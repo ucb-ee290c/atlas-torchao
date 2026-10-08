@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "atlas-torchao"
+version = "0.0.1"
+requires-python = ">=3.11"
+dependencies = [
+    "torch==2.11.0",
+    "torchvision==0.26.0",
+    "torchao==0.18.0",
+    "transformers==5.5.4",
+    "tokenizers==0.22.2",
+    "huggingface_hub==1.33.0",
+    "accelerate==1.15.0",
+    "safetensors==0.8.0",
+    "datasets==5.1.0",
+    "lerobot[smolvla]==0.6.1",
+    "numpy==2.2.6",
+    # model2MLIR's own deps (model2MLIR itself is installed from the submodule with --no-deps)
+    "xdsl==0.65.0",
+    "structlog==25.5.0",
+    "PyYAML==6.0.3",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = ["atlas_torchao", "atlas_m2m_adapter", "quant", "modelutils", "datautils", "eval"]
+
+[project.entry-points."m2m.quantization_adapters"]
+atlas_fp8 = "atlas_m2m_adapter:atlas_fp8_adapter"
