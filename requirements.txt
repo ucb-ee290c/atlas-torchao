@@ -1,0 +1,12 @@
+accelerate==1.15.0
+diffusers==0.35.2
+huggingface-hub==0.35.3
+lerobot==0.4.4
+numpy==2.2.6
+safetensors==0.8.0
+tokenizers==0.22.2
+torch==2.10.0
+torch-mlir==20261001
+torchao==0.15.0
+torchvision==0.25.0
+transformers==4.57.6
