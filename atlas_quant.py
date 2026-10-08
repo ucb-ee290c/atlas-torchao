@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from torchao.core.config import AOBaseConfig
 from torchao.quantization import quantize_
 from torchao.quantization.transform_module import register_quantize_module_handler
-from utils import load_model
+from utils import load_llama, load_model
 from quant import hw_bf16_to_e4m3, hw_e4m3_to_float, scale_exp_for
 from torch.fx.passes.graph_drawer import FxGraphDrawer
 
@@ -65,7 +65,7 @@ def save_for_merlin(model: nn.Module, path: str):
 
 if __name__ == "__main__":
     MODEL_PATH = "/rscratch/agarcia/TinyLlama-1.1B-Chat-v1.0"
-    model = load_model(MODEL_PATH, seqlen=2048)
+    model = load_llama(MODEL_PATH, seqlen=2048)
      
     with torch.no_grad():
         quantize_(model, AtlasQConfig(), filter_fn=skip_lm_head)
