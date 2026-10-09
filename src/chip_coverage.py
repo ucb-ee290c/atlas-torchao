@@ -158,6 +158,14 @@ def _numel(out) -> int:
     return 1
 
 
+def _host_work(name, args, out) -> int:
+    """FLOPs for a matmul run on the host, output elements otherwise."""
+    if name in ("mm", "bmm", "addmm", "baddbmm"):
+        a = args[0] if name in ("mm", "bmm") else args[1]
+        return 2 * _numel(out) * a.shape[-1]
+    return _numel(out)
+
+
 def _tensors(args):
     for a in args:
         if isinstance(a, torch.Tensor):
@@ -228,14 +236,14 @@ class ChipRouter(TorchDispatchMode):
             return func(*args, **kwargs)
         name = func.overloadpacket.__name__
         kind, detail = self._context()
-        if kind == "skip":
+        if kind in ("skip", "rope_host"):
             out = func(*args, **kwargs)
-            self.cov.add("host", name, _numel(out), reason=f"kept off the chip on request (--skip {detail})")
-            return out
-        if kind == "rope_host":
-            out = func(*args, **kwargs)
-            self.cov.add("host", name, _numel(out),
-                         reason="RoPE table (position-only), precomputed on the host (--chip-rope host)")
+            if name in M.DATA:
+                self.cov.add("data", name, _numel(out))
+            else:
+                why = (f"kept off the chip on request (--skip {detail})" if kind == "skip" else
+                       "RoPE table (position-only), precomputed on the host (--chip-rope host)")
+                self.cov.add("host", name, _host_work(name, args, out), reason=why)
             return out
         unit, handler, reason = self.classify(func, name, args, kwargs, kind)
         self._instr.clear()
@@ -278,6 +286,8 @@ class ChipRouter(TorchDispatchMode):
             if ok:
                 return h.unit, h, None
             return "host", None, why
+        if name.startswith("_scaled_dot_product"):
+            return "host", None, M.HOST_REASONS.get(name, "fused SDPA kernel")
         reason = M.HOST_REASONS.get(name, f"unmapped float op {name}: no Atlas instruction mapped")
         if self.strict and name not in M.HOST_REASONS:
             raise RuntimeError(f"chip: unmapped float op {func}")
