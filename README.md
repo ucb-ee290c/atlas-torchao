@@ -135,6 +135,7 @@ the reference treatment, or precomputed on the host), `--chip-strict` (raise on 
 | `bmm`/`baddbmm` (attention when not patched) | per-matrix cast (per batch, head), MXU, vmul rescale; K = 1 is a vmul | model_patcher.py:667-699 |
 | `exp2` of the integer scale exponent in RefQuantLinear | scalar-core exponent construction (exact) | 2^(sx+sw) in quant_linear.py:168 is a Python scalar |
 | `--chip-mxu framework` | FP8 operands, float32 matmul, one BF16 rounding | ref_profile.py `reference` F.linear stand-in |
+| exp inside `_softmax`, `silu`, `sigmoid` | `vmaximum(x, -128)` before `vexp` | the vexp model (bit-exact to ExpLane.scala) wraps below x = -336: exp(-3.3e38) = 1, so an additive min/-inf mask did not mask (TinyLlama chip PPL 942 -> 9.5 on the first window); analogue: ExpLane.scala:47 overflow pre-check |
 | float64 0-d scalar arithmetic | host | schedule constants; Atlas has no FP64 |
 
 The model-level op -> unit map (with the aten ops each model operation becomes) is `MODEL_OPS` in
@@ -152,3 +153,19 @@ multitask-dit-quant's op router accepts an external emulator. With this repo's `
 that router counts as movement, and for matmuls, which its FP8 patches own: a matmul reaching the
 router is host); `em.emulate(func, args, kwargs)` runs the op on ChipVPU with the chip profile's
 handlers. Ops the emulator cannot run are classified None, i.e. host fallback in that report.
+
+### Findings for the Atlas hardware team
+
+- `vexp.bf16` (reference FPEX model, bit-exact to ExpLane.scala) is correct only for x >= -336; for
+  more negative inputs the Q(m,n) conversion wraps (exp(-1000) = 2.6e10, exp(-3.3e38) = 1.0). Masked
+  softmax with the framework's min/-inf mask is wrong unless software clamps first. Is a saturating
+  underflow (return +0) intended in the RTL?
+- `vsin`/`vcos` take a Q(9,12) argument (x 2/pi), i.e. |x| < ~400 rad, and BF16 angles have an ulp of
+  0.5 rad at 64-128: RoPE angles for positions beyond a few hundred are not representable on the VPU.
+  Should RoPE tables be precomputed on the host (`--chip-rope host`) in deployment?
+- `vadd`/`vsub` truncate the FP32 sum to BF16 (raw upper half, AddSubSumVec.scala:133) while
+  `vmul` and `vredsum.row` round to nearest even: intended?
+- The scalar core has no multiply/divide and no FP (ScalarALU.scala:26-36): float schedule
+  constants (flow-matching dt, DDPM coefficients) and integer index multiplies need host
+  precomputation or software routines.
+- No select/compare instruction on the VPU: masks must be additive and precomputed on the host.
