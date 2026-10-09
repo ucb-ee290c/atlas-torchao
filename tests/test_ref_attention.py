@@ -37,8 +37,9 @@ def _inputs(gen, B=2, Sq=5, Skv=7, H=4, Hkv=2, D=40):
     return q.bfloat16(), k.bfloat16(), v.bfloat16(), mask
 
 
+@pytest.mark.parametrize("impl", ["ref_cpu", "torch"])
 @pytest.mark.parametrize("mxu", ["ipt", "sa"])
-def test_attention_head(mp, mxu):
+def test_attention_head(mp, mxu, impl):
     """Batched per-head routine == the reference closure (smolVLA model_patcher.py:624-723)."""
     g = torch.Generator().manual_seed(0)
     q, k, v, mask = _inputs(g)
@@ -48,7 +49,7 @@ def test_attention_head(mp, mxu):
     want = ref_model.vlm_with_expert.eager_attention_forward(mask, 2, 40, q, k, v)
 
     ours = _Holder()
-    sites = patch_attention(ours, fm_factory=lambda: ab.get_accumulator(mxu, "ref_cpu"))
+    sites = patch_attention(ours, fm_factory=lambda: ab.get_accumulator(mxu, impl))
     assert sites[0]["kind"] == "smolvla_text_expert"
     got = ours.vlm_with_expert.eager_attention_forward(mask, 2, 40, q, k, v)
     assert got.dtype == want.dtype and torch.equal(got, want)

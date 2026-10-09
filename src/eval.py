@@ -37,7 +37,7 @@ def main():
 
     from datautils import get_wikitext2
     from modelutils import load_llama
-    from quant_modes import ALL_MODES, add_profile_args, quantize, require_mode_supported
+    from quant_modes import ALL_MODES, add_profile_args, finalize_report, quantize, require_mode_supported
 
     ap = argparse.ArgumentParser(description="WikiText-2 perplexity of a Llama-family model per quantization mode")
     ap.add_argument("--model", required=True, help="local path or HF id of the model")
@@ -67,6 +67,7 @@ def main():
             result["layers"][mode] = quantize(model, mode, skip=["lm_head"], options=args)
         t0 = time.perf_counter()
         result["ppl"][mode] = llama_eval(model, ids, seqlen=args.seqlen)
+        finalize_report(result["layers"].get(mode))
         print(f"{mode} ppl: {result['ppl'][mode]:.4f}  ({time.perf_counter() - t0:.1f}s, "
               f"{result['windows']} windows of {args.seqlen})", flush=True)
         del model

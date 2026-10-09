@@ -51,9 +51,10 @@ def _raw_ref_fm(mxu):
     return ref_loader.import_ref("func_models_sa.systolic_c.systolic_array_rtl_linear").SARTLLinearFunction()
 
 
+@pytest.mark.parametrize("impl", ["ref_cpu", "torch"])
 @pytest.mark.parametrize("mxu", ["ipt", "sa"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-def test_linear_parity(hw, mxu, dtype):
+def test_linear_parity(hw, mxu, dtype, impl):
     """reference_hw == the reference QuantLinear(functional_model=...) bit for bit
     (smolvla_inout quant_linear.py:133-175), K with a tail tile, bias, 3-D float32 input."""
     QuantLinear = ref_loader.import_ref("smolvla_inout.quant_linear").QuantLinear
@@ -66,7 +67,7 @@ def test_linear_parity(hw, mxu, dtype):
     ref_layer = QuantLinear(lin, functional_model=_raw_ref_fm(mxu))
     m = nn.Sequential()
     m.add_module("lin", lin)
-    quantize_reference(m, fm_factory=lambda: ab.get_accumulator(mxu, "ref_cpu"))
+    quantize_reference(m, fm_factory=lambda: ab.get_accumulator(mxu, impl))
     with torch.no_grad():
         want = ref_layer(x)
         got = m.lin(x)

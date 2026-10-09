@@ -29,7 +29,7 @@ from pathlib import Path
 
 import torch
 
-from quant_modes import ALL_MODES, add_profile_args, quantize, require_mode_supported
+from quant_modes import ALL_MODES, add_profile_args, finalize_report, quantize, require_mode_supported
 
 
 
@@ -230,7 +230,7 @@ def main():
         layers = quantize(policy, mode, args.skip, options=args) if mode != "bf16" else None
         preds, gts, pads, times = run_mode(policy, ds, idx, preprocess, postprocess,
                                            args.seed, args.device)
-        entry = {"layers": layers, "vs_ground_truth": error_vs_gt(preds, gts, pads),
+        entry = {"layers": finalize_report(layers), "vs_ground_truth": error_vs_gt(preds, gts, pads),
                  "latency_s": {"median": sorted(times)[len(times) // 2], "mean": sum(times) / len(times)}}
         if mode == "bf16":
             ref = preds
