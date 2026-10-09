@@ -101,8 +101,9 @@ SmolVLA (lerobot/svla_so100_pickplace; F from the benchmark):
     python src/eval_policy.py --policy lerobot/smolvla_base --dataset lerobot/svla_so100_pickplace --n-frames 200 --modes bf16 collab_v0 ref_linear ref_attn ref_conv --rmse --out out/smolvla_ladder_fast.json
     python src/eval_policy.py --policy lerobot/smolvla_base --dataset lerobot/svla_so100_pickplace --n-frames $F --modes reference_hw chip chip_rope_vpu --mxu ipt --out out/smolvla_ladder_subset.json
 
-Multi-Task DiT. Steps 1-5 here with the generic rules (its custom attention is left unpatched, so
-here `ref_attn` reports `equivalent_to: ref_linear`); the full ladder, with DiT's attention and its
+Multi-Task DiT. Steps 1-5 here with the generic rules: `ref_attn` patches only the CLIP vision
+attention (DiT's own RoPEAttention is left unpatched, see `attention_sites`); the full ladder, with
+DiT's attention and its
 chip profile, is in multitask-dit-quant (git@github.com:lorenshung/multitask-dit-quant.git,
 `experiments/run_eval.py --modes bf16 ref_linear ref_attn ref_conv reference_hw chip chip_rope_vpu`,
 same step names; step 2 `collab_v0` only exists here):
