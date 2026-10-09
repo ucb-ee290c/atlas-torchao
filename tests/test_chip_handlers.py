@@ -91,6 +91,8 @@ def test_matmuls_on_mxu_and_conv():
     out = run(r, A.convolution.default, x, w, bias, [2, 2], [0, 0], [1, 1], False, [0, 0], 1)
     ref = torch.nn.functional.conv2d(x, w, bias, stride=2)
     assert out.shape == ref.shape and close(out, ref, rtol=0.15, atol=0.6)
+    out1 = run(r, A.convolution.default, x, w, None, [2], [0], [1], False, [0], 1)
+    assert out1.shape == ref.shape
     # K = 1: an outer product on the VPU
     o = run(r, A.bmm.default, torch.arange(4.0).reshape(1, 4, 1), torch.ones(1, 1, 3))
     assert torch.equal(o, torch.arange(4.0).reshape(1, 4, 1).expand(1, 4, 3))

@@ -644,7 +644,8 @@ def _conv_applies(r, func, name, args, kwargs):
 def _conv(r, func, name, args, kwargs):
     """im2col + FP8 matmul (QuantConv2d functional path, model_patcher.py:345-375)."""
     import torch.nn.functional as F
-    x, w, b, stride, padding, dilation = args[:6]
+    x, w, b = args[:3]
+    stride, padding, dilation = ([int(v) for v in a] * (2 if len(a) == 1 else 1) for a in args[3:6])
     B, _, H, W = x.shape
     O, _, kh, kw = w.shape
     oh = (H + 2 * padding[0] - dilation[0] * (kh - 1) - 1) // stride[0] + 1
