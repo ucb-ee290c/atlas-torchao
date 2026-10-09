@@ -18,6 +18,24 @@
 The collab_v0 profiles keep exactly the behaviour of atlas-eval (daf8e78) under both their new
 names and their old ones, so the collaborator's numbers reproduce
 (tests/test_profiles.py::test_collab_v0_golden).
+
+Coverage ladder (NEW): each step adds exactly one source of error over the previous one, so the
+difference between two consecutive steps on the same windows / frames isolates that source.
+
+  1 bf16           baseline
+  2 collab_v0      Linear FP8 the collaborator's way (fixed 2^0 activation scale, torch cast)
+  3 ref_linear     reference numerics (dynamic po2 floor/256 scales, vpack cast, BF16 bias after
+                   the rescale) on nn.Linear only; framework accumulation
+  4 ref_attn       + attention Q.K^T and P.V, per-head FP8
+  5 ref_conv       + Conv2d (alias: reference); equals ref_attn for a model without Conv2d
+  6 reference_hw   + Atlas MXU accumulation model (--mxu ipt|sa), with the cross-check
+  7 chip           + every other op on the VPU / scalar core, RoPE and timestep tables as host
+                   constants (--chip-rope host, the default)
+  8 chip_rope_vpu  chip with the tables computed on the VPU (the reference author's treatment)
+
+Every report carries `ladder` (ladder_record): the step, what it adds, and exactly which op
+classes were quantized and how matmuls, vector ops and tables were emulated. An explicit --ops
+or --chip-rope that changes a step's definition is recorded as `on_ladder: false`.
 """
 
 from dataclasses import dataclass, field
@@ -32,27 +50,56 @@ class Profile:
     summary: str
     source: str
     aliases: tuple = field(default=())
+    impl: str = ""        # the implementation profile it configures ("" = itself)
+    ops: tuple = ()       # reference profiles: the op classes it quantizes unless --ops is given
+    fixed: tuple = ()     # ((option, value), ...) the profile sets regardless of the CLI
+    step: int = 0         # position on the coverage ladder (0 = off the ladder)
+    adds: str = ""        # what the step adds over the previous one
 
+    @property
+    def base(self) -> str:
+        return self.impl or self.name
+
+
+OPS = ("linear", "conv2d", "attention")
 
 PROFILES = {
     p.name: p for p in (
-        Profile("bf16", "no quantization", "-"),
+        Profile("bf16", "no quantization", "-", step=1, adds="baseline"),
         Profile("collab_v0", "AtlasQConfig, ceil/448 scales, fixed activation scale 2^0, torch fp8 "
                 "activation cast, F.linear", "the collaborator (atlas_torchao.py, atlas_quant.py)",
-                aliases=("atlas",)),
+                aliases=("atlas",), step=2, adds="Linear FP8, the collaborator's cast and scales"),
         Profile("collab_v0_hw", "collab_v0 with the hardware activation cast", "the collaborator "
                 "(atlas_torchao.py:57-61)", aliases=("atlas_hw",)),
-        Profile("reference", "dynamic po2 scales + vpack cast for x and W, F.linear on dequantized "
-                "values (NEW), BF16 bias after", "pi0-quant hw_float_ops.py:38-57,64-103; "
-                "quant_linear.py:153-172"),
+        Profile("ref_linear", "reference cast (dynamic po2 floor/256, vpack) on nn.Linear only, "
+                "F.linear on dequantized values (NEW), BF16 bias after", "pi0-quant "
+                "hw_float_ops.py:38-57,64-103; quant_linear.py:153-172", impl="reference",
+                ops=("linear",), step=3, adds="reference numerics on Linear (framework accumulation)"),
+        Profile("ref_attn", "ref_linear + attention Q.K^T / P.V per-head FP8", "model_patcher.py:624-723",
+                impl="reference", ops=("linear", "attention"), step=4,
+                adds="attention Q.K^T and P.V per-head FP8"),
+        Profile("ref_conv", "ref_attn + Conv2d (im2col, per-tensor casts): the reference profile",
+                "model_patcher.py:282-375", aliases=("reference",), impl="reference", ops=OPS, step=5,
+                adds="Conv2d FP8 (none for a model without Conv2d)"),
         Profile("reference_hw", "reference cast, MXU accumulation model (--mxu ipt|sa), output "
                 "x 2^(sx+sw), BF16 bias after", "pi0-quant quant_linear.py:145-172; "
-                "functional_models.py:79-108"),
+                "functional_models.py:79-108", ops=OPS, step=6,
+                adds="Atlas MXU accumulation (--mxu, cross-checked)"),
         Profile("torchao", "Float8DynamicActivationFloat8WeightConfig, per-tensor", "torchao 0.18"),
         Profile("chip", "reference_hw + every other op on the Atlas VPU / scalar core, or listed as "
-                "host fallback (src/chip_profile.py)", "see src/op_unit_map.py"),
+                "host fallback; RoPE / timestep tables host constants by default (src/chip_profile.py)",
+                "see src/op_unit_map.py", ops=OPS, step=7,
+                adds="VPU / scalar-core vector ops, lane-exact; position/timestep tables host constants"),
+        Profile("chip_rope_vpu", "chip with RoPE / timestep tables computed on the VPU (--chip-rope vpu)",
+                "the reference author's treatment, quant_vector.py:170-171", impl="chip", ops=OPS,
+                fixed=(("chip_rope", "vpu"),), step=8,
+                adds="RoPE / timestep sin-cos tables on the VPU instead of host constants"),
     )
 }
+LADDER = tuple(sorted((p.name for p in PROFILES.values() if p.step), key=lambda n: PROFILES[n].step))
+# Steps that run an MXU accumulation model: slow, so they are run on a subset of windows / frames.
+SUBSET_PROFILES = ("reference_hw", "chip", "chip_rope_vpu")
+FAST_PREDECESSOR = "ref_conv"     # the last fast step, re-run on a subset by --subset-compare
 ALIASES = {a: p.name for p in PROFILES.values() for a in p.aliases}
 
 QUANT_MODES = tuple(n for n in (*PROFILES, *ALIASES) if n != "bf16")
@@ -112,9 +159,6 @@ def _quantize_torchao_style(model: nn.Module, name: str, skip) -> dict:
             "untouched": sorted(set(planned) - set(changed))}
 
 
-OPS = ("linear", "conv2d", "attention")
-
-
 def add_profile_args(ap) -> None:
     """Options of the reference profiles, shared by the eval CLIs."""
     from accum_backends import DEFAULT_MXU, IMPLS, MXUS
@@ -137,9 +181,11 @@ def add_profile_args(ap) -> None:
     g.add_argument("--crosscheck-budget", type=float, default=600.0,
                    help="seconds of reference CPU time the cross-check may spend")
     __import__("chip_profile").add_args(ap)
-    g.add_argument("--ops", default=",".join(OPS),
+    g.add_argument("--ops", default=None,
                    help="comma-separated ops the reference profiles cover: linear, conv2d, attention "
-                        "(smolVLA run_eval.py:7-18; default all)")
+                        "(smolVLA run_eval.py:7-18). Default: the profile's own (ref_linear: linear; "
+                        "ref_attn: linear,attention; the others all). Given explicitly it overrides "
+                        "every profile and the result is recorded as off the ladder")
 
 
 def profile_options(options) -> dict:
@@ -147,7 +193,7 @@ def profile_options(options) -> dict:
     from accum_backends import DEFAULT_MXU
 
     get = options.get if isinstance(options, dict) else (lambda k, d=None: getattr(options, k, d))
-    ops = get("ops", None) or ",".join(OPS)
+    ops = get("ops", None) or get("_profile_ops", None) or ",".join(OPS)
     ops = tuple(o.strip() for o in (ops.split(",") if isinstance(ops, str) else ops) if o.strip())
     bad = set(ops) - set(OPS)
     if bad:
@@ -180,16 +226,156 @@ def finalize_report(rep):
     return rep
 
 
+def _options_dict(options) -> dict:
+    if options is None:
+        return {}
+    return dict(options) if isinstance(options, dict) else dict(vars(options))
+
+
+def resolved_options(mode: str, options=None) -> dict:
+    """`options` as a dict with the profile's own settings applied: its op classes (unless --ops
+    was given) under `_profile_ops`, and its fixed options (chip_rope_vpu: chip_rope=vpu)."""
+    prof = PROFILES[canonical(mode)]
+    opts = _options_dict(options)
+    if prof.ops:
+        opts["_profile_ops"] = ",".join(prof.ops)
+    opts.update(dict(prof.fixed))
+    if prof.base == "chip" and not opts.get("chip_rope"):
+        opts["chip_rope"] = "host"           # NEW default: tables are compile-time host constants
+    return opts
+
+
 def quantize(model: nn.Module, mode: str, skip=(), options=None) -> dict:
     """Quantize `model` in place under profile `mode` (fqn substrings in `skip` are kept).
 
     `options` (argparse namespace or dict) carries the reference-profile options
-    (add_profile_args); other profiles ignore it.
+    (add_profile_args); other profiles ignore it. Ladder profiles (ref_linear, ref_attn, ref_conv,
+    chip_rope_vpu) configure their implementation profile through resolved_options.
 
-    Returns {"planned", "quantized", "untouched"}: a layer counts as quantized only if it was
-    actually replaced (TorchAO's float8 path skips some shapes without raising).
+    Returns {"planned", "quantized", "untouched", "ladder"}: a layer counts as quantized only if it
+    was actually replaced (TorchAO's float8 path skips some shapes without raising); `ladder` is
+    ladder_record(mode, report).
     """
+    opts = resolved_options(mode, options)
+    rep = _quantize_profile(model, PROFILES[canonical(mode)].base, skip, opts)
+    rep["ladder"] = ladder_record(mode, rep, opts)
+    return rep
+
+
+def _count(rep, key):
+    v = rep.get(key)
+    if isinstance(v, dict):
+        return int(v.get("quantized", 0))
+    return len(v) if isinstance(v, list) else 0
+
+
+def ladder_record(mode: str, rep: dict, options=None) -> dict:
+    """What `mode` quantized and emulated, for the result JSON: the ladder step, what it adds over
+    the previous step, the op classes actually quantized (with counts), and how matmuls, vector ops
+    and position / timestep tables ran. `equivalent_to` names the previous step when the op class
+    this step adds found nothing to quantize (TinyLlama has no Conv2d: ref_conv == ref_attn)."""
     name = canonical(mode)
+    prof = PROFILES[name]
+    opts = _options_dict(options)
+    base = prof.base
+    ops = profile_options(opts)["ops"] if base in ("reference", "reference_hw", "chip") else ()
+    rec = {"mode": mode, "profile": name, "step": prof.step or None, "adds": prof.adds or None,
+           "previous": LADDER[prof.step - 2] if prof.step > 1 else None}
+    if base == "bf16":
+        rec.update(operand_cast=None, quantized_op_classes={}, accumulation="framework",
+                   vector_ops="framework", rope_tables="framework")
+        return {**rec, "on_ladder": True, "off_ladder_reasons": []}
+    if base in ("collab_v0", "collab_v0_hw", "torchao"):
+        cast = {"collab_v0": "collab: ceil(log2(amax/448)) weight scale, fixed 2^0 activation scale, "
+                             "torch fp8 cast",
+                "collab_v0_hw": "collab with the hardware activation cast",
+                "torchao": "torchao float8 per-tensor dynamic"}[base]
+        rec.update(operand_cast=cast, quantized_op_classes={"linear": int(rep.get("quantized", 0))},
+                   accumulation="framework" if base != "torchao" else "native fp8 matmul",
+                   vector_ops="framework", rope_tables="framework")
+        return {**rec, "on_ladder": bool(prof.step), "off_ladder_reasons": []}
+    classes = {}
+    if "linear" in ops:
+        classes["linear"] = int(rep.get("quantized", 0))
+    if "attention" in ops:
+        classes["attention"] = _count(rep, "attention_sites")
+    if "conv2d" in ops:
+        classes["conv2d"] = _count(rep, "conv2d")
+    chip_mxu = opts.get("chip_mxu") or "model"
+    if base == "reference" or (base == "chip" and chip_mxu == "framework"):
+        acc = "framework" if base == "reference" else "framework (FP8 operands, float32 matmul, one BF16 rounding)"
+    else:
+        po = profile_options(opts)
+        acc = f"mxu {po['mxu']} ({po['mxu_impl']})"
+    rec.update(operand_cast="reference: dynamic po2 floor(log2(amax/256)), vpack; BF16 bias after rescale",
+               quantized_op_classes=classes, accumulation=acc,
+               vector_ops="vpu (ChipVPU, lane-exact) + scalar core" if base == "chip" else "framework",
+               rope_tables=(opts.get("chip_rope") or "host") if base == "chip" else "framework")
+    off = []
+    if prof.ops and tuple(sorted(ops)) != tuple(sorted(prof.ops)):
+        off.append(f"--ops {','.join(ops)} instead of {','.join(prof.ops)}")
+    if base == "chip" and name == "chip" and rec["rope_tables"] != "host":
+        off.append(f"--chip-rope {rec['rope_tables']} (chip_rope_vpu is that step)")
+    if base == "chip" and chip_mxu == "framework":
+        off.append("--chip-mxu framework (no MXU accumulation model)")
+    added = {"ref_attn": "attention", "ref_conv": "conv2d"}.get(name)
+    if added and not off and classes.get(added, 0) == 0:
+        rec["equivalent_to"] = rec["previous"]
+    return {**rec, "on_ladder": bool(prof.step) and not off, "off_ladder_reasons": off}
+
+
+def add_subset_compare_arg(ap) -> None:
+    ap.add_argument("--subset-compare", choices=("on", "off"), default="on",
+                    help="when a subset profile (reference_hw, chip, chip_rope_vpu) is requested, also "
+                         "evaluate bf16 and the preceding fast step (ref_conv) on the identical "
+                         "windows / frames, so the ladder deltas compare like for like (default on)")
+
+
+def subset_compare_modes(modes, enabled=True) -> tuple:
+    """(modes, added): with any subset profile in `modes`, bf16 and ref_conv (or its alias
+    `reference`) are added if missing, ahead of the first subset profile. Every mode of one run
+    sees the same windows / frames, so this makes the subset steps' deltas like-for-like."""
+    modes = list(modes)
+    if not enabled or not any(canonical(m) in SUBSET_PROFILES for m in modes):
+        return modes, []
+    have = {canonical(m) for m in modes}
+    need = [m for m in ("bf16", FAST_PREDECESSOR) if m not in have]
+    first = min(i for i, m in enumerate(modes) if canonical(m) in SUBSET_PROFILES)
+    return modes[:first] + need + modes[first:], need
+
+
+def ladder_deltas(metrics: dict, ladder: dict | None = None) -> list:
+    """Consecutive-step deltas over the modes of ONE run (so on identical windows / frames).
+    `metrics`: {mode: {metric: value}}; `ladder`: {mode: ladder_record}, whose off-ladder modes
+    are skipped. Missing steps are skipped too: a delta is between the nearest steps present,
+    named in `from`/`to`, and `steps` > 1 shows a gap (the delta then mixes several causes)."""
+    present = {}
+    for mode, m in metrics.items():
+        try:
+            name = canonical(mode)
+        except ValueError:
+            continue
+        rec = (ladder or {}).get(mode)
+        if rec is not None and not rec.get("on_ladder", True):
+            continue
+        if PROFILES[name].step and name not in present:
+            present[name] = (mode, m)
+    out, prev = [], None
+    for name in LADDER:
+        if name not in present:
+            continue
+        if prev is not None:
+            (pm, pv), (cm, cv) = present[prev], present[name]
+            out.append({"from": pm, "to": cm, "steps": PROFILES[name].step - PROFILES[prev].step,
+                        "adds": PROFILES[name].adds,
+                        "delta": {k: cv[k] - pv[k] for k in cv
+                                  if isinstance(cv.get(k), (int, float)) and isinstance(pv.get(k), (int, float))}})
+        prev = name
+    return out
+
+
+def _quantize_profile(model: nn.Module, name: str, skip=(), options=None) -> dict:
+    """The implementation profiles: bf16, collab_v0(_hw), reference, reference_hw, chip, torchao."""
     if name == "chip":
         return __import__("chip_profile").quantize_chip(model, skip, options)
     if name == "bf16":
