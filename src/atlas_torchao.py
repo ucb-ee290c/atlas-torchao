@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchao.core.config import AOBaseConfig
-from torchao.quantization import quantize_
+from torchao.quantization import quantize_, Float8DynamicActivationFloat8WeightConfig
 from torchao.quantization.transform_module import register_quantize_module_handler
 from modelutils import load_llama, load_smolvla
 from atlas_quant import hw_bf16_to_e4m3, hw_e4m3_to_float, scale_exp_for
@@ -54,7 +54,6 @@ class AtlasQuantLinear(nn.Module):
         
 @register_quantize_module_handler(AtlasQConfig)
 def _atlas_handler(module: nn.Module, config: AtlasQConfig) -> nn.Module:
-    print(module)
     return AtlasQuantLinear(module, config)
 
 def skip_lm_head(module: nn.Module, fqn: str) -> bool:

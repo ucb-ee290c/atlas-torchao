@@ -28,7 +28,7 @@ def llama_eval(model, testenc, seqlen=None):
 
 if __name__ == "__main__":
     from modelutils import load_llama, load_smolvla
-    from torchao.quantization import quantize_
+    from torchao.quantization import quantize_, Float8DynamicActivationFloat8WeightConfig
     from atlas_torchao import AtlasQConfig, skip_lm_head
 
     model_path = "/rscratch/agarcia/TinyLlama-1.1B-Chat-v1.0"
@@ -44,8 +44,9 @@ if __name__ == "__main__":
     from datautils import get_wikitext2
     trainloader, testenc = get_wikitext2(nsamples=16, seed=0, seqlen=SEQLEN, model=model_path)
     ppl = llama_eval(model, testenc, seqlen=SEQLEN)
-    print("Baseline ppl:", ppl)
+    print("AtlasQuant ppl:", ppl)
 
+    quantize_(model, Float8DynamicActivationFloat8WeightConfig(), filter_fn=skip_lm_head)
     
     ppl = llama_eval(model, testenc, seqlen=SEQLEN)
-    print("Quantized ppl:", ppl)
+    print("Pytoatchfp8 ppl:", ppl)
