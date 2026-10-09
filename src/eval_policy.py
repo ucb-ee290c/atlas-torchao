@@ -29,7 +29,7 @@ from pathlib import Path
 
 import torch
 
-from quant_modes import ALL_MODES, quantize, require_mode_supported
+from quant_modes import ALL_MODES, add_profile_args, quantize, require_mode_supported
 
 
 
@@ -198,6 +198,7 @@ def main():
     ap.add_argument("--rename-map", type=json.loads, default=None,
                     help='JSON {dataset_key: policy_key}; default pairs cameras in sorted order')
     ap.add_argument("--out", required=True)
+    add_profile_args(ap)
     args = ap.parse_args()
     for m in args.modes:
         try:
@@ -226,7 +227,7 @@ def main():
                                                 args.n_frames, args.seed)
             result["data"] = {"dataset": args.dataset, "test_episodes": test_eps,
                               "frames": len(idx), "fps": meta.fps}
-        layers = quantize(policy, mode, args.skip) if mode != "bf16" else None
+        layers = quantize(policy, mode, args.skip, options=args) if mode != "bf16" else None
         preds, gts, pads, times = run_mode(policy, ds, idx, preprocess, postprocess,
                                            args.seed, args.device)
         entry = {"layers": layers, "vs_ground_truth": error_vs_gt(preds, gts, pads),

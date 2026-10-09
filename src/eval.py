@@ -37,7 +37,7 @@ def main():
 
     from datautils import get_wikitext2
     from modelutils import load_llama
-    from quant_modes import ALL_MODES, quantize, require_mode_supported
+    from quant_modes import ALL_MODES, add_profile_args, quantize, require_mode_supported
 
     ap = argparse.ArgumentParser(description="WikiText-2 perplexity of a Llama-family model per quantization mode")
     ap.add_argument("--model", required=True, help="local path or HF id of the model")
@@ -46,6 +46,7 @@ def main():
     ap.add_argument("--modes", nargs="+", default=["bf16", "atlas"], choices=list(ALL_MODES))
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--out", default=None, help="write results as JSON")
+    add_profile_args(ap)
     args = ap.parse_args()
     for m in args.modes:
         try:
@@ -63,7 +64,7 @@ def main():
     for mode in args.modes:
         model = load_llama(args.model, seqlen=args.seqlen, device=args.device)  # fresh weights per mode
         if mode != "bf16":
-            result["layers"][mode] = quantize(model, mode, skip=["lm_head"])
+            result["layers"][mode] = quantize(model, mode, skip=["lm_head"], options=args)
         t0 = time.perf_counter()
         result["ppl"][mode] = llama_eval(model, ids, seqlen=args.seqlen)
         print(f"{mode} ppl: {result['ppl'][mode]:.4f}  ({time.perf_counter() - t0:.1f}s, "

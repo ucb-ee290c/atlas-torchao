@@ -9,6 +9,9 @@
                 (floor(log2(amax/256))) and the vpack encoder for activations and weights, every
                 nn.Linear including fp32 ones; F.linear on the dequantized operands (NEW), BF16
                 bias after (src/ref_profile.py)
+  reference_hw  as reference, with the matmul through an MXU accumulation model: --mxu ipt
+                (default, the reference author's choice) or sa, implementation --mxu-impl
+                ref_cpu (the reference CPU models) or torch (src/accum_torch.py)
   torchao       stock TorchAO Float8DynamicActivationFloat8WeightConfig, per-tensor
                 (native FP8 matmul; needs compute capability >= 8.9, e.g. L40S / H100)
 
@@ -42,6 +45,9 @@ PROFILES = {
         Profile("reference", "dynamic po2 scales + vpack cast for x and W, F.linear on dequantized "
                 "values (NEW), BF16 bias after", "pi0-quant hw_float_ops.py:38-57,64-103; "
                 "quant_linear.py:153-172"),
+        Profile("reference_hw", "reference cast, MXU accumulation model (--mxu ipt|sa), output "
+                "x 2^(sx+sw), BF16 bias after", "pi0-quant quant_linear.py:145-172; "
+                "functional_models.py:79-108"),
         Profile("torchao", "Float8DynamicActivationFloat8WeightConfig, per-tensor", "torchao 0.18"),
     )
 }
@@ -104,8 +110,32 @@ def _quantize_torchao_style(model: nn.Module, name: str, skip) -> dict:
             "untouched": sorted(set(planned) - set(changed))}
 
 
-def quantize(model: nn.Module, mode: str, skip=()) -> dict:
+def add_profile_args(ap) -> None:
+    """Options of the reference profiles, shared by the eval CLIs."""
+    from accum_backends import DEFAULT_MXU, IMPLS, MXUS
+
+    g = ap.add_argument_group("reference profiles")
+    g.add_argument("--mxu", choices=MXUS, default=DEFAULT_MXU,
+                   help="reference_hw accumulation model: ipt (inner-product tree, the reference "
+                        "author's choice) or sa (per-step systolic array)")
+    g.add_argument("--mxu-impl", choices=IMPLS, default="ref_cpu",
+                   help="ref_cpu: the reference CPU models (oracles); torch: GPU-capable port")
+
+
+def profile_options(options) -> dict:
+    """The profile options in `options` (an argparse namespace or a dict), with defaults."""
+    from accum_backends import DEFAULT_MXU
+
+    get = options.get if isinstance(options, dict) else (lambda k, d=None: getattr(options, k, d))
+    return {"mxu": get("mxu", DEFAULT_MXU) or DEFAULT_MXU,
+            "mxu_impl": get("mxu_impl", "ref_cpu") or "ref_cpu"}
+
+
+def quantize(model: nn.Module, mode: str, skip=(), options=None) -> dict:
     """Quantize `model` in place under profile `mode` (fqn substrings in `skip` are kept).
+
+    `options` (argparse namespace or dict) carries the reference-profile options
+    (add_profile_args); other profiles ignore it.
 
     Returns {"planned", "quantized", "untouched"}: a layer counts as quantized only if it was
     actually replaced (TorchAO's float8 path skips some shapes without raising).
@@ -113,8 +143,21 @@ def quantize(model: nn.Module, mode: str, skip=()) -> dict:
     name = canonical(mode)
     if name == "bf16":
         return {"planned": 0, "quantized": 0, "untouched": []}
-    if name == "reference":
+    if name in ("reference", "reference_hw"):
+        import ref_loader
         from ref_profile import quantize_reference
 
-        return quantize_reference(model, skip)
+        opts = profile_options(options or {})
+        factory = None
+        if name == "reference_hw":
+            from accum_backends import describe, get_accumulator
+
+            get_accumulator(opts["mxu"], opts["mxu_impl"])          # fail before replacing anything
+            factory = lambda: get_accumulator(opts["mxu"], opts["mxu_impl"])  # noqa: E731
+        rep = quantize_reference(model, skip, fm_factory=factory)
+        rep["profile"] = {"name": name,
+                          **({"accumulation": describe(opts["mxu"], opts["mxu_impl"])}
+                             if name == "reference_hw" else {})}
+        rep["reference_sources"] = ref_loader.provenance()
+        return rep
     return _quantize_torchao_style(model, name, skip)
