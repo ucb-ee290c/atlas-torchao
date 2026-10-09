@@ -231,7 +231,7 @@ def quantize(model: nn.Module, mode: str, skip=(), options=None) -> dict:
         if "conv2d" in opts["ops"]:
             rep["conv2d"] = quantize_conv2d(model, skip, fm_factory=factory)
         if "attention" in opts["ops"]:
-            rep["attention_sites"] = patch_attention(model, fm_factory=factory)
+            rep["attention_sites"] = patch_attention(model, fm_factory=factory, skip=skip)
         rep["profile"] = {"name": name, "ops": list(opts["ops"]),
                           **({"accumulation": describe(opts["mxu"], opts["mxu_impl"])}
                              if name == "reference_hw" else {})}

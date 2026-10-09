@@ -37,6 +37,8 @@ from dataclasses import dataclass, field
 QV = "smolVLA-quant smolvla_inout/quant_vector.py"
 VD = "smolVLA-quant smolvla_inout/vpu_decomp.py"
 VD_PI0 = "pi0-quant pi0_inout/vpu_decomp.py"
+QV_PI0 = "pi0-quant pi0_inout/quant_vector.py"
+OP = "openpi@215abfb models_pytorch"          # Physical-Intelligence/openpi, the Pi0 model source
 GC = "atlas_isa_green_card.md 3"
 VRF = "funct_models_vector/vector_rtl_forward.py"
 
@@ -224,6 +226,34 @@ HOST_REASONS = {
     "float64": "float64 scalar arithmetic on schedule constants",
 }
 
+# Host / data treatments that are NEW decisions (no ATEN entry of their own). The router passes the
+# reason string; Coverage lists the row under `new_decisions` with this choice and analogue.
+LOOP_SCALAR = ("loop-carried 0-d float scalar updated in place (flow-matching `time += dt`): kept on the "
+               "host with the loop comparison it feeds (NEW)")
+MASK_BUILD = ("where(mask, c1, c2) with two constant branches: the additive attention mask itself, "
+              "built once from the boolean mask (NEW)")
+NEW_TREATMENTS = {
+    LOOP_SCALAR: {"choice": "host (float32), not vadd",
+                  "analogue": f"{QV_PI0}:136-171 (TARGET_OPS has no add_, so the reference keeps it in "
+                              f"float32); {OP}/pi0_pytorch.py:407,419",
+                  "reason": "the loop test `time >= -dt/2` is a float compare (host) and the scalar core has "
+                            "no FP; a BF16 vadd would truncate the timestep every step (1.0, 0.898, 0.797, ... "
+                            "instead of 1.0, 0.9, 0.8, ...) and shift every time embedding"},
+    MASK_BUILD: {"choice": "data (precomputed constant mask, DMA'd in)",
+                 "analogue": "where/masked_fill decision (additive host-precomputed masks); "
+                             f"{OP}/pi0_pytorch.py:160",
+                 "reason": "a select between two constants is mask construction, not arithmetic on data"},
+}
+# Position- or schedule-only tables computed on the host under --chip-rope host (chip_profile hooks).
+TABLE_HOST = {
+    "create_sinusoidal_pos_embedding": {
+        "choice": "host table (float64 as in the model), --chip-rope host only",
+        "analogue": f"--chip-rope host for RoPE tables; {OP}/pi0_pytorch.py:25-42 (also lerobot SmolVLA)",
+        "reason": "sinusoidal timestep table (schedule-only), precomputed on the host (--chip-rope host): its "
+                  "angles reach 2 pi / 4e-3 = 1571 rad, beyond vsin/vcos's Q(9,12) range (~400 rad), and "
+                  "BF16 angles have an ulp of 8 rad at 1024"},
+}
+
 # Model-level view: (model, operation) -> (aten ops seen, unit, format, citation, status / reason).
 # The census that produced the "aten" column: tests/test_op_unit_map.py::test_model_ops_cover_census
 # (TinyLlama seqlen 128; SmolVLA one frame; Multi-Task DiT one frame).
@@ -287,4 +317,51 @@ MODEL_OPS = [
     ("dit", "DiT MLP (GELU)", "gelu, Linear", "VPU + MXU", f"{BF16}; {FP8}", f"{QV}:186", "REF"),
     ("dit", "DDPM step arithmetic", "mul, sub, add, div, pow, sqrt, clamp, randn", "VPU (+ host RNG)", BF16,
      f"{QV}:150-176; clamp via vmaximum/vminimum (ISA)", "REF/ISA"),
+    # Pi0 (openpi PI0Pytorch, pi0=True; transformers 4.53.2 + openpi transformers_replace). Reference:
+    # pi0-quant patch_vector_ops (quant_vector.py:136-171 TARGET_OPS, 360-433 dispatch); the vector
+    # sequences are vpu_decomp.py (identical to smolVLA-quant's apart from broadcasting, 218-225).
+    ("pi0", "image layout / resize", "permute (resize only for non-224 inputs: upsample_bilinear2d, clamp)",
+     "data / host", "-", f"{OP}/preprocessing_pytorch.py:41-50; resize as SmolVLA input preprocessing", "HOST"),
+    ("pi0", "SigLIP patch embedding (conv, float32 weights)", "convolution", "MXU", FP8,
+     f"pi0-quant model_patcher.py:159,493 (QuantConv2d); fp32 cast through BF16 (quant_linear.py:136-137)", "REF"),
+    ("pi0", "SigLIP position embedding", "embedding, add", "data + VPU", BF16,
+     f"{OP}/transformers_replace/models/siglip/modeling_siglip.py:280; {QV_PI0}:138", "REF"),
+    ("pi0", "SigLIP LayerNorm", "native_layer_norm", "VPU", BF16, f"{QV_PI0}:167,364-369; {VD_PI0}:84-129", "REF"),
+    ("pi0", "SigLIP / Gemma MLP GELU (tanh)", "gelu(approximate='tanh'), mul (GeGLU gate x up)", "VPU", BF16,
+     f"{QV_PI0}:169,377-379; {VD_PI0}:161-178; {QV_PI0}:143", "REF"),
+    ("pi0", "SigLIP attention (SDPA in the model)", "reference routine: bmm (MXU), _softmax", "MXU + VPU",
+     f"{FP8}; {BF16}", "pi0-quant model_patcher.py:738-823 (ref_attention variant pi0)", "REF"),
+    ("pi0", "multimodal projector, q/k/v/o, gate/up/down, action head linears", "Linear", "MXU", FP8,
+     "reference_hw RefQuantLinear (pi0-quant quant_linear.py:145-172)", "REF"),
+    ("pi0", "token embedding x sqrt(width)", "embedding, mul", "data + VPU", BF16,
+     f"{OP}/pi0_pytorch.py:217; {QV_PI0}:143 (the constant rounded to BF16 like every VPU input)", "REF"),
+    ("pi0", "Gemma RMSNorm x rsqrt(mean(x^2) + eps) (1 + w)", "pow(2), mean, add, rsqrt, mul, add(1 + w), mul",
+     "VPU", BF16, f"{OP}/transformers_replace/models/gemma/modeling_gemma.py:68-80; {QV_PI0}:146,165,152 via "
+     f"{VD_PI0}:199-202 (vsquare), {QV_PI0}:390-399 (mean), {VD_PI0}:79-81 (rsqrt), 232-233 (1 + w as vadd)", "REF"),
+    ("pi0", "RoPE tables (inv_freq x positions, cos, sin)", "bmm(K=1), cat, cos, sin, mul", "VPU / host", BF16,
+     f"{QV_PI0}:154-155 (the reference puts sin/cos on the VPU); K=1 bmm as vmul (NEW); --chip-rope host "
+     "precomputes them (Pi0 positions reach ~880 rad, beyond vsin/vcos's range)", "REF/NEW"),
+    ("pi0", "RoPE apply (q cos + rotate_half(q) sin)", "slice, neg, cat, mul, add", "VPU", BF16,
+     f"{OP}/transformers_replace/models/gemma/modeling_gemma.py:163-193; {VD_PI0}:232-260", "REF"),
+    ("pi0", "prefix / block-causal masks", "cumsum, le, mul(bool), bitwise_and, where(bool, 0, -2.38e38)",
+     "scalar / host / data", "-", f"{OP}/pi0_pytorch.py:78-80,160; float cumsum on the VPU, float `le` host "
+     "(no FP compare), constant select = mask build (NEW)", "NEW"),
+    ("pi0", "Gemma attention (eager, joint prefix + suffix)", "reference routine: bmm (MXU), add(mask), _softmax",
+     "MXU + VPU", f"{FP8}; {BF16}", "pi0-quant model_patcher.py:911-1005; mask add vadd; softmax with the vexp "
+     "floor (NEW, masked logits -2.38e38 -> exp = 0)", "REF/NEW"),
+    ("pi0", "residual adds", "add", "VPU", BF16, f"{OP}/transformers_replace/models/gemma/modeling_gemma.py:226; "
+     f"{QV_PI0}:138", "REF"),
+    ("pi0", "state / action projections, action-time MLP (SiLU)", "Linear, cat, silu", "MXU + VPU",
+     f"{FP8}; {BF16}", f"{OP}/pi0_pytorch.py:250,278-284; {QV_PI0}:170,381-383 (SiLU with the vexp floor, NEW)",
+     "REF"),
+    ("pi0", "sinusoidal time embedding", "linspace, pow.Scalar(f64), reciprocal, mul, sin, cos, cat", "VPU / host",
+     BF16, f"{OP}/pi0_pytorch.py:25-42; {QV_PI0}:149,143,154-155 (float64 inputs rounded to BF16); c^x as "
+     "vexp2 (NEW; the reference keeps pow.Scalar in float64); --chip-rope host precomputes the table (NEW)",
+     "REF/NEW"),
+    ("pi0", "flow-matching Euler step x + dt v", "mul, add", "VPU", BF16, f"{OP}/pi0_pytorch.py:418; {QV_PI0}:138,143",
+     "REF"),
+    ("pi0", "flow time update and loop test", "add_ (0-d), neg, div, ge, _local_scalar_dense", "host + VPU",
+     "float32", f"{OP}/pi0_pytorch.py:402-419; -dt/2 on the VPU ({QV_PI0}:148,160), time += dt and the "
+     "compare on the host (NEW, as the reference: add_ is not in its TARGET_OPS)", "NEW"),
+    ("pi0", "initial noise", "normal (randn)", "host", "float32", "RNG on the host", "HOST"),
 ]
