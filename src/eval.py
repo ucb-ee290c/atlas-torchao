@@ -26,26 +26,56 @@ def llama_eval(model, testenc, seqlen=None):
     return torch.exp(torch.stack(losses).mean()).item()
 
 
-if __name__ == "__main__":
-    from modelutils import load_llama, load_smolvla
-    from torchao.quantization import quantize_
-    from atlas_torchao import AtlasQConfig, skip_lm_head
+def main():
+    import argparse
+    import json
+    import platform
+    import time
+    from pathlib import Path
 
-    model_path = "/rscratch/agarcia/TinyLlama-1.1B-Chat-v1.0"
-    #model_path = "/rscratch/agarcia/Llama-2-7b-hf"
+    import torch
 
-    SEQLEN = 2048
-    model = load_llama(model_path, seqlen=SEQLEN)
-    dev = next(model.parameters()).device
-            
-    quantize_(model, AtlasQConfig(), filter_fn=skip_lm_head)
-    print("Quantized model")
-    
     from datautils import get_wikitext2
-    trainloader, testenc = get_wikitext2(nsamples=16, seed=0, seqlen=SEQLEN, model=model_path)
-    ppl = llama_eval(model, testenc, seqlen=SEQLEN)
-    print("Baseline ppl:", ppl)
+    from modelutils import load_llama
+    from quant_modes import ALL_MODES, quantize, require_mode_supported
 
-    
-    ppl = llama_eval(model, testenc, seqlen=SEQLEN)
-    print("Quantized ppl:", ppl)
+    ap = argparse.ArgumentParser(description="WikiText-2 perplexity of a Llama-family model per quantization mode")
+    ap.add_argument("--model", required=True, help="local path or HF id of the model")
+    ap.add_argument("--seqlen", type=int, default=2048)
+    ap.add_argument("--max-windows", type=int, default=None, help="evaluate only the first N windows (smoke test)")
+    ap.add_argument("--modes", nargs="+", default=["bf16", "atlas"], choices=list(ALL_MODES))
+    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--out", default=None, help="write results as JSON")
+    args = ap.parse_args()
+    for m in args.modes:
+        try:
+            require_mode_supported(m, args.device)
+        except RuntimeError as e:
+            ap.error(str(e))
+
+    _, testenc = get_wikitext2(nsamples=1, seed=0, seqlen=args.seqlen, model=args.model)
+    ids = testenc.input_ids
+    if args.max_windows:
+        ids = ids[:, : args.max_windows * args.seqlen]
+    result = {"args": vars(args), "torch": torch.__version__, "host": platform.node(),
+              "gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else None,
+              "windows": ids.shape[1] // args.seqlen, "ppl": {}, "layers": {}}
+    for mode in args.modes:
+        model = load_llama(args.model, seqlen=args.seqlen, device=args.device)  # fresh weights per mode
+        if mode != "bf16":
+            result["layers"][mode] = quantize(model, mode, skip=["lm_head"])
+        t0 = time.perf_counter()
+        result["ppl"][mode] = llama_eval(model, ids, seqlen=args.seqlen)
+        print(f"{mode} ppl: {result['ppl'][mode]:.4f}  ({time.perf_counter() - t0:.1f}s, "
+              f"{result['windows']} windows of {args.seqlen})", flush=True)
+        del model
+        if args.device.startswith("cuda"):
+            torch.cuda.empty_cache()
+    if args.out:
+        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.out).write_text(json.dumps(result, indent=2))
+        print("wrote", args.out)
+
+
+if __name__ == "__main__":
+    main()
