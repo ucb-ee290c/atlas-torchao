@@ -12,13 +12,61 @@ Reference numerics win unless the RTL clearly contradicts them; the RTL cited is
 | `bf16` | none | framework | framework | - |
 | `collab_v0` (alias `atlas`) | ceil(log2(amax/448)) weight scale, fixed 2^0 activation scale, torch fp8 activation cast, pop-path weight codec | `F.linear` | framework | the collaborator: atlas_torchao.py, atlas_quant.py; byte-identical to daf8e78 (tests/test_profiles.py) |
 | `collab_v0_hw` (alias `atlas_hw`) | as `collab_v0`, hardware activation cast | `F.linear` | framework | atlas_torchao.py:57-61 |
-| `reference` | reference rule for x and W, dynamic per call | `F.linear` on dequantized values (NEW) | framework | hw_float_ops.py:38-57,64-103; quant_linear.py:153-172 |
+| `ref_linear` | reference rule for x and W, dynamic per call; nn.Linear only | `F.linear` on dequantized values (NEW) | framework | hw_float_ops.py:38-57,64-103; quant_linear.py:153-172 |
+| `ref_attn` | as `ref_linear`, + attention Q·Kᵀ / P·V per head | framework (NEW) | framework | model_patcher.py:624-723 |
+| `ref_conv` (alias `reference`) | as `ref_attn`, + Conv2d | `F.linear` on dequantized values (NEW) | framework | model_patcher.py:282-375 |
 | `reference_hw` | as `reference` | MXU model, `--mxu ipt` (default) or `sa` | framework | quant_linear.py:145-172; functional_models.py:79-108 |
-| `chip` | as `reference_hw` | as `reference_hw` | VPU (bit-exact to `VectorRTLFunctions`), scalar core, or reported host fallback | src/chip_profile.py, src/op_unit_map.py |
+| `chip` | as `reference_hw` | as `reference_hw` | VPU (bit-exact to `VectorRTLFunctions`), scalar core, or reported host fallback; RoPE / timestep tables host constants (NEW default) | src/chip_profile.py, src/op_unit_map.py |
+| `chip_rope_vpu` | as `chip` | as `chip` | as `chip`, tables computed on the VPU | quant_vector.py:170-171 |
 | `torchao` | torchao per-tensor float8, dynamic | native FP8 matmul (CC >= 8.9) | framework | torchao 0.18 |
 
-`reference`, `reference_hw` and `chip` cover the ops chosen with `--ops` (default
-`linear,conv2d,attention`, as in smolVLA run_eval.py:7-18).
+The `ref_*` steps, `reference_hw`, `chip` and `chip_rope_vpu` cover their own op classes
+(`ref_linear`: linear; `ref_attn`: linear, attention; the rest: `linear,conv2d,attention`, as in
+smolVLA run_eval.py:7-18). An explicit `--ops` overrides that and the result is marked off the
+ladder.
+
+## Reading the ladder
+
+The ladder (README, "Profiles and the coverage ladder") is bf16 → collab_v0 → ref_linear → ref_attn
+→ ref_conv → reference_hw → chip → chip_rope_vpu. Each step adds exactly one thing; its `ladder`
+record in the JSON says what was quantized and emulated, and `ladder_deltas` gives the
+consecutive-step differences of one run.
+
+What each delta means:
+
+| delta | isolates |
+|---|---|
+| bf16 → collab_v0 | Linear FP8 the collaborator's way (fixed 2^0 activation scale, torch cast) |
+| collab_v0 → ref_linear | the reference cast and dynamic po2 scales on the same Linears (also: the reference covers fp32 Linears, collab_v0 only bf16 ones; check `quantized_op_classes.linear`) |
+| ref_linear → ref_attn | FP8 attention score and value matmuls |
+| ref_attn → ref_conv | FP8 Conv2d (zero for TinyLlama: `equivalent_to: ref_attn`) |
+| ref_conv → reference_hw | MXU accumulation order and BF16 output rounding, versus framework accumulation |
+| reference_hw → chip | every other op on the VPU / scalar core (lane-exact BF16 arithmetic, vexp/vsin/... models), tables still host constants |
+| chip → chip_rope_vpu | RoPE / timestep tables on the VPU (sin/cos range and BF16 angle resolution) |
+
+Rules:
+
+1. Compare like with like. Only subtract modes of the same run (same windows / frames / noise).
+   Subset steps (reference_hw, chip, chip_rope_vpu) are compared with the `ref_conv` that
+   `--subset-compare` ran on the same subset, never with the full-split `ref_conv`.
+2. A delta across a gap (`steps` > 1 in `ladder_deltas`) mixes several causes.
+3. Off-ladder modes (`on_ladder: false`: explicit `--ops`, `chip` with `--chip-rope vpu`,
+   `--chip-mxu framework`) are left out of `ladder_deltas`; report them as ablations.
+4. Error is expected to grow along the ladder, but not monotonically by construction. An
+   *improvement* at a hardware-fidelity step (ref_conv → reference_hw, reference_hw → chip) is
+   suspicious. Before quoting it, check:
+   - subset parity: both modes in the same JSON, `subset_compare.added_modes` as expected;
+   - noise: the delta against the spread over frames / windows (`per_sample`, per-frame errors),
+     and the determinism record of both modes;
+   - discrete actions: a gripper (or other ±1) dimension switching one step earlier or later moves
+     an element by 2.0 and can dominate rel-L2 and MSE over a small subset (F-dit-gap);
+     look at `rel_l2_per_dim`;
+   - the cross-check: `crosscheck.ok` and `bit_mismatches == 0` for reference_hw and chip;
+   - the NEW decisions used by chip (`coverage.new_decisions`): a NEW choice can move the
+     result in either direction.
+5. chip → chip_rope_vpu is expected to be harmful where angles exceed ~400 rad or need sub-ulp
+   resolution (Pi0 prefix positions, flow timestep tables); a negligible delta on a short-context
+   model is not evidence that on-VPU tables are safe for long ones.
 
 Linear layers: every `nn.Linear` is covered, fp32 ones included (model_patcher.py:83-87, 496-499). The Llama
 eval skips `lm_head`, which was the collaborator's choice (eval.py:66).
