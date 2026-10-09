@@ -63,6 +63,8 @@ questions are in [docs/reference_profile.md](docs/reference_profile.md).
 
 ## L40S run matrix: the ladder per model
 
+Use tag l40s-run-2.1 (SA compile fix) for run 2.
+
 Setup, once per machine:
 
     git clone -b reference-profile git@github.com:ucb-ee290c/atlas-torchao.git && cd atlas-torchao

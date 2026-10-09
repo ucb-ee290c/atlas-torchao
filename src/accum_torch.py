@@ -396,17 +396,32 @@ def _sa_step(acc: torch.Tensor, xk: torch.Tensor, wk: torch.Tensor, lut: torch.T
     return sa_prod_add_bf16(lut[idx], acc)                        # sa_pe_compute (:229-233)
 
 
+def _sa_step_flat(acc: torch.Tensor, ops: torch.Tensor, xi: torch.Tensor, wi: torch.Tensor,
+                  dx: torch.Tensor, dw: torch.Tensor, lut: torch.Tensor):
+    """_sa_step on a shape-stable signature, for torch.compile (NEW).
+
+    acc     int32 [L], the [B, M, Nc] addends flattened
+    ops     int32 [S], xT [B, K, M] flattened followed by wT [B, K, Nc] flattened
+    xi, wi  int32 [L] (int64 if S >= 2^31), where element (b, m, n) reads its activation and
+            weight in ops at step k
+    dx, dw  0-dim, the advance of those positions per step (M and Nc)
+    Returns (new acc, xi + dx, wi + dw). Every tensor is fresh (not a view), 1-D or 0-dim, and
+    every per-shape or per-step integer is tensor data, so the only symbolic sizes are L and S:
+    no rank, stride, storage-offset, dtype or Python-int guard changes with the layer shape or
+    k, and one graph serves every call (a second only for L == 1). Values are _sa_step's."""
+    p = lut[(ops[xi] << 8) | ops[wi]]
+    return sa_prod_add_bf16(p, acc), xi + dx, wi + dw
+
+
 _sa_step_compiled = None
 
 
-def _get_sa_step(compile: bool):
-    """NEW: optional torch.compile of one step, so the ~60 element-wise ops of the adder fuse
-    into one kernel. The K loop stays in Python: rows are applied strictly in index order."""
+def _get_sa_step_compiled():
+    """NEW: torch.compile of one flat step, so the ~60 element-wise ops of the adder fuse into
+    one kernel. The K loop stays in Python: rows are applied strictly in index order."""
     global _sa_step_compiled
-    if not compile:
-        return _sa_step
     if _sa_step_compiled is None:
-        _sa_step_compiled = torch.compile(_sa_step, dynamic=True)
+        _sa_step_compiled = torch.compile(_sa_step_flat, dynamic=True)
     return _sa_step_compiled
 
 
@@ -444,18 +459,39 @@ def sa_linear_bits(x: torch.Tensor, w: torch.Tensor, b: Optional[torch.Tensor] =
         return out.reshape(out_shape)
     lut = e4m3_mul_to_prod_lut(device)
     xT = xb.transpose(1, 2).contiguous()                          # [B, K, M]
-    step = _get_sa_step(compile)
     for n0, n1 in _n_chunks(N, B * M * 4, chunk_elems):         # NEW: bounds temporaries
+        Nc = n1 - n0
         wT = wb[:, n0:n1].transpose(1, 2).contiguous()           # [B, K, Nc]
         if bb is not None:
-            acc = _sa_e4m3_to_bf16(bb[:, None, n0:n1]).expand(B, M, n1 - n0).contiguous()
+            acc = _sa_e4m3_to_bf16(bb[:, None, n0:n1]).expand(B, M, Nc).contiguous()
         else:
-            acc = torch.zeros(B, M, n1 - n0, dtype=torch.int32, device=device)
-        for k0 in range(0, K, rows):
-            k1 = min(K, k0 + rows)
-            for k in range(k0, k1):                               # rows in index order (:464)
-                acc = step(acc, xT[:, k], wT[:, k], lut)
-            acc = output_conv_stage(acc, sel, scale_exp)
+            acc = torch.zeros(B, M, Nc, dtype=torch.int32, device=device)
+        if compile:
+            # NEW: flat, shape-stable operands (see _sa_step_flat); acc is kept int32 and 1-D
+            # so its dtype and rank never change between tiles (output_conv_stage widens).
+            step = _get_sa_step_compiled()
+            ops = torch.cat([xT.reshape(-1), wT.reshape(-1)])
+            torch._dynamo.mark_static(lut, 0)
+            idt = torch.int32 if ops.numel() < 2 ** 31 else torch.int64
+            i = torch.arange(B * M * Nc, dtype=idt, device=device)
+            n, m, bi = i % Nc, (i // Nc) % M, i // (Nc * M)
+            xi = bi * (K * M) + m                                 # xT[b, 0, m]
+            wi = xT.numel() + bi * (K * Nc) + n                   # wT[b, 0, n]
+            dx = torch.tensor(M, dtype=idt, device=device)        # 0-dim: no size symbol
+            dw = torch.tensor(Nc, dtype=idt, device=device)
+            del i, n, m, bi
+            acc = acc.reshape(-1).clone()                         # fresh, not a view
+            for k0 in range(0, K, rows):
+                for _ in range(k0, min(K, k0 + rows)):            # rows in index order (:464)
+                    acc, xi, wi = step(acc, ops, xi, wi, dx, dw, lut)
+                acc = output_conv_stage(acc, sel, scale_exp).to(torch.int32)
+            acc = acc.reshape(B, M, Nc)
+        else:
+            for k0 in range(0, K, rows):
+                k1 = min(K, k0 + rows)
+                for k in range(k0, k1):                           # rows in index order (:464)
+                    acc = _sa_step(acc, xT[:, k], wT[:, k], lut)
+                acc = output_conv_stage(acc, sel, scale_exp)
         out[:, :, n0:n1] = acc
     return out.reshape(out_shape)
 

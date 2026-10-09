@@ -531,6 +531,48 @@ def test_sa_compiled_equals_eager():
     assert torch.equal(at.sa_linear_bits(x, w, compile=True), at.sa_linear_bits(x, w, compile=False))
 
 
+# (M, N, K, batch, bias, out_fmt_sel, scale_exp): layer-like shape mix, incl. M == 1, N == 1,
+# M == N, K not a multiple of rows, batched w and the E4M3 output feedback.
+_SA_COMPILE_SHAPES = [
+    (16, 64, 96, 0, False, 0, 0), (7, 33, 70, 0, True, 0, 0), (1, 48, 64, 0, False, 0, 0),
+    (5, 1, 40, 0, True, 0, 0), (12, 12, 12, 0, False, 0, 0), (3, 80, 33, 0, False, 1, 0),
+    (9, 20, 128, 0, True, 1, -6), (1, 1, 5, 0, False, 0, 0), (32, 8, 65, 0, False, 0, 0),
+    (4, 24, 31, 2, False, 0, 0), (6, 6, 48, 3, False, 0, 0), (2, 100, 17, 0, True, 0, 0),
+    (20, 3, 1, 0, False, 0, 0), (8, 40, 200, 0, False, 1, 5),
+]
+
+
+@pytest.mark.skipif(os.environ.get("ATLAS_TEST_COMPILE", "0") == "0",
+                    reason="torch.compile path is slow to build; set ATLAS_TEST_COMPILE=1")
+def test_sa_compiled_many_shapes_no_recompile_fallback(request):
+    """The compiled SA step must serve every layer shape from a bounded set of graphs: with
+    recompile_limit set to 2 and fail_on_recompile_limit_hit, any per-shape recompile beyond
+    that raises instead of silently falling back to eager. Bits equal eager and the C model."""
+    try:
+        lib = request.getfixturevalue("sa_lib")
+    except pytest.skip.Exception:
+        lib = None
+    from torch._dynamo.utils import counters
+    torch._dynamo.reset()
+    at._sa_step_compiled = None
+    counters.clear()
+    g = torch.Generator().manual_seed(12)
+    with torch._dynamo.config.patch(recompile_limit=2, fail_on_recompile_limit_hit=True):
+        for M, N, K, nb, bias, sel, scale in _SA_COMPILE_SHAPES:
+            lead = (nb,) if nb else ()
+            x, w = rand_bytes((*lead, M, K), g, "full"), rand_bytes((*lead, N, K), g, "full")
+            b = rand_bytes((N,), g, "full") if bias else None
+            kw = dict(scale_exp=scale, out_fmt_sel=sel)
+            got = at.sa_linear_bits(x, w, b, compile=True, **kw)
+            assert torch.equal(got, at.sa_linear_bits(x, w, b, compile=False, **kw)), (M, N, K)
+            if lib is not None and not nb:
+                assert torch.equal(got, c_sa_linear(lib, x, w, b, scale_exp=scale, sel=sel)), (M, N, K)
+    assert counters["stats"]["unique_graphs"] <= 2, dict(counters["stats"])
+    assert not counters["unimplemented"] and not counters["graph_break"]
+    torch._dynamo.reset()
+    at._sa_step_compiled = None
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA device")
 @pytest.mark.parametrize("fn", [at.sa_linear_bits, at.ipt_linear_bits])
 def test_cuda_equals_cpu(fn):
