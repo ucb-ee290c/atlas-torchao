@@ -112,8 +112,6 @@ model, checkpoint, config, observations, attention routes and action metric.
 
 ### Setup
 
-Branches `pi0` (model) and `pi0-eval` (`src/eval_pi0.py`).
-
 openpi's PyTorch Pi0 needs transformers 4.53.2 with openpi's `transformers_replace` files. That
 conflicts with the main environment (transformers 5.5.4, numpy 2), so Pi0 runs in a separate
 environment built from openpi's own lock file. This package runs there unchanged: the full test
@@ -247,7 +245,7 @@ transformers_replace):
 | headline metrics on joint deltas (pred - state, gt - state) | action RMSE on absolute joint positions (run_output_eval.py:251-295) | the state dominates the absolute norm and hides the quantization error |
 | flow noise from per-frame generators that reproduce the reference's draws, passed to `sample_actions` | global RNG: `torch.manual_seed(seed)` once per pass (run_output_eval.py:176, 216) or per frame (run_eval_mxu_io.py:579, 652) | a frame's noise must not depend on earlier frames, modes or profiles |
 | every mode on a freshly loaded model | baseline and patched pass on one model object (run_output_eval.py:172-236) | the profiles are not undone; equivalent under fixed noise |
-| DROID ground truth from `lerobot/droid_1.0.1`, joint positions, prompts required, openpi `resize_with_pad` (transcribed from image_tools.py:22-52) | run_eval.py:183-298: `droid_100` (cartesian), 224x224 stretch | the matching action space; openpi's own DROID preprocessing |
+| DROID ground truth from `lerobot/droid_1.0.1`, joint positions, prompts required, client-side `resize_with_pad` as openpi's DROID client (examples/droid/main.py:120-123) | run_eval.py:183-298: `droid_100` (cartesian), 224x224 stretch | the matching action space; openpi's own DROID preprocessing |
 | `lm_head` left unpatched (`--skip lm_head` default) | every nn.Linear (model_patcher.py:246-288) | never called (run_eval.py:20-22); about 3 GB less under reference_hw |
 | one score-matmul accumulator pair per attention module | one pair per patch function | the MXU models keep no state for activations |
 | chip keeps SigLIP on the SDPA route | SigLIP runs through SDPA in the reference | the eager route would change the softmax precision |

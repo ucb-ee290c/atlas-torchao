@@ -26,8 +26,9 @@ Observations (eval_pi0.py --obs):
          cartesian (meta/stats.json: observation.state is xyz + euler + gripper), so it does not
          match a joint-position policy; this loader follows its structure (seeded episode shuffle,
          one frame per episode, prompt tokenization through the same policy shim) on droid_1.0.1.
-         Frames are resized with openpi's resize_with_pad (aspect kept, black padding) instead of
-         the reference's 224x224 stretch (run_eval.py:247).
+         Frames are returned at their native 180x320; eval_pi0 resizes them with padding on the
+         client side as openpi's DROID client does (examples/droid/main.py:120-123), instead of the
+         reference's 224x224 stretch (run_eval.py:247).
 """
 
 from __future__ import annotations
@@ -256,30 +257,6 @@ def _decode_frame(path, t: float, fps: float) -> np.ndarray:
         return best.to_ndarray(format="rgb24")
 
 
-def openpi_resize_with_pad(img: np.ndarray, height: int = 224, width: int = 224) -> np.ndarray:
-    """openpi's resize_with_pad for one uint8 HWC image, transcribed from
-    openpi/shared/image_tools.py:22-52 (jax.image.resize, LINEAR, rounded back to uint8, black
-    padding); it is the ResizeImages(224, 224) model transform of the DROID configs
-    (training/config.py:119). The file cannot be imported as is next to the reference's stubs (they
-    replace openpi.shared), and the stubs' torch stand-in mishandles non-224 inputs, so the frames
-    are resized here, before the policy shim. Needs jax (in openpi's lock); it runs on the CPU so
-    that it does not claim GPU memory."""
-    os.environ.setdefault("JAX_PLATFORMS", "cpu")
-    import jax
-    import jax.numpy as jnp
-
-    cur_h, cur_w = img.shape[:2]
-    ratio = max(cur_w / width, cur_h / height)                                      # :26
-    rh, rw = int(cur_h / ratio), int(cur_w / ratio)                                 # :27-28
-    out = jax.image.resize(jnp.asarray(img)[None], (1, rh, rw, img.shape[2]),
-                           method=jax.image.ResizeMethod.LINEAR)                    # :29-31
-    out = jnp.round(out).clip(0, 255).astype(jnp.uint8)                             # :32-34
-    ph0, rem_h = divmod(height - rh, 2)                                             # :40-43
-    pw0, rem_w = divmod(width - rw, 2)
-    out = jnp.pad(out, ((0, 0), (ph0, ph0 + rem_h), (pw0, pw0 + rem_w), (0, 0)), constant_values=0)
-    return np.asarray(out[0])
-
-
 def droid_observations(n: int, horizon: int, frame_idx: int = 0, seed: int = 0,
                        repo: str = DROID_REPO, revision: str = DROID_REVISION) -> list[dict]:
     """NEW: n DROID frames with their recorded action chunks (see the module docstring).
@@ -325,8 +302,7 @@ def droid_observations(n: int, horizon: int, frame_idx: int = 0, seed: int = 0,
         rows = data[data["episode_index"] == ep].sort_values("frame_index")
         row = rows.iloc[frame_idx]
         gt = np.stack(rows["action"].iloc[frame_idx:frame_idx + horizon].to_numpy()).astype(np.float32)
-        obs = {key: openpi_resize_with_pad(
-                   _decode_frame(videos[key], float(erow[f"{col}/from_timestamp"]) + frame_idx / fps, fps))
+        obs = {key: _decode_frame(videos[key], float(erow[f"{col}/from_timestamp"]) + frame_idx / fps, fps)
                for key, col in vcols.items()}
         obs["observation/joint_position"] = np.asarray(row["observation.state.joint_position"], np.float32)
         obs["observation/gripper_position"] = np.asarray(row["observation.state.gripper_position"], np.float32)
