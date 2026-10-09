@@ -96,22 +96,6 @@ generic rules apply, and its custom attention is left unpatched (see `attention_
 
     python src/eval_policy.py --policy TRI-ML/multitask-dit-robosuite-wrist-diffusion-064000 --dataset TRI-ML/PretrainFinetune --n-frames 200 --modes bf16 collab_v0 collab_v0_hw reference --out out/dit_fast.json
 
-Pi0 (openpi PI0Pytorch, `pi0_droid_jointpos_polaris`; set `OPENPI_DIR`, `PI0_CHECKPOINT` and
-`PALIGEMMA_TOKENIZER`, see `src/pi0_model.py`). `--obs dummy` is the reference author's action-RMSE
-methodology (pi0-quant experiments/run_output_eval.py: 4 seeded random observations, seed 0),
-`--obs mxu_dummy` the observations of its per-layer runner (run_eval_mxu_io.py), `--obs droid`
-real lerobot/droid_1.0.1 frames with recorded joint-position actions (MSE / MAE vs ground truth;
-DROID is in this checkpoint's training mixture, so the episodes are not held out). The noise is
-the reference's own draws, passed explicitly (`--noise reference`); every mode runs twice.
-
-    python src/eval_pi0.py --obs dummy --modes bf16 collab_v0 collab_v0_hw reference torchao --out out/pi0_dummy_fast.json
-    python src/eval_pi0.py --obs droid --n-obs 32 --modes bf16 collab_v0 collab_v0_hw reference torchao --out out/pi0_droid_fast.json
-    python src/eval_pi0.py --obs mxu_dummy --modes reference --rmse --out out/pi0_mxu_reference.json
-    python src/eval_pi0.py --obs dummy --modes reference_hw --mxu ipt --rmse --out out/pi0_refhw_ipt.json
-    python src/eval_pi0.py --obs dummy --modes reference_hw --mxu sa --accum-compile --rmse --out out/pi0_refhw_sa.json
-    python src/eval_pi0.py --obs dummy --modes chip --mxu ipt --out out/pi0_chip_ipt.json
-    python src/eval_pi0.py --obs droid --n-obs 32 --modes reference_hw chip --mxu ipt --out out/pi0_droid_hw.json
-
 Check every reference_hw and chip result before quoting it:
 
 - `layers.<mode>.valid` is true;
@@ -128,7 +112,7 @@ model, checkpoint, config, observations, attention routes and action metric.
 
 ### Setup
 
-Branch `pi0` (eval entry `src/eval_pi0.py` arrives with the pi0-eval merge).
+Branches `pi0` (model) and `pi0-eval` (`src/eval_pi0.py`).
 
 openpi's PyTorch Pi0 needs transformers 4.53.2 with openpi's `transformers_replace` files. That
 conflicts with the main environment (transformers 5.5.4, numpy 2), so Pi0 runs in a separate
@@ -221,16 +205,38 @@ transformers_replace):
     deltas made absolute, first 8 dims).
   - Reported against the bf16 baseline: rel-L2, cosine, max abs, per dimension, and the
     reference's own per-observation and overall action RMSE / rel RMSE (`action_rmse.csv`).
+- Headline (NEW, `modes.<mode>.headline`): metrics in joint-delta space, pred - state on the 7
+  joint dims (gripper absolute): rel-L2, cosine and per dimension vs bf16 (`vs_bf16_delta`) and,
+  for `--obs droid`, MSE / MAE vs the recorded deltas (`vs_ground_truth_delta`). The reference's
+  action metric is on absolute joint positions (the shim adds the state back,
+  serve_quant.py:488-492), where the robot's pose dominates the norm and hides the quantization
+  error; it is kept unchanged as `vs_bf16.reference_action_rmse` (run_output_eval.py:251-295).
+- `--obs mxu_dummy` is the observation source of the reference's per-layer runner
+  (run_eval_mxu_io.py:114-133, 793-801: `torch.manual_seed(0)`, model-level random tensors and an
+  empty prompt, straight into `sample_actions`); use it with `--rmse` to compare per-component
+  RMSE with the reference's CSVs. `--obs sim --obs-dir DIR` loads sim-evals `obs_*.npz` files
+  through the reference's `_load_real_obs` (the files are not public). Model-level sources report
+  the first 8 dims of the model's normalized output.
 - `--obs droid` uses real frames with recorded actions from `lerobot/droid_1.0.1` (revision pinned
   in code), joint-position space, one frame per episode. It adds MSE and MAE against the
   recorded action chunk.
-  - DROID has no held-out split, so these episodes may be in the policy's training data.
+  - DROID has no held-out split, and droid 1.0.1 is 0.9 of this checkpoint's fine-tuning mixture
+    (openpi polaris_config.py:116-142), so these episodes may be in the policy's training data;
+    read the MSE / MAE as fidelity to recorded behaviour, with BF16 agreement as the primary metric.
   - The reference's own real-data loader reads `lerobot/droid_100`, whose state and actions are
     cartesian. That does not match a joint-position policy.
 - `--rmse` gives per-layer (isolated) and cumulative relative RMSE per component (reference
   StatsTracker and CSVs).
-- Determinism: each mode runs twice. The flow-matching noise comes from a generator seeded per
-  frame (`seed + frame`).
+- Noise: always passed explicitly to `sample_actions`, never drawn from the global RNG.
+  `--noise reference` (default) reproduces the reference's draws bit for bit with a per-frame
+  `torch.Generator` on the model device: policy-level sources take draw i of a stream seeded once
+  per pass (run_output_eval.py:176, 216), model-level sources a generator seeded `seed + i`
+  (run_eval_mxu_io.py:579, 652). `--noise per_frame` draws on the CPU from `seed + frame`, so it is
+  identical across devices. The JSON records the noise sha256.
+- Determinism: each mode runs twice with the same noise and must match bit for bit.
+- Agreement with bf16 also has per-dimension RMSE, max abs and cosine.
+- The reference's policy shim always runs 10 flow steps (serve_quant.py:479), so its
+  `--steps` is a label only; here `--steps` reaches `sample_actions`.
 - `chip` adds the coverage table and the crosscheck, as for the other models.
 - `--steps` defaults to the reference's 10. Fewer steps set `reduced_steps: true`.
 
@@ -238,7 +244,9 @@ transformers_replace):
 
 | Decision | Reference | Reason |
 |---|---|---|
-| per-frame seeded generator for the flow noise, passed to `sample_actions` | `torch.manual_seed(seed)` once per pass (run_output_eval.py:135-160) | a frame's noise must not depend on earlier frames or modes |
+| headline metrics on joint deltas (pred - state, gt - state) | action RMSE on absolute joint positions (run_output_eval.py:251-295) | the state dominates the absolute norm and hides the quantization error |
+| flow noise from per-frame generators that reproduce the reference's draws, passed to `sample_actions` | global RNG: `torch.manual_seed(seed)` once per pass (run_output_eval.py:176, 216) or per frame (run_eval_mxu_io.py:579, 652) | a frame's noise must not depend on earlier frames, modes or profiles |
+| every mode on a freshly loaded model | baseline and patched pass on one model object (run_output_eval.py:172-236) | the profiles are not undone; equivalent under fixed noise |
 | DROID ground truth from `lerobot/droid_1.0.1`, joint positions, prompts required, openpi `resize_with_pad` (transcribed from image_tools.py:22-52) | run_eval.py:183-298: `droid_100` (cartesian), 224x224 stretch | the matching action space; openpi's own DROID preprocessing |
 | `lm_head` left unpatched (`--skip lm_head` default) | every nn.Linear (model_patcher.py:246-288) | never called (run_eval.py:20-22); about 3 GB less under reference_hw |
 | one score-matmul accumulator pair per attention module | one pair per patch function | the MXU models keep no state for activations |
@@ -276,6 +284,8 @@ Start with F = 4, the reference's `--n-obs` default.
     # fast profiles, reference methodology (dummy obs) and real DROID frames with ground truth
     $P src/eval_pi0.py --obs dummy --n-obs 32 --modes bf16 collab_v0 collab_v0_hw reference torchao --rmse --out out/pi0_fast_dummy.json
     $P src/eval_pi0.py --obs droid --n-obs 32 --modes bf16 collab_v0 collab_v0_hw reference torchao --rmse --out out/pi0_fast_droid.json
+    # per-layer RMSE on the reference's per-layer observations (run_eval_mxu_io.py)
+    $P src/eval_pi0.py --obs mxu_dummy --modes bf16 reference --rmse --out out/pi0_mxu_reference.json
     # MXU models
     $P src/eval_pi0.py --obs dummy --n-obs $F --modes reference_hw --mxu ipt --rmse --out out/pi0_refhw_ipt.json
     $P src/eval_pi0.py --obs dummy --n-obs $F --modes reference_hw --mxu sa --accum-compile --rmse --out out/pi0_refhw_sa.json

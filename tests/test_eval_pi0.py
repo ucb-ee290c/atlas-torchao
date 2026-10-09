@@ -93,6 +93,9 @@ def _run(rt, tmp_path, n_obs, *extra):
         assert len(v["rmse_per_dim"]) == len(v["cosine_per_dim"]) == eval_pi0.ACTION_DIMS
         assert (tmp_path / "r_actions" / name / "action_rmse.csv").is_file()
         assert v["reference_action_rmse"]["overall_rmse"] > 0
+        # model-level outputs are deltas already: the delta metric is the same numbers
+        assert e["vs_bf16_delta"]["rel_l2"] == pytest.approx(v["rel_l2"])
+        assert e["headline"]["delta_rel_l2"] == e["vs_bf16_delta"]["rel_l2"]
         comps = {c["component"] for c in e["rmse"]["components"]}
         assert {"vision", "language", "action_expert", "action_head"} & comps, (name, comps)
     return res["modes"]
@@ -170,9 +173,32 @@ def test_cli_refuses_torchao_on_cpu(tmp_path, capsys):
     assert args.modes == ["bf16", "reference"]
 
 
+
+def test_delta_space_metrics():
+    """Policy-level chunks are absolute joint positions (state added back); the delta metric
+    subtracts the frame's state on the 7 joint dims and leaves the gripper absolute."""
+    state_j, grip = np.arange(7, dtype=np.float32) + 10, np.array([0.5], np.float32)
+    fr = {"obs": {"observation/joint_position": state_j, "observation/gripper_position": grip}}
+    delta = np.full((4, 8), 0.01, np.float32)
+    absolute = delta.copy()
+    absolute[:, :7] += state_j
+    got = eval_pi0.to_delta([absolute], [fr], "policy")[0]
+    assert np.allclose(got, delta, atol=1e-5)
+    assert np.array_equal(eval_pi0.to_delta([absolute], [fr], "model")[0], absolute)   # model level: unchanged
+    # a 10% error on the deltas is ~0.1% of the absolute norm: the reason delta is the headline
+    noisy = absolute.copy()
+    noisy[:, :7] += 0.001
+    a = eval_pi0.agreement(eval_pi0._t([noisy]), eval_pi0._t([absolute]))
+    d = eval_pi0.agreement(eval_pi0._t(eval_pi0.to_delta([noisy], [fr], "policy")),
+                           eval_pi0._t([got]))
+    assert d["rel_l2"] > 50 * a["rel_l2"]
+    gt = eval_pi0.vs_ground_truth(eval_pi0.to_delta([noisy], [fr], "policy"), [got])
+    assert gt["mae"] == pytest.approx(0.001 * 7 / 8, rel=1e-2)
+
+
 def test_droid_frames_resized_on_client(rt):
     """DROID's 180x320 frames are padded to 224x224 before the policy shim, as openpi's DROID
-    client does; the model's own resize path drops the batch dimension."""
+    client does; the model's stubbed resize path drops the batch dimension."""
     import pi0_model
 
     obs = {k: np.full((180, 320, 3), 200, np.uint8) for k in pi0_model.DROID_CAMERAS}

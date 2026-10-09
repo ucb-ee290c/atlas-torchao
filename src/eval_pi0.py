@@ -31,6 +31,12 @@ Flow-matching noise (--noise), always explicit (passed to sample_actions), never
   per_frame  pi0_model.frame_noise(seed + i): drawn on the CPU, so identical across devices.
 
 Per mode:
+  headline         (NEW) the delta-space numbers below: agreement with bf16 and, for droid, MSE /
+                   MAE vs the recorded deltas. The reference's action metric is on absolute joint
+                   positions (state added back, serve_quant.py:488-492), where the robot's pose
+                   dominates the norm and hides the quantization error;
+  vs_bf16_delta,   as vs_bf16 / vs_ground_truth on joint deltas (pred - state, gt - state on the
+  vs_ground_truth_delta  7 joint dims; gripper absolute). Model-level sources are deltas already;
   vs_bf16          rel_l2, cosine, max_abs, per-dimension rel_l2 (eval_policy.agreement), plus
                    per-dimension RMSE / max_abs / cosine (NEW), and the reference's action metric
                    (run_output_eval.py:251-295: per-observation and overall RMSE, ref RMS, rel
@@ -93,7 +99,8 @@ NEW_DECISIONS = [
                  "and video file, RandomState(seed) episode shuffle, one frame per episode, episodes "
                  "without a prompt skipped; images resized with padding to 224x224 on the client "
                  "side as openpi's DROID client does (examples/droid/main.py:120-123)",
-     "reference": "run_eval.py:183-298 reads lerobot/droid_100 and stretches images to 224x224",
+     "reference": "run_eval.py:183-298 reads lerobot/droid_100 and stretches images to 224x224 "
+                  "(run_eval.py:247)",
      "reason": "droid_100's state/actions are cartesian (meta/stats.json), not the joint-position "
                "space of pi0_droid_jointpos_polaris; droid_1.0.1 has the matching recorded actions. "
                "DROID 1.0.1 is this checkpoint's training mixture (openpi polaris_config.py:116-142, "
@@ -103,6 +110,12 @@ NEW_DECISIONS = [
                   "(run_output_eval.py:172-236)",
      "reason": "the profiles replace modules in place and are not undone; equivalent, since the "
                "unpatched model is deterministic under fixed noise"},
+    {"decision": "headline metrics in joint-delta space (pred - state, gt - state on the joint dims): "
+                 "rel_l2, cosine, per dimension, MSE / MAE vs the recorded deltas",
+     "reference": "action RMSE on absolute joint positions after AbsoluteActions "
+                  "(run_output_eval.py:251-295, serve_quant.py:488-492)",
+     "reason": "the state added back dominates the absolute norm, so absolute rel-L2 / rel RMSE "
+               "understate the quantization error; the reference metric is kept as is"},
     {"decision": "agreement metrics beyond the reference RMSE: rel_l2, cosine, max_abs and "
                  "per-dimension rel_l2 / RMSE / max_abs / cosine",
      "reference": "overall and per-observation RMSE and rel RMSE only (run_output_eval.py:251-295)",
@@ -271,6 +284,46 @@ def vs_bf16(preds, ref, csv_path) -> dict:
     return out
 
 
+JOINT_DIMS = 7   # AbsoluteActions(make_bool_mask(7, -1)): joints absolute, gripper not (serve_quant.py:488-492)
+
+
+def frame_state(obs) -> np.ndarray | None:
+    """The raw robot state (7 joints + gripper) a policy-level frame was given, as the shim builds
+    it (serve_quant.py:424-427); None for model-level frames."""
+    if not isinstance(obs, dict):
+        return None
+    return np.concatenate([np.asarray(obs["observation/joint_position"], np.float32).flatten(),
+                           np.asarray(obs["observation/gripper_position"], np.float32).flatten()])
+
+
+def to_delta(chunks, frames, level):
+    """NEW: actions as joint deltas from the frame's state (pred - state on the joint dims, the
+    inverse of the shim's AbsoluteActions; the gripper stays absolute, as the model emits it).
+    Model-level outputs are already deltas (normalized) and are returned unchanged."""
+    if level != "policy":
+        return [np.asarray(c, np.float32) for c in chunks]
+    out = []
+    for c, fr in zip(chunks, frames):
+        c = np.array(c, dtype=np.float32, copy=True)
+        c[:, :JOINT_DIMS] -= frame_state(fr["obs"])[:JOINT_DIMS]
+        out.append(c)
+    return out
+
+
+def headline(entry) -> dict:
+    """NEW: the delta-space numbers first. On absolute joint positions the robot's pose dominates
+    the norm, so the reference's absolute-space rel RMSE understates the quantization error."""
+    h = {}
+    if "vs_bf16_delta" in entry:
+        d = entry["vs_bf16_delta"]
+        h.update(delta_rel_l2=d["rel_l2"], delta_cosine=d["cosine"], delta_max_abs=d["max_abs"],
+                 reference_rel_rmse_absolute=entry["vs_bf16"]["reference_action_rmse"]["rel_rmse"])
+    if "vs_ground_truth_delta" in entry:
+        h.update(gt_delta_mse=entry["vs_ground_truth_delta"]["mse"],
+                 gt_delta_mae=entry["vs_ground_truth_delta"]["mae"])
+    return h
+
+
 def vs_ground_truth(preds, gts) -> dict:
     """MSE / MAE against the recorded chunks (eval_policy.error_vs_gt, no padding: every chunk is
     complete), plus per dimension (NEW)."""
@@ -339,7 +392,7 @@ def evaluate(args, frames, build, level, horizon, action_dim, out: Path) -> dict
     rmse_dir = Path(args.rmse_dir) if args.rmse_dir else out.with_name(out.stem + "_rmse")
     act_dir = out.with_name(out.stem + "_actions")
     modes = {}
-    ref = clean = clean_run = None
+    ref = ref_delta = clean = clean_run = None
     for mode in ["bf16", *[m for m in args.modes if m != "bf16"]]:   # bf16 first: the baseline
         print(f"== {mode}", flush=True)
         model, inv, layers, policy = build(mode)
@@ -376,14 +429,20 @@ def evaluate(args, frames, build, level, horizon, action_dim, out: Path) -> dict
         entry["valid"] = bool((layers or {}).get("valid", True))
         if layers is not None and layers.get("quantized", 1) == 0 and not layers.get("attention_sites"):
             print(f"WARNING: mode {mode} quantized no layers; its numbers are the baseline's", flush=True)
+        delta = to_delta(preds, frames, level)
         if frames[0]["gt"] is not None:
-            entry["vs_ground_truth"] = vs_ground_truth(preds, [f["gt"] for f in frames])
+            gts = [f["gt"] for f in frames]
+            entry["vs_ground_truth"] = vs_ground_truth(preds, gts)
+            entry["vs_ground_truth_delta"] = vs_ground_truth(delta, to_delta(gts, frames, level))
         if mode == "bf16":
-            ref = preds
+            ref, ref_delta = preds, delta
         else:
             entry["vs_bf16"] = vs_bf16(preds, ref, act_dir / mode / "action_rmse.csv")
+            entry["vs_bf16_delta"] = {**agreement(_t(delta), _t(ref_delta)), **per_dim(delta, ref_delta)}
+        entry["headline"] = headline(entry)
         modes[mode] = entry
         brief = {k: v for k, v in entry.items() if k not in ("actions", "patch_coverage", "layers", "rmse")}
+        print(mode, "headline:", json.dumps(entry["headline"]), flush=True)
         print(mode, json.dumps(brief, default=str)[:600], flush=True)
         print(mode, "patch coverage:", json.dumps(entry["patch_coverage"]["summary"]), flush=True)
         if isinstance((layers or {}).get("coverage"), dict):
@@ -456,7 +515,7 @@ def client_resize(frames, size=224) -> list[dict]:
     """Camera images resized with padding to 224x224 on the client side, as openpi's DROID client
     does before sending (openpi examples/droid/main.py:120-123, openpi_client image_tools
     .resize_with_pad) and as the reference pre-resizes its sim observations (run_eval_mxu_io.py:
-    189-190). Without it the 180x320 DROID frames reach the model's resize_with_pad_torch, which
+    189-190). Without it the 180x320 DROID frames reach the stubbed resize_with_pad_torch, which
     drops the batch dimension (preprocessing_pytorch.py:146 then fails)."""
     from openpi_client import image_tools
 
