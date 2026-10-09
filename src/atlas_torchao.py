@@ -53,7 +53,8 @@ class AtlasQuantLinear(nn.Module):
                 f"input_scale_exp={int(self.input_scale_exp)}")
         
 @register_quantize_module_handler(AtlasQConfig)
-def _atlas_handler(module: nn.Linear, config: AtlasQConfig, **kwargs) -> nn.Module:
+def _atlas_handler(module: nn.Module, config: AtlasQConfig) -> nn.Module:
+    print(module)
     return AtlasQuantLinear(module, config)
 
 def skip_lm_head(module: nn.Module, fqn: str) -> bool:

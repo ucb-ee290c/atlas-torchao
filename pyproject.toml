@@ -8,7 +8,7 @@ version = "0.0.1"
 requires-python = ">=3.11"
 dependencies = [
     "torch==2.11.0",
-    "torch-mlir==20261001",
+    "torch-mlir",  
     "torchvision==0.26.0",
     "torchao==0.18.0",
     "transformers==5.5.4",
@@ -17,9 +17,9 @@ dependencies = [
     "accelerate==1.15.0",
     "safetensors==0.8.0",
     "datasets==5.1.0",
-    "lerobot[smolvla]==0.6.1",
     "numpy==2.2.6",
-    # model2MLIR's own deps (model2MLIR itself is installed from the submodule with --no-deps)
+    "ml_dtypes>=0.4.0",
+    # model2MLIR's internal dependencies
     "xdsl==0.65.0",
     "structlog==25.5.0",
     "PyYAML==6.0.3",

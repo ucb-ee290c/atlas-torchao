@@ -37,14 +37,15 @@ if __name__ == "__main__":
     SEQLEN = 2048
     model = load_llama(model_path, seqlen=SEQLEN)
     dev = next(model.parameters()).device
-
+            
+    quantize_(model, AtlasQConfig(), filter_fn=skip_lm_head)
+    print("Quantized model")
+    
     from datautils import get_wikitext2
     trainloader, testenc = get_wikitext2(nsamples=16, seed=0, seqlen=SEQLEN, model=model_path)
     ppl = llama_eval(model, testenc, seqlen=SEQLEN)
     print("Baseline ppl:", ppl)
-        
-    quantize_(model, AtlasQConfig(), filter_fn=skip_lm_head)
-    print("Quantized model")
+
     
     ppl = llama_eval(model, testenc, seqlen=SEQLEN)
     print("Quantized ppl:", ppl)

@@ -4,3 +4,5 @@ __pycache__
 *.svgmodel2MLIR/
 .vscode
 src/out/
+*.egg-info
+model2MLIR
