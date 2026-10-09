@@ -41,7 +41,8 @@ def main():
     from datautils import get_wikitext2
     from modelutils import load_llama
     from ppl_protocols import PROTOCOLS, load_mxq_windows, mxq_eval
-    from quant_modes import ALL_MODES, add_profile_args, finalize_report, quantize, require_mode_supported
+    from quant_modes import (ALL_MODES, add_profile_args, add_subset_compare_arg, finalize_report, ladder_deltas,
+                             ladder_record, quantize, require_mode_supported, subset_compare_modes)
 
     ap = argparse.ArgumentParser(description="WikiText-2 perplexity of a Llama-family model per quantization mode")
     ap.add_argument("--model", required=True, help="local path or HF id of the model")
@@ -66,7 +67,11 @@ def main():
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--out", default=None, help="write results as JSON")
     add_profile_args(ap)
+    add_subset_compare_arg(ap)
     args = ap.parse_args()
+    # a subset: seeded / first-N mxq windows, or the first --max-windows of the split
+    subset = bool(args.max_windows) if args.protocol != "mxq" else args.nsamples > 0
+    args.modes, added = subset_compare_modes(args.modes, args.subset_compare == "on" and subset)
     for m in args.modes:
         try:
             require_mode_supported(m, args.device)
@@ -79,7 +84,8 @@ def main():
 
     result = {"args": vars(args), "torch": torch.__version__, "host": platform.node(),
               "gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else None,
-              "protocol": args.protocol, "ppl": {}, "layers": {}}
+              "protocol": args.protocol, "ppl": {}, "layers": {}, "ladder": {},
+              "subset_compare": {"enabled": bool(added) or None, "added_modes": added}}
     if args.protocol == "mxq":
         windows, picked = load_mxq_windows(args.model, args.seqlen, args.nsamples,
                                            None if args.sequential else args.seed)
@@ -101,6 +107,18 @@ def main():
         model = load_llama(args.model, seqlen=args.seqlen, device=args.device)  # fresh weights per mode
         if mode != "bf16":
             result["layers"][mode] = quantize(model, mode, skip=["lm_head"], options=args)
+        result["ladder"][mode] = (result["layers"][mode]["ladder"] if mode != "bf16"
+                                  else ladder_record("bf16", {}, args))
+        eq = result["ladder"][mode].get("equivalent_to")
+        if eq in result["ppl"]:
+            # the op class this step adds is absent (TinyLlama has no Conv2d): same model, same numbers
+            result["ladder"][mode]["duplicate_of"] = eq
+            result["ppl"][mode] = result["ppl"][eq]
+            if args.protocol == "mxq":
+                result["per_sample"][mode] = result["per_sample"][eq]
+            print(f"{mode}: identical to {eq} (nothing added to quantize); not re-run", flush=True)
+            del model
+            continue
         rm = None
         if clean is not None and mode != "bf16":
             # NEW: a causal LM is all language model; the reference taxonomy has no rule for its paths
@@ -128,6 +146,7 @@ def main():
             torch.cuda.empty_cache()
     if args.rmse:
         result["reference_provenance"] = layer_rmse.ref_provenance()
+    result["ladder_deltas"] = ladder_deltas({m: {"ppl": v} for m, v in result["ppl"].items()}, result["ladder"])
     if args.out:
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
         Path(args.out).write_text(json.dumps(result, indent=2))
