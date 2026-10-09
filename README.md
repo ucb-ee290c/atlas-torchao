@@ -128,8 +128,6 @@ model, checkpoint, config, observations, attention routes and action metric.
 
 ### Setup
 
-Branch `pi0` (eval entry `src/eval_pi0.py` arrives with the pi0-eval merge).
-
 openpi's PyTorch Pi0 needs transformers 4.53.2 with openpi's `transformers_replace` files. That
 conflicts with the main environment (transformers 5.5.4, numpy 2), so Pi0 runs in a separate
 environment built from openpi's own lock file. This package runs there unchanged: the full test
@@ -229,8 +227,12 @@ transformers_replace):
     cartesian. That does not match a joint-position policy.
 - `--rmse` gives per-layer (isolated) and cumulative relative RMSE per component (reference
   StatsTracker and CSVs).
-- Determinism: each mode runs twice. The flow-matching noise comes from a generator seeded per
-  frame (`seed + frame`).
+- Also `--obs mxu_dummy` and `--obs sim`: the observations of the reference's per-layer runner
+  (run_eval_mxu_io.py).
+- Noise is always passed explicitly to `sample_actions`. The default, `--noise reference`,
+  reproduces the reference's own draws bit for bit. `--noise per_frame` draws from a CPU generator
+  seeded with `seed + frame`, which is device-independent.
+- Determinism: each mode runs twice with the same noise.
 - `chip` adds the coverage table and the crosscheck, as for the other models.
 - `--steps` defaults to the reference's 10. Fewer steps set `reduced_steps: true`.
 
@@ -238,8 +240,8 @@ transformers_replace):
 
 | Decision | Reference | Reason |
 |---|---|---|
-| per-frame seeded generator for the flow noise, passed to `sample_actions` | `torch.manual_seed(seed)` once per pass (run_output_eval.py:135-160) | a frame's noise must not depend on earlier frames or modes |
-| DROID ground truth from `lerobot/droid_1.0.1`, joint positions, prompts required, openpi `resize_with_pad` (transcribed from image_tools.py:22-52) | run_eval.py:183-298: `droid_100` (cartesian), 224x224 stretch | the matching action space; openpi's own DROID preprocessing |
+| flow noise always passed explicitly to `sample_actions`. The default reproduces the reference's draws; the option `--noise per_frame` uses a CPU generator seeded per frame | `torch.manual_seed(seed)` once per pass (run_output_eval.py) | noise isolated from whatever else uses the global RNG (clean `--rmse` pass, other modes) |
+| DROID ground truth from `lerobot/droid_1.0.1`, joint positions, prompts required, client-side `resize_with_pad` as openpi's DROID client (examples/droid/main.py:120-123) | run_eval.py:183-298: `droid_100` (cartesian), 224x224 stretch | the matching action space; openpi's own DROID preprocessing |
 | `lm_head` left unpatched (`--skip lm_head` default) | every nn.Linear (model_patcher.py:246-288) | never called (run_eval.py:20-22); about 3 GB less under reference_hw |
 | one score-matmul accumulator pair per attention module | one pair per patch function | the MXU models keep no state for activations |
 | chip keeps SigLIP on the SDPA route | SigLIP runs through SDPA in the reference | the eager route would change the softmax precision |
