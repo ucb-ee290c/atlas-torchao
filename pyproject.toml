@@ -25,9 +25,15 @@ dependencies = [
     "PyYAML==6.0.3",
 ]
 
+[project.optional-dependencies]
+# The reference author's CPU functional models (third_party/pi0-quant) used as oracles and as the
+# `ref_cpu` accumulation implementation: ipt_numba needs numba; ipt_c and systolic_c are compiled
+# with gcc at first use.
+reference = ["numba>=0.60"]
+
 [tool.setuptools]
 package-dir = {"" = "src"}
-py-modules = ["atlas_quant", "atlas_torchao", "atlas_m2m", "quant_modes", "modelutils", "datautils", "eval", "eval_policy"]
+py-modules = ["atlas_quant", "atlas_torchao", "atlas_m2m", "quant_modes", "modelutils", "datautils", "eval", "eval_policy", "ref_loader"]
 
 # Not enabled yet: the m2m quantization adapter (atlas_m2m_adapter:atlas_fp8_adapter) is not written.
 # [project.entry-points."m2m.quantization_adapters"]

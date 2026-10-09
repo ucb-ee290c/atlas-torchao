@@ -1,3 +1,9 @@
 [submodule "model2MLIR"]
 	path = model2MLIR
 	url = https://github.com/ucb-bar/model2MLIR.git
+[submodule "third_party/pi0-quant"]
+	path = third_party/pi0-quant
+	url = https://github.com/chloe-wong/pi0-quant.git
+[submodule "third_party/smolVLA-quant"]
+	path = third_party/smolVLA-quant
+	url = https://github.com/chloe-wong/smolVLA-quant.git
