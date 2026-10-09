@@ -2,3 +2,5 @@ __pycache__
 *.mlir
 *.pt
 *.svgmodel2MLIR/
+.vscode
+src/out/

@@ -14,7 +14,6 @@ model = load_llama(TINY_LLAMA, seqlen=512)
 
 trainloader, testenc = get_wikitext2(nsamples=4, seed=0, seqlen=512, model=TINY_LLAMA)
 
-
 model = load_llama(TINY_LLAMA, seqlen=512)          # CPU, no hooks
 dev = next(model.parameters()).device
 ids = trainloader[0][0].to(dev)

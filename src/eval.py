@@ -1,66 +1,48 @@
 from torch import nn
 
 import torch 
-import math 
+import math
+
+import torch
+from tqdm import tqdm
+
 
 @torch.no_grad()
-def llama_eval(model, testenc, dev):
-    print('Evaluating ...')
+def llama_eval(model, testenc, seqlen=None):
+    """Perplexity over non-overlapping windows of `seqlen` tokens.
+    testenc: tokenizer output (with .input_ids) or a [1, N] tensor of token ids."""
+    ids = getattr(testenc, "input_ids", testenc)          # accept BatchEncoding or tensor
+    if ids.dim() == 1:
+        ids = ids.unsqueeze(0)
+    seqlen = seqlen or getattr(model, "seqlen", 512)     # default: the model's own seqlen
+    dev = next(model.parameters()).device
 
-    testenc = testenc.input_ids
-    nsamples = testenc.numel() // model.seqlen
+    losses = []
+    
+    for i in tqdm(range(ids.shape[1] // seqlen)):
+        window = ids[:, i * seqlen:(i + 1) * seqlen].to(dev)
+        losses.append(model(window, labels=window, use_cache=False).loss.float())
 
-    # Save original config settings
-    use_cache = model.config.use_cache
-    model.config.use_cache = False
+    return torch.exp(torch.stack(losses).mean()).item()
 
-    batch_size = 1
-    n_batches = math.ceil(nsamples / batch_size)
 
-    nlls = []
+if __name__ == "__main__":
+    from modelutils import load_llama, load_smolvla
+    from torchao.quantization import quantize_
+    from atlas_torchao import AtlasQConfig, skip_lm_head
 
-    # Process in batches
-    from tqdm import tqdm
-    for batch_idx in tqdm(range(n_batches)):
-        # print("Batch", batch_idx, "of", n_batches, flush=True)
-        start_idx = batch_idx * batch_size
-        end_idx = min((batch_idx + 1) * batch_size, nsamples)
-        current_batch_size = end_idx - start_idx
+    model_path = "/rscratch/agarcia/TinyLlama-1.1B-Chat-v1.0"
+    #model_path = "/rscratch/agarcia/Llama-2-7b-hf"
 
-        # Prepare batch input
-        batch_input_ids = torch.stack([
-            testenc[:, (i * model.seqlen):((i + 1) * model.seqlen)]
-            for i in range(start_idx, end_idx)
-        ]).squeeze(1).to(model.device)
+    SEQLEN = 2048
+    model = load_llama(model_path, seqlen=SEQLEN)
+    dev = next(model.parameters()).device
 
-        # Forward pass through the entire model at once
-        outputs = model(
-            input_ids=batch_input_ids,
-            use_cache=False,
-            return_dict=True
-        )
-
-        # Calculate loss for each item in batch
-        for j in range(current_batch_size):
-            logits = outputs.logits[j]
-            shift_logits = logits[:-1, :].contiguous()
-            shift_labels = batch_input_ids[j, 1:].contiguous()
-
-            loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-            neg_log_likelihood = loss.float() * model.seqlen
-            nlls.append(neg_log_likelihood)
-        
-        # OOM
-        del outputs
-        torch.cuda.empty_cache()
-
-    # Calculate perplexity
-    ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * model.seqlen))
-    print(ppl.item())
-
-    # Restore original config
-    model.config.use_cache = use_cache
-
-    return ppl.item()
-
+    from datautils import get_wikitext2
+    trainloader, testenc = get_wikitext2(nsamples=16, seed=0, seqlen=SEQLEN, model=model_path)
+    
+    quantize_(model, AtlasQConfig(quantize_activations=True), filter_fn=skip_lm_head)
+    print("Quantized model")
+    
+    ppl = llama_eval(model, testenc, seqlen=SEQLEN)
+    print("Quantized ppl:", ppl)
