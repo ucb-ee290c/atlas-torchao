@@ -57,7 +57,9 @@ def test_collab_v0_golden(golden_src, tmp_path, old, new):
     """collab_v0 (and its aliases) == the atlas-eval code at daf8e78, bit for bit."""
     a = _run(golden_src, old, tmp_path / "old.pt")
     b = _run(REPO / "src", new, tmp_path / "new.pt")
-    assert a["rep"] == b["rep"]
+    # the report gained the ladder record after daf8e78; everything else is unchanged
+    assert a["rep"] == {k: v for k, v in b["rep"].items() if k != "ladder"}
+    assert b["rep"]["ladder"]["profile"] == new.replace("atlas", "collab_v0")
     assert torch.equal(a["y"].view(torch.int16), b["y"].view(torch.int16))
     assert a["sd"].keys() == b["sd"].keys()
     for k in a["sd"]:

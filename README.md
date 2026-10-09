@@ -23,21 +23,45 @@ The reference author's quantization code is pinned as two submodules and loaded 
 
 Do not use `--recursive`: smolVLA-quant's nested `npu_model` submodule is not needed.
 
-## Profiles
+## Profiles and the coverage ladder
 
-`--modes` accepts `bf16`, `collab_v0` (alias `atlas`), `collab_v0_hw` (alias `atlas_hw`),
-`reference`, `reference_hw`, `chip` and `torchao`. `chip` is the headline: the whole model as it
-would run on Atlas (MXU model + VPU + scalar core, host fallbacks reported). `reference_hw` is the
-MXU-only comparison. Every numerics decision and its source, the findings and the open questions are
-in [docs/reference_profile.md](docs/reference_profile.md).
+`--modes` accepts the ladder steps below plus `collab_v0_hw` (alias `atlas_hw`) and `torchao`.
+The ladder adds one source of error per step, so the difference between two consecutive steps,
+measured on the same windows / frames, isolates that source:
+
+| step | mode | adds over the previous step | quantized / emulated |
+|---|---|---|---|
+| 1 | `bf16` | baseline | nothing |
+| 2 | `collab_v0` (alias `atlas`) | Linear FP8, the collaborator's way: ceil/448 weight scale, fixed 2^0 activation scale, torch cast | Linear; framework accumulation |
+| 3 | `ref_linear` | reference numerics: dynamic po2 floor(log2(amax/256)) scales, vpack cast, BF16 bias after the rescale | Linear; framework accumulation |
+| 4 | `ref_attn` | attention Q·Kᵀ and P·V, per-head FP8 | + attention |
+| 5 | `ref_conv` (alias `reference`) | Conv2d | + Conv2d (SmolVLA, Multi-Task DiT, Pi0). TinyLlama has none: `ref_conv` ≡ `ref_attn` (the JSON says `equivalent_to`; do not run both) |
+| 6 | `reference_hw` | Atlas MXU accumulation (`--mxu ipt`, default, or `sa`), cross-checked | all matmuls through the MXU model |
+| 7 | `chip` | VPU / scalar-core vector ops, lane-exact; RoPE and timestep sin/cos tables as compile-time host constants (`--chip-rope host`, the default, NEW) | everything; host fallbacks listed |
+| 8 | `chip_rope_vpu` | the tables computed on the VPU instead (the reference author's treatment) | everything |
+
+Steps 3-5 are the reference profile with an op subset (`--ops` defaults to the step's own classes;
+an explicit `--ops` overrides every profile and is recorded as off the ladder). Every result JSON
+records, per mode, `ladder`: the step, what it adds, `quantized_op_classes` with counts
+(`linear`, `attention` sites, `conv2d`), `operand_cast`, `accumulation`, `vector_ops`,
+`rope_tables`, and `on_ladder` with `off_ladder_reasons` (an explicit `--ops`, `chip` with
+`--chip-rope vpu`, `--chip-mxu framework`). `ladder_deltas` lists the consecutive-step differences
+of the modes of that run. How to read them: [docs/reference_profile.md](docs/reference_profile.md#reading-the-ladder).
+
+Subset steps: `reference_hw`, `chip` and `chip_rope_vpu` run an MXU model and are evaluated on a
+subset (seeded windows, a few frames). `--subset-compare on` (the default) adds `bf16` and
+`ref_conv` to such a run, so steps 5 → 6 → 7 → 8 are measured on identical windows / frames and
+noise (`subset_compare.added_modes`, `added_by_subset_compare` in the JSON). Never subtract a
+subset result from a full-split result.
 
 Reference-profile options: `--mxu ipt|sa` (default `ipt`, the ipt_numba model, which is the reference
 author's choice), `--mxu-impl torch|ref_cpu` (default `torch`), `--accum-compile` (compile the SA
 step), `--ops linear,conv2d,attention`, and `--crosscheck on|off` (default on). With the cross-check on,
 a seeded sample of real calls is recomputed by the reference CPU model, and any bit mismatch sets
-`valid: false` in the result JSON.
+`valid: false` in the result JSON. Every numerics decision and its source, the findings and the open
+questions are in [docs/reference_profile.md](docs/reference_profile.md).
 
-## L40S run matrix
+## L40S run matrix: the ladder per model
 
 Setup, once per machine:
 
@@ -47,36 +71,46 @@ Setup, once per machine:
     export PYTHONPATH=src HF_HOME=/path/to/hf_cache TL=/path/to/TinyLlama-1.1B-Chat-v1.0
     mkdir -p out
 
-Gates (stop if any fail):
+Gates (stop if any fail), then the benchmark that sizes every subset job:
 
     python -m pytest -q tests
     ATLAS_TEST_COMPILE=1 python -m pytest -q tests/test_accum_torch.py
     python scripts/bench_accum.py --device cuda --compile --check --ref | tee out/bench_accum.txt
 
-Size the slow jobs from the measured throughput, so that each job fits in about 1–2 h:
+Benchmark first: size each subset job from the measured MAC/s of the chosen MXU model in
+`out/bench_accum.txt` (ipt, or SA compiled), so that it fits in about 1–2 h:
 
-    N = floor(seconds * MAC_per_s / (2048 * 0.97e9))
+    N = floor(seconds * MAC_per_s / (MAC per window or frame))
 
-Use the ipt or SA compiled MAC/s from `out/bench_accum.txt` for 2048-token TinyLlama windows.
-Start with N = 4 if in doubt.
+TinyLlama is 0.97 GMAC per token (2048-token windows: 2.0e12); a Pi0 frame is 2.14e12; SmolVLA and
+Multi-Task DiT: one frame is a forward of a few hundred tokens times the flow / denoising steps (time
+one `reference_hw` frame and scale). Start with N = 4 if in doubt. `chip` costs about the same as
+`reference_hw` on the MXU plus the VPU emulation; `chip_rope_vpu` the same as `chip`.
 
-TinyLlama (WikiText-2):
+TinyLlama (WikiText-2; no Conv2d, so step 5 is not run):
 
-    # fast profiles, full split; the collaborator's protocol for comparison
-    python src/eval.py --model $TL --modes bf16 collab_v0 collab_v0_hw reference torchao --out out/tl_fast_default.json
-    python src/eval.py --model $TL --protocol mxq --nsamples 0 --modes bf16 collab_v0 collab_v0_hw reference torchao --rmse --out out/tl_fast_mxq.json
-    # MXU models, seeded windows
-    python src/eval.py --model $TL --protocol mxq --nsamples $N --modes reference_hw --mxu ipt --rmse --out out/tl_refhw_ipt.json
-    python src/eval.py --model $TL --protocol mxq --nsamples $N --modes reference_hw --mxu sa --accum-compile --rmse --out out/tl_refhw_sa.json
-    # whole chip (headline)
-    python src/eval.py --model $TL --protocol mxq --nsamples $N --modes chip --mxu ipt --out out/tl_chip_ipt.json
+    # steps 1-4 (fast), the whole split
+    python src/eval.py --model $TL --protocol mxq --nsamples 0 --modes bf16 collab_v0 ref_linear ref_attn --rmse --out out/tl_ladder_fast.json
+    # steps 6-8 on N seeded windows; --subset-compare adds bf16 and ref_conv (== ref_attn) on the same windows
+    python src/eval.py --model $TL --protocol mxq --nsamples $N --modes reference_hw chip chip_rope_vpu --mxu ipt --out out/tl_ladder_subset.json
+    # side profiles: the collaborator's protocol, the hardware cast, stock torchao
+    python src/eval.py --model $TL --modes bf16 collab_v0 collab_v0_hw ref_conv torchao --out out/tl_fast_default.json
 
-SmolVLA (lerobot/svla_so100_pickplace; set F, the frame count for the slow jobs, from the
-benchmark: one frame is roughly one forward of a few hundred tokens times the flow steps):
+SmolVLA (lerobot/svla_so100_pickplace; F from the benchmark):
 
-    python src/eval_policy.py --policy lerobot/smolvla_base --dataset lerobot/svla_so100_pickplace --n-frames 200 --modes bf16 collab_v0 collab_v0_hw reference torchao --rmse --out out/smolvla_fast.json
-    python src/eval_policy.py --policy lerobot/smolvla_base --dataset lerobot/svla_so100_pickplace --n-frames $F --modes reference_hw --mxu ipt --rmse --out out/smolvla_refhw_ipt.json
-    python src/eval_policy.py --policy lerobot/smolvla_base --dataset lerobot/svla_so100_pickplace --n-frames $F --modes chip --mxu ipt --out out/smolvla_chip_ipt.json
+    python src/eval_policy.py --policy lerobot/smolvla_base --dataset lerobot/svla_so100_pickplace --n-frames 200 --modes bf16 collab_v0 ref_linear ref_attn ref_conv --rmse --out out/smolvla_ladder_fast.json
+    python src/eval_policy.py --policy lerobot/smolvla_base --dataset lerobot/svla_so100_pickplace --n-frames $F --modes reference_hw chip chip_rope_vpu --mxu ipt --out out/smolvla_ladder_subset.json
+
+Multi-Task DiT. Steps 1-5 here with the generic rules: `ref_attn` patches only the CLIP vision
+attention (DiT's own RoPEAttention is left unpatched, see `attention_sites`); the full ladder, with
+DiT's attention and its
+chip profile, is in multitask-dit-quant (git@github.com:lorenshung/multitask-dit-quant.git,
+`experiments/run_eval.py --modes bf16 ref_linear ref_attn ref_conv reference_hw chip chip_rope_vpu`,
+same step names; step 2 `collab_v0` only exists here):
+
+    python src/eval_policy.py --policy TRI-ML/multitask-dit-robosuite-wrist-diffusion-064000 --dataset TRI-ML/PretrainFinetune --n-frames 200 --modes bf16 collab_v0 ref_linear ref_attn ref_conv --out out/dit_ladder_fast.json
+
+Pi0: see "L40S run matrix for Pi0" below (same ladder, `src/eval_pi0.py`).
 
 Policy-eval options (eval_policy.py):
 
@@ -89,12 +123,6 @@ Policy-eval options (eval_policy.py):
   included; the reference author loads SmolVLA in float32. The baseline mode label stays `bf16` even
   with `--dtype float32` (it is the mode name used throughout the result JSON and the `vs_bf16`
   keys, so it is documented rather than renamed); read it as "the unquantized baseline in --dtype".
-
-Multi-Task DiT. The dedicated DiT profile lives in multitask-dit-quant (see its README:
-git@github.com:lorenshung/multitask-dit-quant.git). Here there is no DiT-specific profile: the
-generic rules apply, and its custom attention is left unpatched (see `attention_sites` in the JSON).
-
-    python src/eval_policy.py --policy TRI-ML/multitask-dit-robosuite-wrist-diffusion-064000 --dataset TRI-ML/PretrainFinetune --n-frames 200 --modes bf16 collab_v0 collab_v0_hw reference --out out/dit_fast.json
 
 Check every reference_hw and chip result before quoting it:
 
@@ -279,20 +307,21 @@ Start with F = 4, the reference's `--n-obs` default.
     P=$PI0_ENV/bin/python
     $P -m pytest -q tests                                   # includes tests/test_pi0.py
     $P scripts/bench_accum.py --device cuda --compile --check --ref | tee out/bench_accum_pi0env.txt
-    # fast profiles, reference methodology (dummy obs) and real DROID frames with ground truth
-    $P src/eval_pi0.py --obs dummy --n-obs 32 --modes bf16 collab_v0 collab_v0_hw reference torchao --rmse --out out/pi0_fast_dummy.json
-    $P src/eval_pi0.py --obs droid --n-obs 32 --modes bf16 collab_v0 collab_v0_hw reference torchao --rmse --out out/pi0_fast_droid.json
+    # steps 1-5 (fast): reference methodology (dummy obs) and real DROID frames with ground truth
+    $P src/eval_pi0.py --obs dummy --n-obs 32 --modes bf16 collab_v0 ref_linear ref_attn ref_conv --rmse --out out/pi0_ladder_fast_dummy.json
+    $P src/eval_pi0.py --obs droid --n-obs 32 --modes bf16 collab_v0 ref_linear ref_attn ref_conv --rmse --out out/pi0_ladder_fast_droid.json
     # per-layer RMSE on the reference's per-layer observations (run_eval_mxu_io.py)
-    $P src/eval_pi0.py --obs mxu_dummy --modes bf16 reference --rmse --out out/pi0_mxu_reference.json
-    # MXU models
-    $P src/eval_pi0.py --obs dummy --n-obs $F --modes reference_hw --mxu ipt --rmse --out out/pi0_refhw_ipt.json
-    $P src/eval_pi0.py --obs dummy --n-obs $F --modes reference_hw --mxu sa --accum-compile --rmse --out out/pi0_refhw_sa.json
-    # whole chip (headline). RoPE and timestep tables precomputed on the host (--chip-rope host):
-    # Pi0's positions (~880) and timestep angles (~1571 rad) exceed the vsin/vcos argument range
-    # (~400 rad), see "### Pi0" under the chip profile
-    $P src/eval_pi0.py --obs droid --n-obs $F --modes chip --mxu ipt --chip-rope host --out out/pi0_chip_ipt_ropehost.json
-    # the reference treatment (sin/cos on the VPU), labelled as such, on a small subset
-    $P src/eval_pi0.py --obs droid --n-obs 4 --modes chip --mxu ipt --chip-rope vpu --out out/pi0_chip_ipt_ropevpu.json
+    $P src/eval_pi0.py --obs mxu_dummy --modes bf16 ref_conv --rmse --out out/pi0_mxu_reference.json
+    # steps 6-8 on F frames; --subset-compare (default on) adds bf16 and ref_conv on the same frames
+    $P src/eval_pi0.py --obs droid --n-obs $F --modes reference_hw chip chip_rope_vpu --mxu ipt --out out/pi0_ladder_subset_droid.json
+    # side profiles
+    $P src/eval_pi0.py --obs droid --n-obs 32 --modes bf16 collab_v0_hw torchao --out out/pi0_side_droid.json
+    $P src/eval_pi0.py --obs dummy --n-obs $F --modes reference_hw --mxu sa --accum-compile --out out/pi0_refhw_sa.json
+
+`chip` puts the RoPE and timestep tables on the host by default: Pi0's positions (~880) and
+timestep angles (~1571 rad) exceed the vsin/vcos argument range (~400 rad), see "### Pi0" under
+the chip profile. `chip_rope_vpu` is the reference treatment, kept as the ablation that shows
+that effect (its delta from `chip` is the cost of on-VPU tables).
 
 Check before quoting, as for the other models:
 - `valid` is true;
@@ -375,8 +404,10 @@ Every result JSON written with `chip` carries `layers.chip.coverage` (eval.py) o
 `modes.chip.layers.coverage` (eval_policy.py): calls and work per unit (MXU FLOPs = 2MNK, VPU
 lane-element ops, output elements otherwise), the host-fallback list with reasons, the
 `new_decisions` list (op, choice, analogue, reason) and `silent_bf16_ops: 0`. The same table is
-printed after the first pass and at exit. Options: `--chip-rope vpu|host` (RoPE tables on the VPU,
-the reference treatment, or precomputed on the host together with the sinusoidal timestep table), `--chip-strict` (raise on an unmapped op).
+printed after the first pass and at exit. Options: `--chip-rope host|vpu` (default `host`, NEW:
+RoPE tables and the sinusoidal timestep table are compile-time host constants; `vpu` computes them on
+the VPU, the reference treatment, and is the `chip_rope_vpu` ladder step), `--chip-strict` (raise on
+an unmapped op).
 
     python src/eval.py --model /path/TinyLlama-1.1B-Chat-v1.0 --seqlen 128 --max-windows 2 \
         --modes bf16 chip --chip-mxu framework --device cpu --out out/tinyllama_chip.json
@@ -393,9 +424,9 @@ vsquare / staged rsum / vsqrt+vrecip / vadd / vmul, softmax, SiLU, embedding sca
 Euler step). On a tiny random-weight Pi0 (tests/pi0_tiny.py, tests/test_chip_pi0.py)
 `silent_bf16_ops` is 0 and the only host fallbacks are the float `le` of the block-causal mask
 build, the loop test `ge` and the loop time update `add_` (plus the RoPE and timestep tables with
-`--chip-rope host`). Use `--chip-rope host` for Pi0: its prefix positions reach ~880 and its
-timestep angles 1571 rad, where the VPU's sin/cos (and BF16 angles) are wrong by up to 2.0
-(the reference puts them on the VPU, so `vpu` stays the default and the reference treatment).
+`--chip-rope host`, now the default for every model). Pi0 shows why: its prefix positions reach
+~880 and its timestep angles 1571 rad, where the VPU's sin/cos (and BF16 angles) are wrong by up
+to 2.0. The reference puts them on the VPU; that treatment is the `chip_rope_vpu` step.
 The masked logits (-2.38e38) are zeroed by the vexp floor (-128).
 
 ### NEW decisions (no reference or ISA source; the analogue followed is cited)
@@ -421,6 +452,7 @@ The masked logits (-2.38e38) are zeroed by the vexp floor (-128).
 | 0-d float `add_`/`sub_` (Pi0 flow `time += dt`) | host, float32 | pi0-quant TARGET_OPS has no `add_` (quant_vector.py:136-171), so the reference keeps it float32; the loop compare is host anyway. A BF16 vadd would truncate the timestep each step (1.0, 0.898, 0.797, ...) |
 | `where(mask, c1, c2)` with two constant branches (Pi0 `torch.where(att, 0, -2.38e38)`) | data: the precomputed additive mask | the where/masked_fill decision above; openpi pi0_pytorch.py:160 |
 | sinusoidal timestep table (`create_sinusoidal_pos_embedding`, Pi0 / SmolVLA) under `--chip-rope host` | host table, like RoPE | angles reach 2π/4e-3 = 1571 rad: outside vsin/vcos's range and 8 rad per BF16 ulp; the table depends only on the step schedule |
+| `--chip-rope host` the default of `chip` for every model (`chip_rope_vpu` keeps the reference treatment) | RoPE and timestep sin/cos tables are compile-time host constants | on a deployment, position- and schedule-only tables are constants; vsin/vcos take \|x\| < ~400 rad and BF16 angles have an 8 rad ulp near 1000, so on-VPU tables are wrong for long positions (Pi0 findings); the reference computes them on the VPU (quant_vector.py:170-171) |
 
 The model-level op -> unit map (with the aten ops each model operation becomes) is `MODEL_OPS` in
 `src/op_unit_map.py`; the aten-level map with instruction sequences and citations is `ATEN`.
@@ -446,7 +478,8 @@ handlers. Ops the emulator cannot run are classified None, i.e. host fallback in
   underflow (return +0) intended in the RTL?
 - `vsin`/`vcos` take a Q(9,12) argument (x 2/pi), i.e. |x| < ~400 rad, and BF16 angles have an ulp of
   0.5 rad at 64-128: RoPE angles for positions beyond a few hundred are not representable on the VPU.
-  Should RoPE tables be precomputed on the host (`--chip-rope host`) in deployment?
+  This repo now precomputes them on the host by default (`chip`); `chip_rope_vpu` measures the
+  on-VPU alternative. Is that the intended deployment?
   Pi0 is worse: prefix positions to ~880 and flow-timestep angles to 1571 rad (max |sin - sin_ref|
   up to 2.0 on the VPU; 406 of 1024 timestep-embedding values off by more than 0.1 at t = 1).
 - `vexp.bf16` wraps already at x = -336 (sigmoid via the reference SiLU sequence comes out 0 for
