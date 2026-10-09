@@ -39,6 +39,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn as nn
 
 import ref_loader
 
@@ -330,3 +331,103 @@ def load_pi0(checkpoint_dir, *, openpi_dir=None, device="cpu", dtype=None, confi
     tokenizer_path = tokenizer_path or os.environ.get("PALIGEMMA_TOKENIZER")
     policy = make_policy(rt, model, device, config, norm_stats_dir, tokenizer_path) if tokenizer_path else None
     return model, policy, dummy_observations
+
+
+# ---------------------------------------------------------------------------------------------
+# Patch coverage
+# ---------------------------------------------------------------------------------------------
+
+def _canonical(mode):
+    from quant_modes import canonical
+
+    return canonical(mode)
+
+
+def inventory(model: nn.Module) -> dict:
+    """The matmul sites of an unpatched Pi0: {fqn: {kind, dtype, component}}."""
+    sites = {}
+    for n, m in model.named_modules():
+        kind = ("linear" if type(m) is nn.Linear else "conv2d" if type(m) is nn.Conv2d else
+                "embedding" if type(m) is nn.Embedding else "attention" if n.split(".")[-1] == "self_attn"
+                else None)
+        if kind:
+            w = getattr(m, "weight", None)
+            sites[n] = {"kind": kind, "dtype": str(w.dtype).removeprefix("torch.") if w is not None else None,
+                        "component": __import__('ref_attention').pi0_component(n)}
+    return sites
+
+
+class CallCounter:
+    """Counts forward calls per module path (patch coverage: patched AND exercised)."""
+
+    def __init__(self, model, fqns):
+        self.counts = dict.fromkeys(fqns, 0)
+        mods = dict(model.named_modules())
+        self.handles = [mods[f].register_forward_hook(self._hook(f)) for f in fqns if f in mods]
+
+    def _hook(self, f):
+        def h(*_):
+            self.counts[f] += 1
+        return h
+
+    def close(self):
+        for h in self.handles:
+            h.remove()
+
+
+def patch_coverage(inv: dict, model: nn.Module, mode: str, layers, calls: dict, skip) -> dict:
+    """Per site: patched or not (with the reason), and how often it ran in the first pass."""
+    name = _canonical(mode)
+    mods = dict(model.named_modules())
+    sites = {s["site"]: s for s in (layers or {}).get("attention_sites", [])}
+    rows, not_patched = [], []
+    for fqn, info in inv.items():
+        m = mods.get(fqn)
+        if info["kind"] in ("linear", "conv2d"):
+            patched = m is not None and (type(m).__name__ not in ("Linear", "Conv2d") or type(
+                getattr(m, "weight", None)) not in (torch.Tensor, nn.Parameter))
+        elif info["kind"] == "attention":
+            patched = fqn in sites
+        else:
+            patched = False
+        reason = None
+        if not patched:
+            if name == "bf16":
+                reason = "baseline"
+            elif info["kind"] == "embedding":
+                reason = "embedding lookup (gather), no matmul; the reference leaves it as is"
+            elif any(s and s in fqn for s in skip):
+                reason = ("never called in Pi0 inference (run_eval.py:20-22); --skip" if "lm_head" in fqn
+                          else "--skip")
+            elif name in ("collab_v0", "collab_v0_hw", "torchao") and info["kind"] != "linear":
+                reason = f"{name} covers nn.Linear only"
+            elif name in ("collab_v0", "collab_v0_hw", "torchao") and info["dtype"] != "bfloat16":
+                reason = f"{name} quantizes bfloat16 layers only (quant_modes.py:210-213); this one is float32"
+            elif info["kind"] == "attention":
+                reason = "attention not in --ops" if name not in ("collab_v0", "collab_v0_hw", "torchao") \
+                    else f"{name} has no attention path"
+            else:
+                reason = "not replaced (see layers.untouched)"
+        n_calls = (sum(sites[fqn]["calls"].values()) if info["kind"] == "attention" and fqn in sites
+                   else calls.get(fqn))
+        row = {"site": fqn, **info, "patched": patched, "calls": n_calls}
+        if info["kind"] == "attention" and fqn in sites:
+            row["routes"] = dict(sites[fqn]["calls"])
+        if reason:
+            row["reason"] = reason
+            not_patched.append({"site": fqn, "kind": info["kind"], "reason": reason})
+        rows.append(row)
+    summary = {}
+    for r in rows:
+        s = summary.setdefault(r["kind"], {"sites": 0, "patched": 0, "patched_and_called": 0,
+                                           "patched_not_called": []})
+        s["sites"] += 1
+        if r["patched"]:
+            s["patched"] += 1
+            if r["calls"]:
+                s["patched_and_called"] += 1
+            else:
+                s["patched_not_called"].append(r["site"])
+    return {"summary": summary, "not_patched": not_patched, "sites": rows}
+
+
