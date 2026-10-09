@@ -5,6 +5,10 @@
                 scales (ceil/448), fixed activation scale 2^0. Alias: atlas
   collab_v0_hw  as collab_v0, activations through the hardware cast (|x/2^s| < 2^-6 flushed to
                 zero). Alias: atlas_hw
+  reference     the reference author's operand cast: dynamic per-tensor po2 scales
+                (floor(log2(amax/256))) and the vpack encoder for activations and weights, every
+                nn.Linear including fp32 ones; F.linear on the dequantized operands (NEW), BF16
+                bias after (src/ref_profile.py)
   torchao       stock TorchAO Float8DynamicActivationFloat8WeightConfig, per-tensor
                 (native FP8 matmul; needs compute capability >= 8.9, e.g. L40S / H100)
 
@@ -35,6 +39,9 @@ PROFILES = {
                 aliases=("atlas",)),
         Profile("collab_v0_hw", "collab_v0 with the hardware activation cast", "the collaborator "
                 "(atlas_torchao.py:57-61)", aliases=("atlas_hw",)),
+        Profile("reference", "dynamic po2 scales + vpack cast for x and W, F.linear on dequantized "
+                "values (NEW), BF16 bias after", "pi0-quant hw_float_ops.py:38-57,64-103; "
+                "quant_linear.py:153-172"),
         Profile("torchao", "Float8DynamicActivationFloat8WeightConfig, per-tensor", "torchao 0.18"),
     )
 }
@@ -106,4 +113,8 @@ def quantize(model: nn.Module, mode: str, skip=()) -> dict:
     name = canonical(mode)
     if name == "bf16":
         return {"planned": 0, "quantized": 0, "untouched": []}
+    if name == "reference":
+        from ref_profile import quantize_reference
+
+        return quantize_reference(model, skip)
     return _quantize_torchao_style(model, name, skip)
