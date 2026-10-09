@@ -24,7 +24,6 @@ class AtlasQuantLinear(nn.Module):
     def __init__(self, linear: nn.Linear, config: AtlasQConfig):
         super().__init__()
         self.in_features, self.out_features = linear.in_features, linear.out_features
-        self.quantize_activations = config.quantize_activations 
         w = linear.weight.detach()
 
         weight_scale_exp = scale_exp_for(w)                                    # int32

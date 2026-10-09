@@ -40,8 +40,10 @@ if __name__ == "__main__":
 
     from datautils import get_wikitext2
     trainloader, testenc = get_wikitext2(nsamples=16, seed=0, seqlen=SEQLEN, model=model_path)
-    
-    quantize_(model, AtlasQConfig(quantize_activations=True), filter_fn=skip_lm_head)
+    ppl = llama_eval(model, testenc, seqlen=SEQLEN)
+    print("Baseline ppl:", ppl)
+        
+    quantize_(model, AtlasQConfig(), filter_fn=skip_lm_head)
     print("Quantized model")
     
     ppl = llama_eval(model, testenc, seqlen=SEQLEN)
