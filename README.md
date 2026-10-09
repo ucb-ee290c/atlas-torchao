@@ -96,6 +96,22 @@ generic rules apply, and its custom attention is left unpatched (see `attention_
 
     python src/eval_policy.py --policy TRI-ML/multitask-dit-robosuite-wrist-diffusion-064000 --dataset TRI-ML/PretrainFinetune --n-frames 200 --modes bf16 collab_v0 collab_v0_hw reference --out out/dit_fast.json
 
+Pi0 (openpi PI0Pytorch, `pi0_droid_jointpos_polaris`; set `OPENPI_DIR`, `PI0_CHECKPOINT` and
+`PALIGEMMA_TOKENIZER`, see `src/pi0_model.py`). `--obs dummy` is the reference author's action-RMSE
+methodology (pi0-quant experiments/run_output_eval.py: 4 seeded random observations, seed 0),
+`--obs mxu_dummy` the observations of its per-layer runner (run_eval_mxu_io.py), `--obs droid`
+real lerobot/droid_1.0.1 frames with recorded joint-position actions (MSE / MAE vs ground truth;
+DROID is in this checkpoint's training mixture, so the episodes are not held out). The noise is
+the reference's own draws, passed explicitly (`--noise reference`); every mode runs twice.
+
+    python src/eval_pi0.py --obs dummy --modes bf16 collab_v0 collab_v0_hw reference torchao --out out/pi0_dummy_fast.json
+    python src/eval_pi0.py --obs droid --n-obs 32 --modes bf16 collab_v0 collab_v0_hw reference torchao --out out/pi0_droid_fast.json
+    python src/eval_pi0.py --obs mxu_dummy --modes reference --rmse --out out/pi0_mxu_reference.json
+    python src/eval_pi0.py --obs dummy --modes reference_hw --mxu ipt --rmse --out out/pi0_refhw_ipt.json
+    python src/eval_pi0.py --obs dummy --modes reference_hw --mxu sa --accum-compile --rmse --out out/pi0_refhw_sa.json
+    python src/eval_pi0.py --obs dummy --modes chip --mxu ipt --out out/pi0_chip_ipt.json
+    python src/eval_pi0.py --obs droid --n-obs 32 --modes reference_hw chip --mxu ipt --out out/pi0_droid_hw.json
+
 Check every reference_hw and chip result before quoting it:
 
 - `layers.<mode>.valid` is true;
