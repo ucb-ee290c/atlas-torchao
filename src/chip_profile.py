@@ -15,7 +15,8 @@ predict_action_chunk / select_action / _generate_actions / sample_actions (eval_
 these, not forward). Pre/post-processing pipelines run outside the policy and are not emulated.
 
 Options (argparse or dict): mxu, mxu_impl (reference profiles), chip_rope ("vpu": RoPE tables
-computed on the VPU as the reference does for SmolVLA, quant_vector.py:170-171; "host": tables
+computed on the VPU as the reference does for SmolVLA, quant_vector.py:170-171, also the
+chip_rope_vpu profile; "host", the default (NEW): tables
 from *RotaryEmbedding modules, and the sinusoidal timestep table of flow-matching policies
 (`create_sinusoidal_pos_embedding` in the model's module, NEW), precomputed on the host),
 chip_strict (raise on an unmapped float op).
@@ -40,9 +41,10 @@ _ALL: list = []
 
 def add_args(ap) -> None:
     g = ap.add_argument_group("chip profile")
-    g.add_argument("--chip-rope", choices=("vpu", "host"), default="vpu",
-                   help="RoPE tables: vpu (computed on the VPU, the reference treatment) or host "
-                        "(*RotaryEmbedding tables and sinusoidal timestep tables precomputed on the host)")
+    g.add_argument("--chip-rope", choices=("vpu", "host"), default=None,
+                   help="RoPE and timestep tables for `chip`: host (default, NEW: *RotaryEmbedding and "
+                        "sinusoidal timestep tables are compile-time host constants) or vpu (computed "
+                        "on the VPU, the reference treatment; also the chip_rope_vpu profile)")
     g.add_argument("--chip-strict", action="store_true", help="raise on an unmapped float op")
     g.add_argument("--chip-native", nargs="*", default=[],
                    help="aten ops (overload-packet names) run on the host instead, for ablations; "
@@ -227,7 +229,7 @@ def quantize_chip(model: nn.Module, skip=(), options=None) -> dict:
     mxu_kind = _opt(options, "chip_mxu", "model") or "model"
     rep = quant_modes.quantize(model, "reference_hw" if mxu_kind == "model" else "reference", skip, options)
     opts = quant_modes.profile_options(options or {})
-    rope = _opt(options, "chip_rope", "vpu") or "vpu"
+    rope = _opt(options, "chip_rope", "host") or "host"
     cov = cc.Coverage(type(model).__name__)
     router = cc.ChipRouter(cov, opts["mxu"], opts["mxu_impl"], rope=rope,
                            strict=bool(_opt(options, "chip_strict", False)),

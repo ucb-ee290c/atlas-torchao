@@ -38,7 +38,8 @@ from pathlib import Path
 
 import torch
 
-from quant_modes import ALL_MODES, add_profile_args, finalize_report, quantize, require_mode_supported
+from quant_modes import (ALL_MODES, add_profile_args, add_subset_compare_arg, finalize_report, ladder_deltas,
+                         ladder_record, quantize, require_mode_supported, subset_compare_modes)
 
 
 
@@ -292,6 +293,7 @@ def build_parser():
                          "workspace config")
     ap.add_argument("--out", required=True)
     add_profile_args(ap)
+    add_subset_compare_arg(ap)
     return ap
 
 
@@ -308,10 +310,13 @@ def main():
             ap.error(str(e))
     if "bf16" not in args.modes:
         args.modes = ["bf16", *args.modes]  # every FP8 mode is compared against it
+    # the frames are always a sample, so a subset profile gets ref_conv on the same frames
+    args.modes, added = subset_compare_modes(args.modes, args.subset_compare == "on")
 
     from lerobot.policies.factory import make_pre_post_processors
 
-    result = {"provenance": provenance(args), "determinism_state": determinism_state(), "modes": {}}
+    result = {"provenance": provenance(args), "determinism_state": determinism_state(), "modes": {},
+              "subset_compare": {"enabled": bool(added) or None, "added_modes": added}}
     ref = None
     clean = None
     rmse_dir = Path(args.rmse_dir) if args.rmse_dir else Path(args.out).with_name(Path(args.out).stem + "_rmse")
@@ -331,6 +336,15 @@ def main():
             result["data"] = {"dataset": args.dataset, "test_episodes": test_eps,
                               "frames": len(idx), "fps": meta.fps}
         layers = quantize(policy, mode, args.skip, options=args) if mode != "bf16" else None
+        eq = layers["ladder"].get("equivalent_to") if layers is not None else None
+        if eq in result["modes"]:
+            # the op class this step adds is absent from the model: same model, same numbers
+            result["modes"][mode] = {**result["modes"][eq], "layers": finalize_report(layers),
+                                     "ladder": {**layers["ladder"], "duplicate_of": eq},
+                                     "added_by_subset_compare": mode in added}
+            print(f"{mode}: identical to {eq} (nothing added to quantize); not re-run", flush=True)
+            del policy
+            continue
         rm = before = None
         if args.rmse and mode != "bf16":
             import layer_rmse
@@ -346,7 +360,10 @@ def main():
                 rm.capture(run_clean)
         preds, gts, pads, times = run_mode(policy, ds, idx, preprocess, postprocess,
                                            args.seed, args.device, before_frame=before)
-        entry = {"layers": finalize_report(layers), "vs_ground_truth": error_vs_gt(preds, gts, pads),
+        entry = {"layers": finalize_report(layers),
+                 "ladder": layers["ladder"] if layers is not None else ladder_record("bf16", {}, args),
+                 "added_by_subset_compare": mode in added,
+                 "vs_ground_truth": error_vs_gt(preds, gts, pads),
                  "latency_s": {"median": sorted(times)[len(times) // 2], "mean": sum(times) / len(times)}}
         if rm is not None:
             rm.close()
@@ -377,6 +394,12 @@ def main():
         import layer_rmse
 
         result["reference_provenance"] = layer_rmse.ref_provenance()
+    result["ladder_deltas"] = ladder_deltas(
+        {m: {**{f"gt_{k}": v for k, v in e["vs_ground_truth"].items() if k != "elements"},
+             **({f"bf16_{k}": e["vs_bf16"][k] for k in ("rel_l2", "cosine")} if "vs_bf16" in e
+                else {"bf16_rel_l2": 0.0, "bf16_cosine": 1.0})}
+         for m, e in result["modes"].items()},
+        {m: e["ladder"] for m, e in result["modes"].items()})
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out).write_text(json.dumps(result, indent=2, default=str))
     print("wrote", args.out)
