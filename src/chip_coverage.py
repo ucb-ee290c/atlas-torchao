@@ -69,9 +69,14 @@ class Coverage:
         self.model = model_name
         self.rows = defaultdict(lambda: {"calls": 0, "work": 0, "instructions": defaultdict(int)})
         self.reasons: dict[tuple, str] = {}
+        self.new_rows: dict[tuple, dict] = {}
         self.live: dict = {}
 
-    def add(self, unit, op, work, instrs=None, reason=None):
+    def add(self, unit, op, work, instrs=None, reason=None, new=None):
+        """new: a NEW decision taken for this row that has no ATEN entry of its own (a host or data
+        treatment), as {"choice", "analogue", "reason"}; listed in `new_decisions`."""
+        if new:
+            self.new_rows[(unit, op)] = new
         r = self.rows[(unit, op)]
         r["calls"] += 1
         r["work"] += int(work)
@@ -107,6 +112,10 @@ class Coverage:
                       and op in M.ATEN and M.ATEN[op].status == "NEW"})
         new_decisions = [{"op": op, "choice": M.ATEN[op].instrs, "analogue": M.ATEN[op].source,
                           "reason": M.ATEN[op].reason} for op in new]
+        grouped: dict = {}
+        for (u, op), d in sorted(self.new_rows.items()):        # one entry per decision
+            grouped.setdefault(d["choice"] + d["reason"], (d, []))[1].append(f"{op} ({u})")
+        new_decisions += [{"op": ", ".join(ops), **d} for d, ops in grouped.values()]
         partial_new = sorted({op for (u, op) in self.rows if u == "VPU" and op in M.ATEN
                               and M.ATEN[op].status == "REF" and M.ATEN[op].reason})
         return {
@@ -242,11 +251,17 @@ class ChipRouter(TorchDispatchMode):
             if name in M.DATA:
                 self.cov.add("data", name, _numel(out))
             else:
-                why = (f"kept off the chip on request (--skip {detail})" if kind == "skip" else
-                       "RoPE table (position-only), precomputed on the host (--chip-rope host)")
-                self.cov.add("host", name, _host_work(name, args, out), reason=why)
+                new, row = None, name
+                if kind == "skip":
+                    why = f"kept off the chip on request (--skip {detail})"
+                elif detail in M.TABLE_HOST:
+                    why, new, row = M.TABLE_HOST[detail]["reason"], M.TABLE_HOST[detail], f"{name}@{detail}"
+                else:
+                    why = "RoPE table (position-only), precomputed on the host (--chip-rope host)"
+                self.cov.add("host", row, _host_work(name, args, out), reason=why, new=new)
             return out
         unit, handler, reason = self.classify(func, name, args, kwargs, kind)
+        new = M.NEW_TREATMENTS.get(reason) if unit in ("host", "data") else None
         self._instr.clear()
         out = handler.fn(self, func, name, args, kwargs) if handler else func(*args, **kwargs)
         if unit == "VPU":
@@ -258,7 +273,7 @@ class ChipRouter(TorchDispatchMode):
                 self.cov.add("VPU", f"{name}.rescale_bias", vpu_work, dict(self._instr),
                              reason="VPU side of an MXU op: x 2^(sa+sb) rescale and bias add")
         else:
-            self.cov.add(unit, name, _numel(out), reason=reason)
+            self.cov.add(unit, name, _numel(out), reason=reason, new=new)
         return out
 
     def classify(self, func, name, args, kwargs, kind):
@@ -280,6 +295,14 @@ class ChipRouter(TorchDispatchMode):
             return "host", None, M.HOST_REASONS.get(name, f"unmapped integer op {name}")
         if any(t.dtype == torch.float64 for t in floats) and all(t.numel() <= 1 for t in floats):
             return "host", None, M.HOST_REASONS["float64"]
+        if name in ("add_", "sub_") and isinstance(args[0], torch.Tensor) and args[0].dim() == 0 \
+                and all(t.dim() == 0 for t in floats):
+            # a loop-carried 0-d float scalar updated in place (flow-matching `time += dt`)
+            return "host", None, M.LOOP_SCALAR
+        if name == "where" and func._overloadname in ("self", "ScalarOther", "ScalarSelf", "Scalar") \
+                and _is_const(args[1]) and _is_const(args[2]):
+            # where(mask, c1, c2): building the additive mask itself from a boolean mask
+            return "data", None, M.MASK_BUILD
         if kind == "mxu_module" and name == "exp2":
             # 2^(sx+sw) from integer scale exponents: an exponent field written by the scalar core
             return "scalar", None, "2^k from an integer scale exponent: exponent-field construction (exact)"

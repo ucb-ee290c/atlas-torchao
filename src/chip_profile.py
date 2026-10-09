@@ -16,7 +16,9 @@ these, not forward). Pre/post-processing pipelines run outside the policy and ar
 
 Options (argparse or dict): mxu, mxu_impl (reference profiles), chip_rope ("vpu": RoPE tables
 computed on the VPU as the reference does for SmolVLA, quant_vector.py:170-171; "host": tables
-from *RotaryEmbedding modules precomputed on the host), chip_strict (raise on an unmapped float op).
+from *RotaryEmbedding modules, and the sinusoidal timestep table of flow-matching policies
+(`create_sinusoidal_pos_embedding` in the model's module, NEW), precomputed on the host),
+chip_strict (raise on an unmapped float op).
 """
 
 from __future__ import annotations
@@ -40,7 +42,7 @@ def add_args(ap) -> None:
     g = ap.add_argument_group("chip profile")
     g.add_argument("--chip-rope", choices=("vpu", "host"), default="vpu",
                    help="RoPE tables: vpu (computed on the VPU, the reference treatment) or host "
-                        "(*RotaryEmbedding tables precomputed on the host)")
+                        "(*RotaryEmbedding tables and sinusoidal timestep tables precomputed on the host)")
     g.add_argument("--chip-strict", action="store_true", help="raise on an unmapped float op")
     g.add_argument("--chip-native", nargs="*", default=[],
                    help="aten ops (overload-packet names) run on the host instead, for ablations; "
@@ -181,6 +183,44 @@ def _set_eager(model) -> list:
     return changed
 
 
+TABLE_FUNCTIONS = ("create_sinusoidal_pos_embedding",)
+
+
+def _host_tables(model, router) -> list:
+    """--chip-rope host: position/schedule-only table functions of the model's module run on the
+    host (NEW, op_unit_map.TABLE_HOST). The module attribute is wrapped once per process and pushes
+    the context only for a router that is running, so other models sharing the module (the bf16
+    baseline) are unaffected."""
+    import sys
+
+    mod = sys.modules.get(type(model).__module__)
+    done = []
+    for fname in TABLE_FUNCTIONS:
+        fn = getattr(mod, fname, None) if mod is not None else None
+        if fn is None:
+            continue
+        routers = getattr(fn, "_chip_routers", None)
+        if routers is None:
+            orig, routers = fn, []
+
+            @functools.wraps(orig)
+            def run(*a, _orig=orig, _routers=routers, _name=fname, **k):
+                live = [r for r in _routers if r.active]
+                for r in live:
+                    r.push("rope_host", _name)
+                try:
+                    return _orig(*a, **k)
+                finally:
+                    for r in live:
+                        r.pop()
+
+            run._chip_routers = routers
+            setattr(mod, fname, run)
+        routers.append(router)
+        done.append(f"{mod.__name__}.{fname}")
+    return done
+
+
 def quantize_chip(model: nn.Module, skip=(), options=None) -> dict:
     import quant_modes
 
@@ -233,6 +273,7 @@ def quantize_chip(model: nn.Module, skip=(), options=None) -> dict:
         eager = []
     else:
         eager = _set_eager(model)
+    tables = _host_tables(model, router) if rope == "host" else []
     session = _Session(router)
     entries = [n for n in ENTRY_POINTS if _wrap_entry(model, n, session)]
     _ALL.append(cov)
@@ -241,7 +282,7 @@ def quantize_chip(model: nn.Module, skip=(), options=None) -> dict:
                       "base": "reference_hw" if mxu_kind == "model" else "reference (framework accumulation)",
                       "mxu": mxu_kind,
                       "vpu": "chip_ops.ChipVPU (bit-exact to VectorRTLFunctions, 16 lanes)",
-                      "rope": rope, "entry_points": entries, "eager_attention_set": eager,
+                      "rope": rope, "host_tables": tables, "entry_points": entries, "eager_attention_set": eager,
                       "skipped_to_host": list(skip), "skip_modules": n_skip,
                       "vpu_lut_sha256_16": chip_ops.lut_provenance()}
     import ref_loader
