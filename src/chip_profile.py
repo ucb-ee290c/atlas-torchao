@@ -226,7 +226,13 @@ def quantize_chip(model: nn.Module, skip=(), options=None) -> dict:
         elif type(m).__name__ in ("RefQuantLinear", "RefQuantConv2d"):
             ctx_hooks(m, "mxu_module", type(m).__name__)
 
-    eager = _set_eager(model)
+    if any(s.get("variant") == "pi0" for s in rep.get("attention_sites", [])):
+        # Pi0: every attention route (Gemma eager, SigLIP sdpa) is already the reference routine,
+        # whose softmax and mask are separate ops; switching SigLIP to eager would change its
+        # softmax precision away from the reference's SDPA route (pi0-quant model_patcher.py:787).
+        eager = []
+    else:
+        eager = _set_eager(model)
     session = _Session(router)
     entries = [n for n in ENTRY_POINTS if _wrap_entry(model, n, session)]
     _ALL.append(cov)

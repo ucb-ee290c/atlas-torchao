@@ -21,6 +21,9 @@ reference's own two paths differ:
           is added instead, as LlamaAttention's eager path does: modeling_llama.py:213-214).
   vision  scores are cast to bf16, the additive mask is added, softmax runs in float32 and P is
           cast to bf16 (827-836).
+  pi0     Pi0 (pi0-quant model_patcher.py:738-823 SDPA, 911-1005 Gemma eager): scores cast to bf16,
+          mask added, softmax in the dtype of the result (float32 with Pi0's float32 additive mask,
+          bf16 for the unmasked SigLIP SDPA call), P cast to bf16. See patch_pi0_attention.
 
 (B, H) are processed in one batched call instead of the reference's Python loop over heads; the
 per-head scales make that equivalent (tests/test_ref_attention.py compares against the
@@ -29,6 +32,7 @@ reference closure).
 
 from __future__ import annotations
 
+import threading
 import types
 
 import torch
@@ -68,6 +72,20 @@ def ref_attention(q, k, v, scaling, mask=None, fm_qk=None, fm_av=None, variant="
         if mask is not None:
             scores = scores + mask                                                 # 831-833
         p = torch.softmax(scores.float(), dim=-1).to(torch.bfloat16)               # 836
+    elif variant == "pi0":
+        # pi0-quant model_patcher.py: Gemma eager 957-965, SigLIP SDPA 772-787. The scores are
+        # rounded to BF16, the mask is added (Pi0's additive mask is float32, pi0_pytorch.py:160,
+        # so the sum and the softmax are float32; without a mask the softmax runs in BF16) and P is
+        # cast to BF16 by the quantizer (hw_float_ops.py:89).
+        scores = scores.to(torch.bfloat16)                                         # 772-774, 957-959
+        if mask is not None:
+            if mask.dim() == 3:
+                mask = mask[:, None]
+            if mask.dtype == torch.bool:
+                scores = scores.masked_fill(~mask, float("-inf"))                  # 724-725
+            else:
+                scores = scores + mask[..., :scores.shape[-2], :scores.shape[-1]]  # 727, 963
+        p = torch.softmax(scores, dim=-1).to(torch.bfloat16)                       # 787, 965
     else:
         if mask is not None:
             if mask.dim() == 3:
@@ -155,6 +173,8 @@ def patch_attention(model: nn.Module, fm_factory=None) -> list:
         everything else (Llama-family decoders) the text variant.
     Models with neither (e.g. custom attention modules) are left unchanged.
     """
+    if any(type(m).__name__ == "PaliGemmaWithExpertModel" for m in model.modules()):
+        return patch_pi0_attention(model, fm_factory)
     new_fm = (lambda: fm_factory()) if fm_factory else (lambda: None)
     sites = []
     for name, mod in model.named_modules():
@@ -180,6 +200,127 @@ def patch_attention(model: nn.Module, fm_factory=None) -> list:
         register_hf_attention()
         for cfg in configs.values():
             cfg._attn_implementation = ATTN_KEY
+    return sites
+
+
+# ---------------------------------------------------------------------------
+# Pi0 (openpi PI0Pytorch): the three routes of pi0-quant model_patcher.py
+# ---------------------------------------------------------------------------
+
+# Every patched Pi0 attention module carries `_atlas_ref_attn`; the three module-level functions
+# below are installed once per process and fall through to the saved originals for any other
+# module (an unquantized baseline or the clean --rmse copy share the same transformers modules).
+_PI0_ORIG: dict = {}
+_pi0_current = threading.local()
+
+
+def _pi0_cfg(module):
+    cfg = getattr(module, "_atlas_ref_attn", None)
+    return cfg if isinstance(cfg, dict) and cfg.get("variant") == "pi0" else None
+
+
+def _pi0_gemma_eager(module, query, key, value, attention_mask, scaling, dropout=0.0, **kwargs):
+    """modeling_gemma.eager_attention_forward replacement (pi0-quant model_patcher.py:911-1005).
+
+    Called for the language model, the action expert and the joint co-attention layers
+    (gemma_pytorch.py:200-207 calls the module-level function directly)."""
+    cfg = _pi0_cfg(module)
+    if cfg is None:
+        return _PI0_ORIG["gemma"](module, query, key, value, attention_mask, scaling, dropout, **kwargs)
+    n_rep = module.num_key_value_groups                                           # 925-926 repeat_kv
+    k, v = _expand_kv(key, n_rep), _expand_kv(value, n_rep)
+    out = ref_attention(query, k, v, scaling, attention_mask, cfg["fm_qk"], cfg["fm_av"], "pi0")
+    cfg["calls"]["gemma_eager"] = cfg["calls"].get("gemma_eager", 0) + 1
+    return out.to(query.dtype).transpose(1, 2).contiguous(), None                  # 982-1005
+
+
+def _pi0_siglip_eager(module, query, key, value, attention_mask, scaling, dropout=0.0, **kwargs):
+    """modeling_siglip.eager_attention_forward replacement (model_patcher.py:1087-1165): fires
+    only when the vision config uses eager attention (the chip profile sets it). Its softmax is
+    float32 then cast to bf16 (1134): the `vision` variant."""
+    cfg = _pi0_cfg(module)
+    if cfg is None:
+        return _PI0_ORIG["siglip"](module, query, key, value, attention_mask, scaling, dropout, **kwargs)
+    out = ref_attention(query, key, value, scaling, attention_mask, cfg["fm_qk"], cfg["fm_av"], "vision")
+    cfg["calls"]["siglip_eager"] = cfg["calls"].get("siglip_eager", 0) + 1
+    return out.to(query.dtype).transpose(1, 2).contiguous(), None                  # 1151-1165
+
+
+def _pi0_sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, **kwargs):
+    """F.scaled_dot_product_attention replacement (model_patcher.py:738-823): active while a
+    patched Pi0 self_attn module runs (forward pre/post hooks, 703-719). In Pi0 this is the
+    SigLIP vision tower, whose config uses sdpa (transformers 4.53.2 default)."""
+    mod = getattr(_pi0_current, "module", None)
+    cfg = _pi0_cfg(mod) if mod is not None else None
+    if cfg is None or kwargs:
+        return _PI0_ORIG["sdpa"](query, key, value, attn_mask, dropout_p, is_causal, scale=scale, **kwargs)
+    scale = scale if scale is not None else query.size(-1) ** -0.5                 # 746-747
+    mask = attn_mask
+    if mask is None and is_causal:                                                 # 728-734
+        sq, skv = query.shape[-2], key.shape[-2]
+        mask = torch.ones(sq, skv, dtype=torch.bool, device=query.device).tril()[None, None]
+    out = ref_attention(query, key, value, scale, mask, cfg["fm_qk"], cfg["fm_av"], "pi0")
+    cfg["calls"]["sdpa"] = cfg["calls"].get("sdpa", 0) + 1
+    return out.to(query.dtype)                                                     # 804
+
+
+def _install_pi0_routes() -> None:
+    if _PI0_ORIG:
+        return
+    from transformers.models.gemma import modeling_gemma
+    from transformers.models.siglip import modeling_siglip
+
+    _PI0_ORIG.update(gemma=modeling_gemma.eager_attention_forward,
+                     siglip=modeling_siglip.eager_attention_forward,
+                     sdpa=F.scaled_dot_product_attention)
+    modeling_gemma.eager_attention_forward = _pi0_gemma_eager                      # 1007
+    modeling_siglip.eager_attention_forward = _pi0_siglip_eager                    # 1167
+    F.scaled_dot_product_attention = _pi0_sdpa                                     # 825
+
+
+def pi0_component(path: str) -> str:
+    """pi0-quant model_patcher.py:92-126 (_COMPONENT_RULES, first match wins)."""
+    for sub, comp in PI0_COMPONENT_RULES:
+        if sub in path:
+            return comp
+    return "unknown"
+
+
+PI0_COMPONENT_RULES = (                                                            # model_patcher.py:92-109
+    ("action_in_proj", "action_head"), ("action_out_proj", "action_head"),
+    ("action_time_mlp_in", "action_head"), ("action_time_mlp_out", "action_head"),
+    ("state_proj", "action_head"), ("time_mlp_in", "action_head"), ("time_mlp_out", "action_head"),
+    ("gemma_expert", "action_expert"), ("vision_tower", "vision"), ("language_model", "language"),
+    ("paligemma", "language"),
+)
+
+
+def patch_pi0_attention(model: nn.Module, fm_factory=None) -> list:
+    """Pi0's attention score matmuls through the reference routine, as pi0-quant run_eval.py:774-796
+    does with patch_attn_sdpa + patch_attn_eager + patch_attn_siglip_eager (ops `attention`, all
+    groups): every module named `*.self_attn` (model_patcher.py:703-707, 893-900) gets its own
+    score-matmul accumulators. The reference shares one pair per route (699-700, 902-903); the
+    MXU models are stateless for non-weight operands here (ref_profile F-cache), so this is
+    equivalent. Each returned site carries a live `calls` dict {route: count}."""
+    _install_pi0_routes()
+    new_fm = (lambda: fm_factory()) if fm_factory else (lambda: None)
+    sites = []
+    for name, mod in model.named_modules():
+        if name.split(".")[-1] != "self_attn":
+            continue
+        calls: dict = {}
+        mod._atlas_ref_attn = {"fm_qk": new_fm(), "fm_av": new_fm(), "variant": "pi0", "calls": calls}
+
+        def pre(m, *_):
+            _pi0_current.module = m
+
+        def post(m, *_):
+            _pi0_current.module = None
+
+        mod.register_forward_pre_hook(pre)
+        mod.register_forward_hook(post)
+        sites.append({"site": name, "kind": type(mod).__name__, "variant": "pi0",
+                      "component": pi0_component(name), "calls": calls})
     return sites
 
 

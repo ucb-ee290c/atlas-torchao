@@ -137,10 +137,25 @@ _DIT_COMPONENT_RULES = [
 ]
 
 
+# Pi0 (openpi PI0Pytorch): pi0-quant pi0_inout/model_patcher.py:92-109, the reference's own table
+# for this model. Its paths never match the rules above except `vision_model` inside
+# `vision_tower`, which both tables call VISION.
+_PI0_COMPONENT_RULES = [
+    ("action_in_proj", "ACTION_HEAD"), ("action_out_proj", "ACTION_HEAD"),
+    ("action_time_mlp_in", "ACTION_HEAD"), ("action_time_mlp_out", "ACTION_HEAD"),
+    ("state_proj", "ACTION_HEAD"), ("time_mlp_in", "ACTION_HEAD"), ("time_mlp_out", "ACTION_HEAD"),
+    ("gemma_expert", "ACTION_EXPERT"), ("vision_tower", "VISION"), ("language_model", "LANGUAGE"),
+    ("paligemma", "LANGUAGE"),
+]
+
+
 def component_for(path: str, default: str = "UNKNOWN"):
-    """The reference Component of a module path (model_patcher.py:98-113, plus the DiT rules)."""
+    """The reference Component of a module path (model_patcher.py:98-113, plus the DiT and Pi0
+    rules)."""
     Component = load_ref_file("stats_tracker").Component
-    for substr, comp in (*_REF_COMPONENT_RULES, *_DIT_COMPONENT_RULES):
+    rules = _PI0_COMPONENT_RULES if "paligemma_with_expert" in path else (
+        *_REF_COMPONENT_RULES, *_DIT_COMPONENT_RULES)
+    for substr, comp in rules:
         if substr in path:
             return Component[comp]
     return Component[default]
