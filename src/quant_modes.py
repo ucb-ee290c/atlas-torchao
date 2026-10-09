@@ -71,6 +71,14 @@ def require_mode_supported(mode: str, device: str) -> None:
     """Raise RuntimeError with a clear message if `mode` cannot run on `device`."""
     if canonical(mode) != "torchao":
         return
+    try:
+        from torchao.quantization import Float8DynamicActivationFloat8WeightConfig, PerTensor  # noqa: F401
+    except ImportError as e:
+        import torchao
+
+        raise RuntimeError(f"mode 'torchao' needs torchao.quantization."
+                           f"Float8DynamicActivationFloat8WeightConfig and PerTensor, which torchao "
+                           f"{torchao.__version__} does not provide ({e})") from e
     if not str(device).startswith("cuda") or not torch.cuda.is_available():
         raise RuntimeError("mode 'torchao' needs a CUDA GPU with compute capability >= 8.9 "
                            f"(native FP8 matmul); device is {device!r}")
