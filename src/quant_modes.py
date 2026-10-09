@@ -49,6 +49,8 @@ PROFILES = {
                 "x 2^(sx+sw), BF16 bias after", "pi0-quant quant_linear.py:145-172; "
                 "functional_models.py:79-108"),
         Profile("torchao", "Float8DynamicActivationFloat8WeightConfig, per-tensor", "torchao 0.18"),
+        Profile("chip", "reference_hw + every other op on the Atlas VPU / scalar core, or listed as "
+                "host fallback (src/chip_profile.py)", "see src/op_unit_map.py"),
     )
 }
 ALIASES = {a: p.name for p in PROFILES.values() for a in p.aliases}
@@ -134,6 +136,7 @@ def add_profile_args(ap) -> None:
                    help="fraction of calls checked beyond the first call of each shape")
     g.add_argument("--crosscheck-budget", type=float, default=600.0,
                    help="seconds of reference CPU time the cross-check may spend")
+    __import__("chip_profile").add_args(ap)
     g.add_argument("--ops", default=",".join(OPS),
                    help="comma-separated ops the reference profiles cover: linear, conv2d, attention "
                         "(smolVLA run_eval.py:7-18; default all)")
@@ -187,6 +190,8 @@ def quantize(model: nn.Module, mode: str, skip=(), options=None) -> dict:
     actually replaced (TorchAO's float8 path skips some shapes without raising).
     """
     name = canonical(mode)
+    if name == "chip":
+        return __import__("chip_profile").quantize_chip(model, skip, options)
     if name == "bf16":
         return {"planned": 0, "quantized": 0, "untouched": []}
     if name in ("reference", "reference_hw"):
