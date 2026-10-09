@@ -98,14 +98,26 @@ def _run(rt, tmp_path, n_obs, *extra):
         assert e["headline"]["delta_rel_l2"] == e["vs_bf16_delta"]["rel_l2"]
         comps = {c["component"] for c in e["rmse"]["components"]}
         assert {"vision", "language", "action_expert", "action_head"} & comps, (name, comps)
-    return res["modes"]
+    for name, e in res["modes"].items():
+        assert e["ladder"]["mode"] == name and "added_by_subset_compare" in e
+    return res
 
 
 def test_evaluate_software_profiles(rt, tmp_path):
     """bf16 + the software profiles: determinism, agreement, the reference action metric, per-layer
     RMSE by component and patch coverage."""
-    modes = _run(rt, tmp_path, 2, "--modes", "bf16", "collab_v0", "collab_v0_hw", "reference")
-    assert list(modes) == ["bf16", "collab_v0", "collab_v0_hw", "reference"]
+    res = _run(rt, tmp_path, 2, "--modes", "bf16", "collab_v0", "collab_v0_hw", "ref_linear", "ref_attn",
+               "reference")
+    modes = res["modes"]
+    assert list(modes) == ["bf16", "collab_v0", "collab_v0_hw", "ref_linear", "ref_attn", "reference"]
+    assert res["subset_compare"]["added_modes"] == []
+    # consecutive ladder steps on the same frames: bf16 -> collab_v0 -> ref_linear -> ref_attn -> ref_conv
+    steps = [(d["from"], d["to"]) for d in res["ladder_deltas"]]
+    assert steps == [("bf16", "collab_v0"), ("collab_v0", "ref_linear"), ("ref_linear", "ref_attn"),
+                     ("ref_attn", "reference")]
+    assert all("delta_rel_l2" in d["delta"] for d in res["ladder_deltas"])
+    assert not modes["ref_linear"]["patch_coverage"]["summary"]["attention"]["patched"]
+    assert modes["ref_attn"]["patch_coverage"]["summary"]["attention"]["patched"] == 5
     comps = {c["component"] for c in modes["reference"]["rmse"]["components"]}
     assert comps == {"vision", "language", "action_expert", "action_head"}
     # collab_v0 quantizes bf16 Linears only: the float32 action head stays, with that reason
@@ -117,8 +129,14 @@ def test_evaluate_hardware_profiles(rt, tmp_path):
     """reference_hw (MXU model, cross-checked against the reference CPU model) and chip: the
     cross-check verdict and the chip unit coverage reach the report (one frame, one flow step;
     --mxu sa is bit-exact-tested in test_pi0.py and only slower here)."""
-    modes = _run(rt, tmp_path, 1, "--steps", "1", "--modes", "reference_hw", "chip", "--mxu", "ipt",
-                 "--crosscheck-frac", "0", "--crosscheck-budget", "10")
+    res = _run(rt, tmp_path, 1, "--steps", "1", "--modes", "reference_hw", "chip", "--mxu", "ipt",
+               "--crosscheck-frac", "0", "--crosscheck-budget", "10")
+    modes = res["modes"]
+    # --subset-compare (default on) brings ref_conv onto the same frames
+    assert list(modes) == ["bf16", "ref_conv", "reference_hw", "chip"]
+    assert res["subset_compare"]["added_modes"] == ["ref_conv"] and modes["ref_conv"]["added_by_subset_compare"]
+    assert [(d["from"], d["to"]) for d in res["ladder_deltas"]][-2:] == [("ref_conv", "reference_hw"),
+                                                                         ("reference_hw", "chip")]
     for name in ("reference_hw", "chip"):
         cc = modes[name]["layers"]["crosscheck"]
         assert cc["ok"] and cc["calls_checked"] > 0 and modes[name]["valid"], (name, cc)

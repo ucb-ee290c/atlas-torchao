@@ -48,6 +48,10 @@ Per mode:
                    CSVs as its :37-40; src/layer_rmse.py, components model_patcher.py:92-109);
   determinism      each mode runs twice with the same noise; must reproduce bit for bit;
   patch_coverage   every Linear / Conv2d / attention site, patched and called or why not;
+  ladder           the coverage-ladder record (quant_modes.ladder_record); the result's
+                   ladder_deltas difference consecutive steps on these same frames, and a subset
+                   profile (reference_hw, chip, chip_rope_vpu) brings in bf16 and ref_conv unless
+                   --subset-compare off; chip tables (RoPE, timestep) default to --chip-rope host;
   layers           the profile report: for reference_hw / chip the MXU cross-check
                    (layers.crosscheck, layers.valid), for chip the unit coverage
                    (layers.coverage), as eval.py / eval_policy.py store them.
@@ -79,7 +83,8 @@ import torch
 import pi0_model
 from eval_policy import agreement, determinism_state, error_vs_gt, make_deterministic, repeat_agreement
 from pi0_model import CallCounter, inventory, patch_coverage
-from quant_modes import ALL_MODES, add_profile_args, finalize_report, quantize, require_mode_supported
+from quant_modes import (ALL_MODES, add_profile_args, add_subset_compare_arg, finalize_report, ladder_deltas,
+                         ladder_record, quantize, require_mode_supported, subset_compare_modes)
 
 REFERENCE_STEPS = 10      # serve_quant.py:479, run_output_eval.py:356, run_eval_mxu_io.py:707
 ACTION_DIMS = 8           # serve_quant.py:494-495: 7 joints + gripper
@@ -180,6 +185,7 @@ def build_parser():
     ap.add_argument("--no-hash", action="store_true", help="do not hash model.safetensors")
     ap.add_argument("--out", required=True)
     add_profile_args(ap)
+    add_subset_compare_arg(ap)
     return ap
 
 
@@ -393,9 +399,21 @@ def evaluate(args, frames, build, level, horizon, action_dim, out: Path) -> dict
     act_dir = out.with_name(out.stem + "_actions")
     modes = {}
     ref = ref_delta = clean = clean_run = None
-    for mode in ["bf16", *[m for m in args.modes if m != "bf16"]]:   # bf16 first: the baseline
+    order = ["bf16", *[m for m in args.modes if m != "bf16"]]      # bf16 first: the baseline
+    # the frames are always a sample, so a subset profile gets ref_conv on the same frames
+    order, added = subset_compare_modes(order, getattr(args, "subset_compare", "on") == "on")
+    for mode in order:
         print(f"== {mode}", flush=True)
         model, inv, layers, policy = build(mode)
+        eq = (layers or {}).get("ladder", {}).get("equivalent_to")
+        if eq in modes:
+            # the op class this step adds is absent from the model: same model, same numbers
+            modes[mode] = {**modes[eq], "layers": finalize_report(layers),
+                           "ladder": {**layers["ladder"], "duplicate_of": eq},
+                           "added_by_subset_compare": mode in added}
+            print(f"{mode}: identical to {eq} (nothing added to quantize); not re-run", flush=True)
+            del model, policy
+            continue
         run = make_runner(model, policy, level, args.steps, args.device)
         counter = CallCounter(model, [f for f, i in inv.items() if i["kind"] in ("linear", "conv2d")])
         rm = before = None
@@ -426,6 +444,8 @@ def evaluate(args, frames, build, level, horizon, action_dim, out: Path) -> dict
                 print(f"WARNING: mode {mode} is not deterministic: {entry['determinism']}", flush=True)
         # after every pass, so the cross-check summary covers the repeat as well
         entry["layers"] = finalize_report(layers)
+        entry["ladder"] = layers["ladder"] if layers is not None else ladder_record("bf16", {}, args)
+        entry["added_by_subset_compare"] = mode in added
         entry["valid"] = bool((layers or {}).get("valid", True))
         if layers is not None and layers.get("quantized", 1) == 0 and not layers.get("attention_sites"):
             print(f"WARNING: mode {mode} quantized no layers; its numbers are the baseline's", flush=True)
@@ -454,7 +474,22 @@ def evaluate(args, frames, build, level, horizon, action_dim, out: Path) -> dict
             torch.cuda.empty_cache()
     return {"noise": {"kind": args.noise, "level": level, "sha256": noise_digest(noises),
                       "device": str(noises[0].device)},
-            "modes": modes, "valid": all(e["valid"] for e in modes.values())}
+            "modes": modes, "valid": all(e["valid"] for e in modes.values()),
+            "subset_compare": {"enabled": bool(added) or None, "added_modes": added},
+            "ladder_deltas": ladder_deltas({m: ladder_metrics(e) for m, e in modes.items()},
+                                           {m: e["ladder"] for m, e in modes.items()})}
+
+
+def ladder_metrics(entry) -> dict:
+    """The numbers ladder_deltas differences between consecutive steps: the delta-space headline,
+    the absolute-space agreement and the reference's rel RMSE (bf16 is 0 / 1 against itself)."""
+    m = {k: v for k, v in entry["headline"].items() if isinstance(v, (int, float))}
+    if "vs_bf16" in entry:
+        m.update(bf16_rel_l2=entry["vs_bf16"]["rel_l2"], bf16_cosine=entry["vs_bf16"]["cosine"])
+    else:
+        m.update(bf16_rel_l2=0.0, bf16_cosine=1.0, delta_rel_l2=0.0, delta_cosine=1.0,
+                 reference_rel_rmse_absolute=0.0)
+    return m
 
 
 def provenance(args, openpi) -> dict:
