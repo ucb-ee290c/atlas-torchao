@@ -112,6 +112,9 @@ def _quantize_torchao_style(model: nn.Module, name: str, skip) -> dict:
             "untouched": sorted(set(planned) - set(changed))}
 
 
+OPS = ("linear", "conv2d", "attention")
+
+
 def add_profile_args(ap) -> None:
     """Options of the reference profiles, shared by the eval CLIs."""
     from accum_backends import DEFAULT_MXU, IMPLS, MXUS
@@ -120,9 +123,23 @@ def add_profile_args(ap) -> None:
     g.add_argument("--mxu", choices=MXUS, default=DEFAULT_MXU,
                    help="reference_hw accumulation model: ipt (inner-product tree, the reference "
                         "author's choice) or sa (per-step systolic array)")
-    g.add_argument("--mxu-impl", choices=IMPLS, default="ref_cpu",
-                   help="ref_cpu: the reference CPU models (oracles); torch: GPU-capable port")
+    g.add_argument("--mxu-impl", choices=IMPLS, default="torch",
+                   help="torch: bit-exact device-agnostic port (default); ref_cpu: the reference "
+                        "CPU models (the oracles; slow)")
+    g.add_argument("--accum-compile", action="store_true",
+                   help="torch.compile the SA step (recommended on GPU for --mxu sa)")
+    g.add_argument("--crosscheck", choices=("on", "off"), default="on",
+                   help="reference_hw with --mxu-impl torch: recompute a seeded sample of real "
+                        "calls with the reference CPU model and compare bits; any mismatch marks "
+                        "the result invalid (default on)")
+    g.add_argument("--crosscheck-frac", type=float, default=0.01,
+                   help="fraction of calls checked beyond the first call of each shape")
+    g.add_argument("--crosscheck-budget", type=float, default=600.0,
+                   help="seconds of reference CPU time the cross-check may spend")
     __import__("chip_profile").add_args(ap)
+    g.add_argument("--ops", default=",".join(OPS),
+                   help="comma-separated ops the reference profiles cover: linear, conv2d, attention "
+                        "(smolVLA run_eval.py:7-18; default all)")
 
 
 def profile_options(options) -> dict:
@@ -130,8 +147,37 @@ def profile_options(options) -> dict:
     from accum_backends import DEFAULT_MXU
 
     get = options.get if isinstance(options, dict) else (lambda k, d=None: getattr(options, k, d))
+    ops = get("ops", None) or ",".join(OPS)
+    ops = tuple(o.strip() for o in (ops.split(",") if isinstance(ops, str) else ops) if o.strip())
+    bad = set(ops) - set(OPS)
+    if bad:
+        raise ValueError(f"unknown ops {sorted(bad)}; choose from {OPS}")
     return {"mxu": get("mxu", DEFAULT_MXU) or DEFAULT_MXU,
-            "mxu_impl": get("mxu_impl", "ref_cpu") or "ref_cpu"}
+            "mxu_impl": get("mxu_impl", "torch") or "torch", "ops": ops,
+            "accum_compile": bool(get("accum_compile", False)) or None,
+            "crosscheck": (get("crosscheck", "on") or "on") == "on",
+            "crosscheck_frac": float(get("crosscheck_frac", 0.01)),
+            "crosscheck_budget": float(get("crosscheck_budget", 600.0))}
+
+
+def finalize_report(rep):
+    """Call after the evaluation, before writing the JSON: turns the live cross-check into its
+    summary and marks the result invalid if any checked bit differed (or nothing was checked)."""
+    if not isinstance(rep, dict):
+        return rep
+    cc = rep.get("crosscheck")
+    if cc is not None and hasattr(cc, "summary"):
+        rep["crosscheck"] = cc = cc.summary()
+    if isinstance(cc, dict) and not cc.get("ok", False):
+        rep["valid"] = False
+        rep.setdefault("invalid_reasons", []).append(
+            f"crosscheck: {cc.get('bit_mismatches')} bit mismatches, {cc.get('calls_checked')} calls "
+            f"checked, {len(cc.get('errors', []))} errors")
+        print("WARNING: reference_hw cross-check failed; result marked invalid:",
+              rep["invalid_reasons"][-1], flush=True)
+    elif isinstance(cc, dict):
+        rep.setdefault("valid", True)
+    return rep
 
 
 def quantize(model: nn.Module, mode: str, skip=(), options=None) -> dict:
@@ -153,16 +199,36 @@ def quantize(model: nn.Module, mode: str, skip=(), options=None) -> dict:
         from ref_profile import quantize_reference
 
         opts = profile_options(options or {})
-        factory = None
+        factory = fm0 = None
         if name == "reference_hw":
             from accum_backends import describe, get_accumulator
 
-            get_accumulator(opts["mxu"], opts["mxu_impl"])          # fail before replacing anything
-            factory = lambda: get_accumulator(opts["mxu"], opts["mxu_impl"])  # noqa: E731
-        rep = quantize_reference(model, skip, fm_factory=factory)
-        rep["profile"] = {"name": name,
+            from accum_backends import crosschecked
+
+            fm0 = get_accumulator(opts["mxu"], opts["mxu_impl"], compile=opts["accum_compile"])
+            if opts["mxu_impl"] == "torch":
+                # stateless: one instance serves every layer
+                if opts["crosscheck"]:
+                    fm0 = crosschecked(opts["mxu"], fm0, opts["crosscheck_frac"],
+                                       time_budget_s=opts["crosscheck_budget"])
+                factory = lambda: fm0  # noqa: E731
+            else:
+                factory = lambda: get_accumulator(opts["mxu"], opts["mxu_impl"])  # noqa: E731
+        from ref_attention import patch_attention, quantize_conv2d
+
+        if "linear" in opts["ops"]:
+            rep = quantize_reference(model, skip, fm_factory=factory)
+        else:
+            rep = {"planned": 0, "quantized": 0, "untouched": []}
+        if "conv2d" in opts["ops"]:
+            rep["conv2d"] = quantize_conv2d(model, skip, fm_factory=factory)
+        if "attention" in opts["ops"]:
+            rep["attention_sites"] = patch_attention(model, fm_factory=factory)
+        rep["profile"] = {"name": name, "ops": list(opts["ops"]),
                           **({"accumulation": describe(opts["mxu"], opts["mxu_impl"])}
                              if name == "reference_hw" else {})}
+        if name == "reference_hw" and hasattr(fm0, "summary"):
+            rep["crosscheck"] = fm0                  # replaced by its summary in finalize_report
         rep["reference_sources"] = ref_loader.provenance()
         return rep
     return _quantize_torchao_style(model, name, skip)

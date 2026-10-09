@@ -107,27 +107,35 @@ class _RefCPU:
 
 
 class _Torch:
-    def __init__(self, mxu: str):
+    """src/accum_torch.py. ipt follows ipt_numba (variant="numba", the reference author's run and
+    the RTL's single rounding); sa can torch.compile its step (compile=None reads
+    ATLAS_ACCUM_COMPILE). Pure integer bit-field arithmetic: TF32 and reduction-order settings
+    cannot change its results."""
+
+    def __init__(self, mxu: str, compile=None):
         try:
             import accum_torch
         except ImportError as e:
             raise RuntimeError("the torch accumulation implementation (src/accum_torch.py) is not "
                                "available in this checkout; use --mxu-impl ref_cpu") from e
-        self.mxu = mxu
-        self.fn = accum_torch.ipt_linear if mxu == "ipt" else accum_torch.sa_linear
+        self.mxu, self.compile = mxu, compile
+        self._at = accum_torch
 
     def __call__(self, x, w, b=None, static: bool = False):
-        return self.fn(x, w, b)
+        if self.mxu == "ipt":
+            return self._at.ipt_linear(x, w, b, variant="numba")
+        return self._at.sa_linear(x, w, b, compile=self.compile)
 
 
-def get_accumulator(mxu: str = DEFAULT_MXU, impl: str = "ref_cpu") -> Accumulator:
-    """A callable fm(x, w, b=None, static=False) for the given MXU model and implementation."""
+def get_accumulator(mxu: str = DEFAULT_MXU, impl: str = "ref_cpu", compile=None) -> Accumulator:
+    """A callable fm(x, w, b=None, static=False) for the given MXU model and implementation.
+    `compile` only affects the torch SA port."""
     if mxu not in MXUS:
         raise ValueError(f"unknown mxu {mxu!r}; choose from {MXUS}")
     if impl not in IMPLS:
         raise ValueError(f"unknown implementation {impl!r}; choose from {IMPLS}")
     if impl == "torch":
-        return _Torch(mxu)
+        return _Torch(mxu, compile)
     return _RefCPU(mxu, impl)
 
 
@@ -137,4 +145,18 @@ def describe(mxu: str, impl: str) -> dict:
               ("ipt", "ref_cpu_c"): "funct_models_ipt.ipt_c CIPTLinearRTLFunction(32, 32)",
               ("sa", "ref_cpu"): "func_models_sa.systolic_c SARTLLinearFunction(32, 32)"}
     return {"mxu": mxu, "impl": impl,
-            "model": oracle.get((mxu, impl), f"accum_torch.{mxu}_linear")}
+            "model": oracle.get((mxu, impl), "accum_torch.ipt_linear(variant='numba')" if mxu == "ipt"
+                                else "accum_torch.sa_linear")}
+
+
+def crosschecked(mxu: str, fm, sample_frac: float = 0.01, seed: int = 0, time_budget_s: float = 600.0):
+    """Wrap a torch accumulator so a seeded sample of real calls is recomputed by the reference
+    CPU model and compared bit for bit (src/accum_crosscheck.py). One instance is shared by every
+    layer so the time budget is global. The reference is always called with its weight cache
+    dropped: the operands it receives are fresh CPU copies, whose addresses can repeat."""
+    from accum_crosscheck import CrossChecked
+
+    ref = get_accumulator(mxu, "ref_cpu")
+    return CrossChecked(fm, lambda x, w, b=None: ref(x, w, b, static=False), mxu=mxu, impl="torch",
+                        ref_impl="ref_cpu", sample_frac=sample_frac, seed=seed,
+                        time_budget_s=time_budget_s)

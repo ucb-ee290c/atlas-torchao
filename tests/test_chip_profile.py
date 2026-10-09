@@ -42,10 +42,11 @@ def test_tiny_llama_chip(mxu):
     assert any("--skip lm_head" in r for r in host.values())
     ops = {(o["unit"], o["op"]) for o in cov["ops"]}
     for need in [("VPU", "_softmax"), ("VPU", "silu"), ("VPU", "rsqrt"), ("VPU", "mean"),
-                 ("MXU", "linear" if mxu == "model" else "mm"), ("MXU", "bmm"), ("eval", "_log_softmax")]:
+                 ("MXU", "linear" if mxu == "model" else "mm"), ("MXU", "attention"), ("eval", "_log_softmax")]:
         assert need in ops, need
     assert cov["silent_bf16_ops"] == 0
-    assert {d["op"] for d in cov["new_decisions"]} >= {"bmm"}
+    # attention runs through the reference per-head routine (ref_attention), counted as "attention"
+    assert ("MXU", "bmm") not in ops
 
 
 def test_reference_target_ops_all_handled():

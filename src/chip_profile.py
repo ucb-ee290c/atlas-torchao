@@ -200,6 +200,10 @@ def quantize_chip(model: nn.Module, skip=(), options=None) -> dict:
         cfg = getattr(m, "_atlas_ref_attn", None)
         if isinstance(cfg, dict):
             for k in ("fm_qk", "fm_av"):
+                if cfg.get(k) is None and mxu_kind == "framework":
+                    # the reference attention routine (ref_attention) with no MXU model: its score
+                    # matmuls run guarded, so give them the framework stand-in to keep them counted
+                    cfg[k] = framework_fm
                 if cfg.get(k) is not None and not isinstance(cfg[k], _GuardedFM):
                     cfg[k] = _GuardedFM(cfg[k], router, "attention")
 

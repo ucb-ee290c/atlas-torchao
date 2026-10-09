@@ -12,13 +12,14 @@ def _refs():
 
 
 @pytest.mark.parametrize("K", [32, 77, 160])
-def test_ipt_numba_and_c_agree_on_random(K):
+def test_torch_impl_matches_its_oracle(K):
+    """ipt_numba and ipt_c are different models (single vs double rounding, see below), so each
+    is compared with its own port, never with each other."""
     g = torch.Generator().manual_seed(K)
     x = with_ties(e4m3_values((9, K), g), g)
     w = with_ties(e4m3_values((37, K), g, spread=1.0, scale=0.05), g)
-    a = ab.get_accumulator("ipt", "ref_cpu")(x, w)
-    b = ab.get_accumulator("ipt", "ref_cpu_c")(x, w)
-    assert torch.equal(a, b)
+    for mxu in ab.MXUS:
+        assert torch.equal(ab.get_accumulator(mxu, "torch")(x, w), ab.get_accumulator(mxu, "ref_cpu")(x, w))
 
 
 def test_ipt_lane_count_does_not_change_results():
@@ -29,7 +30,6 @@ def test_ipt_lane_count_does_not_change_results():
     y16 = m.CIPTLinearRTLFunction(num_lanes=16)(x, w, None)
     y32 = m.CIPTLinearRTLFunction(num_lanes=32)(x, w, None)
     assert torch.equal(y16, y32)
-    assert torch.equal(y32, ab.get_accumulator("ipt", "ref_cpu")(x, w))
 
 
 def test_ipt_c_double_rounds_where_numba_and_rtl_round_once():
@@ -72,3 +72,20 @@ def test_unknown_names_raise():
         ab.get_accumulator("tpu", "ref_cpu")
     with pytest.raises(ValueError):
         ab.get_accumulator("sa", "ref_cpu_c")
+
+
+def test_crosscheck_flags_mismatch_as_invalid():
+    import quant_modes
+
+    g = torch.Generator().manual_seed(4)
+    x, w = e4m3_values((3, 64), g), e4m3_values((8, 64), g, scale=0.1)
+    good = ab.crosschecked("sa", ab.get_accumulator("sa", "torch"))
+    good(x, w, static=True)
+    assert quant_modes.finalize_report({"crosscheck": good})["valid"] is True
+    bad = ab.crosschecked("sa", lambda x, w, b=None, static=False: ab.get_accumulator("ipt", "torch")(x, w))
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        bad(x, w)
+    rep = quant_modes.finalize_report({"crosscheck": bad})
+    assert rep["valid"] is False and rep["crosscheck"]["bit_mismatches"] > 0
