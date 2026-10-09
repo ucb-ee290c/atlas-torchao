@@ -5,7 +5,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import m2m
 
-
 class FP8Linear(nn.Module):
     """Minimal: FP8 weight buffer + FP8 activation cast, then a matmul."""
     def __init__(self):

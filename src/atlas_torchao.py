@@ -8,7 +8,6 @@ from torchao.quantization.transform_module import register_quantize_module_handl
 from modelutils import load_llama, load_smolvla
 from atlas_quant import hw_bf16_to_e4m3, hw_e4m3_to_float, scale_exp_for
 from torch.fx.passes.graph_drawer import FxGraphDrawer
-from model2MLIR import m2m
 
 E8M0_BIAS = 127
 
