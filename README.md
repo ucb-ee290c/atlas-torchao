@@ -78,8 +78,21 @@ benchmark: one frame is roughly one forward of a few hundred tokens times the fl
     python src/eval_policy.py --policy lerobot/smolvla_base --dataset lerobot/svla_so100_pickplace --n-frames $F --modes reference_hw --mxu ipt --rmse --out out/smolvla_refhw_ipt.json
     python src/eval_policy.py --policy lerobot/smolvla_base --dataset lerobot/svla_so100_pickplace --n-frames $F --modes chip --mxu ipt --out out/smolvla_chip_ipt.json
 
-Multi-Task DiT. There is no DiT-specific profile: the generic rules apply, and its custom attention
-is left unpatched (see `attention_sites` in the JSON).
+Policy-eval options (eval_policy.py):
+
+- Determinism check: each mode runs twice by default and the result JSON records `determinism` and
+  `deterministic` per mode. `--no-determinism-check` runs each mode once (halves the time, determinism
+  unchecked). `--deterministic` turns on deterministic kernels (`torch.use_deterministic_algorithms`,
+  cuDNN deterministic, cuBLAS workspace config). Compare runs only at equal thread counts: CPU
+  reductions are split by thread, so the thread count changes bf16 results.
+- `--dtype {bfloat16,float32}` (default bfloat16) sets the policy dtype for every mode, the baseline
+  included; the reference author loads SmolVLA in float32. The baseline mode label stays `bf16` even
+  with `--dtype float32` (it is the mode name used throughout the result JSON and the `vs_bf16`
+  keys, so it is documented rather than renamed); read it as "the unquantized baseline in --dtype".
+
+Multi-Task DiT. The dedicated DiT profile lives in multitask-dit-quant (see its README:
+git@github.com:lorenshung/multitask-dit-quant.git). Here there is no DiT-specific profile: the
+generic rules apply, and its custom attention is left unpatched (see `attention_sites` in the JSON).
 
     python src/eval_policy.py --policy TRI-ML/multitask-dit-robosuite-wrist-diffusion-064000 --dataset TRI-ML/PretrainFinetune --n-frames 200 --modes bf16 collab_v0 collab_v0_hw reference --out out/dit_fast.json
 

@@ -74,6 +74,9 @@ eval skips `lm_head`, which was the collaborator's choice (eval.py:66).
   - The reference patches the module-level `eager_attention_forward` (model_patcher.py:868), which only takes effect when the vision config uses `eager`.
   - lerobot does not set an attention implementation for SmolVLM.
   - This repo registers a transformers attention key instead, so the routine runs whatever implementation was configured. Whether the reference's vision patch fired in the reference author's runs is not verified here (transformers 4.53.2 there, 5.5.4 here).
+- **F-dit-gap: the DiT 0.343 vs 0.015 gap is a gripper switch, not nondeterminism.**
+  - The gap comes from a single dimension, the gripper (dim 6), switching one step earlier under collab_v0.
+  - It is not nondeterminism: sampling draws from the global RNG, which is now isolated with `torch.random.fork_rng` plus a reseed. The draws are unchanged by that isolation.
 
 ## Open questions
 
