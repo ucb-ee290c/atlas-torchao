@@ -42,6 +42,9 @@ def add_args(ap) -> None:
                    help="RoPE tables: vpu (computed on the VPU, the reference treatment) or host "
                         "(*RotaryEmbedding tables precomputed on the host)")
     g.add_argument("--chip-strict", action="store_true", help="raise on an unmapped float op")
+    g.add_argument("--chip-native", nargs="*", default=[],
+                   help="aten ops (overload-packet names) run on the host instead, for ablations; "
+                        "they are reported as host fallback")
     g.add_argument("--chip-mxu", choices=("model", "framework"), default="model",
                    help="model: MXU accumulation through the reference_hw model (--mxu/--mxu-impl); "
                         "framework: FP8 operands, float32 matmul rounded to BF16 (NEW, for fast CPU smokes)")
@@ -187,7 +190,8 @@ def quantize_chip(model: nn.Module, skip=(), options=None) -> dict:
     rope = _opt(options, "chip_rope", "vpu") or "vpu"
     cov = cc.Coverage(type(model).__name__)
     router = cc.ChipRouter(cov, opts["mxu"], opts["mxu_impl"], rope=rope,
-                           strict=bool(_opt(options, "chip_strict", False)))
+                           strict=bool(_opt(options, "chip_strict", False)),
+                           native_ops=_opt(options, "chip_native", None) or ())
     router.active = False
     if mxu_kind == "framework":
         router.fm = framework_fm
