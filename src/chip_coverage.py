@@ -196,8 +196,9 @@ class ChipRouter(TorchDispatchMode):
     """Route a forward pass onto the Atlas units. One instance per model."""
 
     def __init__(self, coverage: Coverage, mxu: str = "ipt", mxu_impl: str = "ref_cpu",
-                 rope: str = "vpu", strict: bool = False):
+                 rope: str = "vpu", strict: bool = False, native_ops=()):
         super().__init__()
+        self.native_ops = set(native_ops)
         self.cov = coverage
         self._instr = defaultdict(int)
         self.vpu = chip_ops.ChipVPU(counter=self._count)
@@ -263,6 +264,8 @@ class ChipRouter(TorchDispatchMode):
     def classify(self, func, name, args, kwargs, kind):
         ts = list(_tensors(list(args) + list(kwargs.values())))
         floats = [t for t in ts if t.is_floating_point()]
+        if name in self.native_ops:
+            return "host", None, "forced to the host for an ablation (--chip-native)"
         if name in M.EVAL_ONLY:
             return "eval", None, "evaluation-only loss (not part of inference)"
         if name in M.DATA:
@@ -396,7 +399,7 @@ def _neg(r, x):
 
 
 def _sigmoid(r, x):                                              # vpu_decomp.py:188-191
-    e = r.vpu.exp(r.vpu.sub(torch.zeros_like(x), x))
+    e = _safe_exp(r, r.vpu.sub(torch.zeros_like(x), x))
     return r.vpu.rcp(r.vpu.add(torch.full_like(e, 1.0), e))
 
 
@@ -528,10 +531,32 @@ def _maxmin(r, func, name, args, kwargs):
     return _reduce(r, args[0], None, False, "max" if name == "max" else "min").to(args[0].dtype)
 
 
+# vexp.bf16 is exact only down to x = -336: below that the reference FPEX model (bit-exact to
+# ExpLane.scala) wraps in its Q(m,n) conversion and returns large or unit values (exp(-1000) =
+# 2.6e10, exp(-3.3e38) = 1). Every exp of a value that can be very negative (softmax after the
+# additive mask, SiLU/sigmoid of large inputs) is therefore preceded by vmaximum(x, EXP_FLOOR);
+# exp(EXP_FLOOR) is exactly 0 in the model (zero for -336 <= x <= -93). NEW (one vmaximum per
+# element), the analogue being the RTL's own overflow pre-check (expFPIsInf, ExpLane.scala:47).
+EXP_FLOOR = -128.0
+
+
+def _safe_exp(r, x):
+    return r.vpu.exp(r.vpu.pairwise_max(x, torch.full_like(x, EXP_FLOOR)))
+
+
 def _softmax(r, func, name, args, kwargs):
+    """The reference sequence (vpu_decomp.py:132-158) with the exp floor above."""
     x, dim = args[0], args[1]
     half_to_float = len(args) > 2 and args[2]
-    out = r.dec._vpu_softmax(r.vpu, x.float(), dim)                    # vpu_decomp.py:132-158
+    f = x.float()
+    d = dim % f.dim()
+    t = f.transpose(d, -1).contiguous() if d != f.dim() - 1 else f
+    x_max = r.dec._vpu_rmax_all(r.vpu, t)
+    e = _safe_exp(r, r.vpu.sub(t, x_max.expand_as(t).contiguous()))
+    inv = r.vpu.rcp(r.dec._vpu_rsum_all(r.vpu, e))
+    out = r.vpu.mul(e, inv.expand_as(e).contiguous())
+    if d != f.dim() - 1:
+        out = out.transpose(d, -1).contiguous()
     return out.to(torch.float32 if half_to_float else x.dtype)
 
 
@@ -567,8 +592,10 @@ def _gelu(r, func, name, args, kwargs):
 
 
 def _silu(r, func, name, args, kwargs):
+    """x * sigmoid(x): the reference SiLU sequence (vpu_decomp.py:181-192) with the exp floor."""
     x = args[0]
-    return _result(r.dec._vpu_silu(r.vpu, x.float()), func, name, args, x.dtype)
+    f = x.float()
+    return _result(r.vpu.mul(f, _sigmoid(r, f)), func, name, args, x.dtype)
 
 
 def _cumsum(r, func, name, args, kwargs):

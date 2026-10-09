@@ -96,3 +96,14 @@ def test_matmuls_on_mxu_and_conv():
     # K = 1: an outer product on the VPU
     o = run(r, A.bmm.default, torch.arange(4.0).reshape(1, 4, 1), torch.ones(1, 1, 3))
     assert torch.equal(o, torch.arange(4.0).reshape(1, 4, 1).expand(1, 4, 3))
+
+
+def test_masked_softmax_masks():
+    """vexp wraps below -336 (exp(-3.3e38) = 1 in the model); the exp floor keeps the mask a mask."""
+    r = router()
+    s = torch.randn(4, 128) * 3
+    m = torch.triu(torch.full((128, 128), torch.finfo(torch.bfloat16).min), 1)[:4]
+    assert r.vpu.exp(torch.tensor([-3.3e38])).item() == 1.0          # the model's behaviour
+    out = run(r, A._softmax.default, s + m, -1, False)
+    assert close(out, torch.softmax(s + m, -1), atol=1e-2)
+    assert (out[m < 0] == 0).all()

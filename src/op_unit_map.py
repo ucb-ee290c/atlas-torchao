@@ -94,14 +94,19 @@ ATEN: dict[str, Entry] = {
     "clamp_max": _v("vminimum.bf16", f"{GC} 57/04", "ISA"),
     "clamp_": _v("vmaximum.bf16, vminimum.bf16", f"{GC} 57/04, 57/06", "ISA"),
     # ---- activations / fused composites (quant_vector.py:183-187, 375-396; vpu_decomp.py:79-192)
-    "silu": _v("vsub, vexp, vadd, vrecip, vmul", f"{QV}:187,390-392; {VD}:181-192"),
-    "silu_": _v("vsub, vexp, vadd, vrecip, vmul", f"{VD}:181-192", "NEW", "in-place form of silu"),
-    "sigmoid": _v("vsub, vexp, vadd, vrecip", f"{VD}:187-191", "NEW",
-                  "the sigmoid part of the reference SiLU sequence (vpu_decomp.py:188-191)"),
+    "silu": _v("vsub, vmaximum (exp floor), vexp, vadd, vrecip, vmul", f"{QV}:187,390-392; {VD}:181-192",
+               "NEW", "reference sequence plus vmaximum(x, -128) before vexp: the vexp model wraps "
+               "below -336 (exp(-1000) = 2.6e10); analogue: ExpLane.scala:47 overflow pre-check"),
+    "silu_": _v("vsub, vmaximum, vexp, vadd, vrecip, vmul", f"{VD}:181-192", "NEW", "in-place form of silu"),
+    "sigmoid": _v("vsub, vmaximum (exp floor), vexp, vadd, vrecip", f"{VD}:187-191", "NEW",
+                  "the sigmoid part of the reference SiLU sequence (vpu_decomp.py:188-191), with the exp floor"),
     "gelu": _v("vmul x3, vmul, vadd, vmul, vtanh, vadd, vmul, vmul", f"{QV}:186,386-388; {VD}:161-178",
                reason="tanh form for every `approximate` (the reference ignores it, quant_vector.py:386-388)"),
-    "_softmax": _v("vredmax.row (staged), vsub, vexp, vredsum.row (staged), vrecip, vmul",
-                   f"{QV}:185,381-384; {VD}:132-158"),
+    "_softmax": _v("vredmax.row (staged), vsub, vmaximum (exp floor), vexp, vredsum.row (staged), vrecip, vmul",
+                   f"{QV}:185,381-384; {VD}:132-158", "NEW",
+                   "reference sequence plus vmaximum(x - max, -128) before vexp: the vexp model returns "
+                   "exp(-3.3e38) = 1, so an additive -inf/min mask would not mask; analogue: "
+                   "ExpLane.scala:47 overflow pre-check"),
     "_safe_softmax": _v("as _softmax", f"{VD}:132-158", "NEW", "same op without fully-masked-row NaNs in torch"),
     "native_layer_norm": _v("vredsum.row, vmul, vsub, vmul, vredsum.row, vmul, vadd, vsqrt, vrecip, vmul, vmul, vadd",
                             f"{QV}:184,376-379; {VD}:84-129"),
