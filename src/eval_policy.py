@@ -49,6 +49,11 @@ def load_policy(path, device, dtype):
     for name in ("action_in_proj", "action_out_proj", "action_time_mlp_in", "action_time_mlp_out"):
         if hasattr(inner, name):
             getattr(inner, name).float()
+    # Multi-Task DiT builds its timestep embedding in float32 (long * float32 frequencies); round it to
+    # the policy dtype so the bf16 time MLP accepts it.
+    for m in policy.modules():
+        if type(m).__name__ == "SinusoidalPosEmb":
+            m.register_forward_hook(lambda mod, inp, out: out.to(dtype))
     return policy, cfg
 
 
@@ -88,6 +93,19 @@ def to_batch(sample, preprocess):
     return preprocess(batch)
 
 
+def predict_chunk(policy, batch, seed, device):
+    """One action chunk for a preprocessed offline batch.
+
+    Policies with an observation history (n_obs_steps > 1, e.g. Multi-Task DiT) normally fill it from
+    an online queue that predict_action_chunk reads; offline the history is already in the batch (the
+    dataset was built with the config's observation delta timestamps), so call the model directly.
+    """
+    if getattr(policy.config, "n_obs_steps", 1) > 1 and hasattr(policy, "_generate_actions"):
+        b = {k: v for k, v in batch.items() if k != "action"}
+        return policy._generate_actions(policy._prepare_batch(b))
+    return policy.predict_action_chunk(batch, **noise_kwargs(policy, seed, device))
+
+
 def noise_kwargs(policy, seed, device):
     """Explicit initial noise for policies that take it (SmolVLA). Others sample from the global RNG, which run_mode seeds per frame."""
     import inspect
@@ -111,13 +129,16 @@ def run_mode(policy, ds, idx, preprocess, postprocess, seed, device):
         if device.startswith("cuda"):
             torch.cuda.synchronize()
         t0 = time.perf_counter()
-        chunk = policy.predict_action_chunk(batch, **noise_kwargs(policy, seed + i, device))
+        chunk = predict_chunk(policy, batch, seed + i, device)
         if device.startswith("cuda"):
             torch.cuda.synchronize()
         times.append(time.perf_counter() - t0)
         chunk = postprocess(chunk).float().cpu()[0]  # (T, action_dim), dataset units
-        gt = sample["action"].float()
-        pad = sample.get("action_is_pad", torch.zeros(gt.shape[0], dtype=torch.bool))
+        # The chunk starts at the current step; the sample's action window starts at its first delta
+        # index (e.g. -1 for a 2-step observation history), so skip to the delta-0 entry.
+        off = list(policy.config.action_delta_indices).index(0)
+        gt = sample["action"].float()[off:]
+        pad = sample.get("action_is_pad", torch.zeros(sample["action"].shape[0], dtype=torch.bool))[off:]
         t = min(chunk.shape[0], gt.shape[0])
         preds.append(chunk[:t])
         gts.append(gt[:t])
@@ -179,7 +200,10 @@ def main():
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     for m in args.modes:
-        require_mode_supported(m, args.device)  # fail early, before any model download
+        try:
+            require_mode_supported(m, args.device)  # fail early, before any model download
+        except RuntimeError as e:
+            ap.error(str(e))
     if "bf16" not in args.modes:
         args.modes = ["bf16", *args.modes]  # every FP8 mode is compared against it
 
