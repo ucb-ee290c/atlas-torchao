@@ -122,13 +122,27 @@ Every result JSON written with `chip` carries `layers.chip.coverage` (eval.py) o
 lane-element ops, output elements otherwise), the host-fallback list with reasons, the
 `new_decisions` list (op, choice, analogue, reason) and `silent_bf16_ops: 0`. The same table is
 printed after the first pass and at exit. Options: `--chip-rope vpu|host` (RoPE tables on the VPU,
-the reference treatment, or precomputed on the host), `--chip-strict` (raise on an unmapped op).
+the reference treatment, or precomputed on the host together with the sinusoidal timestep table), `--chip-strict` (raise on an unmapped op).
 
     python src/eval.py --model /path/TinyLlama-1.1B-Chat-v1.0 --seqlen 128 --max-windows 2 \
         --modes bf16 chip --chip-mxu framework --device cpu --out out/tinyllama_chip.json
     python src/eval_policy.py --policy lerobot/smolvla_base --dataset lerobot/svla_so100_pickplace \
         --modes bf16 chip --chip-mxu framework --n-test-episodes 1 --n-frames 2 --device cpu \
         --out out/smolvla_chip.json
+
+### Pi0
+
+Every aten op of openpi's PI0Pytorch (`sample_actions`, pi0=True) has a unit: `MODEL_OPS` rows
+`"pi0"` in `src/op_unit_map.py`, cited to pi0-quant's `patch_vector_ops` (quant_vector.py:136-171,
+360-433) and vpu_decomp.py, which this repo follows op for op (GELU-tanh, RMSNorm with `1 + w` as
+vsquare / staged rsum / vsqrt+vrecip / vadd / vmul, softmax, SiLU, embedding scale, RoPE apply,
+Euler step). On a tiny random-weight Pi0 (tests/pi0_tiny.py, tests/test_chip_pi0.py)
+`silent_bf16_ops` is 0 and the only host fallbacks are the float `le` of the block-causal mask
+build, the loop test `ge` and the loop time update `add_` (plus the RoPE and timestep tables with
+`--chip-rope host`). Use `--chip-rope host` for Pi0: its prefix positions reach ~880 and its
+timestep angles 1571 rad, where the VPU's sin/cos (and BF16 angles) are wrong by up to 2.0
+(the reference puts them on the VPU, so `vpu` stays the default and the reference treatment).
+The masked logits (-2.38e38) are zeroed by the vexp floor (-128).
 
 ### NEW decisions (no reference or ISA source; the analogue followed is cited)
 
@@ -150,6 +164,9 @@ the reference treatment, or precomputed on the host), `--chip-strict` (raise on 
 | `--chip-mxu framework` | FP8 operands, float32 matmul, one BF16 rounding | ref_profile.py `reference` F.linear stand-in |
 | exp inside `_softmax`, `silu`, `sigmoid` | `vmaximum(x, -128)` before `vexp` | the vexp model (bit-exact to ExpLane.scala) wraps below x = -336: exp(-3.3e38) = 1, so an additive min/-inf mask did not mask (TinyLlama chip PPL 942 -> 9.5 on the first window); analogue: ExpLane.scala:47 overflow pre-check |
 | float64 0-d scalar arithmetic | host | schedule constants; Atlas has no FP64 |
+| 0-d float `add_`/`sub_` (Pi0 flow `time += dt`) | host, float32 | pi0-quant TARGET_OPS has no `add_` (quant_vector.py:136-171), so the reference keeps it float32; the loop compare is host anyway. A BF16 vadd would truncate the timestep each step (1.0, 0.898, 0.797, ...) |
+| `where(mask, c1, c2)` with two constant branches (Pi0 `torch.where(att, 0, -2.38e38)`) | data: the precomputed additive mask | the where/masked_fill decision above; openpi pi0_pytorch.py:160 |
+| sinusoidal timestep table (`create_sinusoidal_pos_embedding`, Pi0 / SmolVLA) under `--chip-rope host` | host table, like RoPE | angles reach 2π/4e-3 = 1571 rad: outside vsin/vcos's range and 8 rad per BF16 ulp; the table depends only on the step schedule |
 
 The model-level op -> unit map (with the aten ops each model operation becomes) is `MODEL_OPS` in
 `src/op_unit_map.py`; the aten-level map with instruction sequences and citations is `ATEN`.
@@ -176,6 +193,10 @@ handlers. Ops the emulator cannot run are classified None, i.e. host fallback in
 - `vsin`/`vcos` take a Q(9,12) argument (x 2/pi), i.e. |x| < ~400 rad, and BF16 angles have an ulp of
   0.5 rad at 64-128: RoPE angles for positions beyond a few hundred are not representable on the VPU.
   Should RoPE tables be precomputed on the host (`--chip-rope host`) in deployment?
+  Pi0 is worse: prefix positions to ~880 and flow-timestep angles to 1571 rad (max |sin - sin_ref|
+  up to 2.0 on the VPU; 406 of 1024 timestep-embedding values off by more than 0.1 at t = 1).
+- `vexp.bf16` wraps already at x = -336 (sigmoid via the reference SiLU sequence comes out 0 for
+  x = 336), not only below it.
 - `vadd`/`vsub` truncate the FP32 sum to BF16 (raw upper half, AddSubSumVec.scala:133) while
   `vmul` and `vredsum.row` round to nearest even: intended?
 - The scalar core has no multiply/divide and no FP (ScalarALU.scala:26-36): float schedule
