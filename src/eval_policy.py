@@ -2,7 +2,8 @@
 
 For each held-out frame the policy predicts one action chunk. Every mode sees the same frames and
 the same per-frame RNG seed, so the diffusion / flow-matching noise is identical and differences
-come from the numerics alone. Reported per mode:
+come from the numerics alone. Each mode is run twice and must reproduce itself bit for bit; a mode
+that does not is marked "deterministic": false. Reported per mode:
   - error against the dataset's recorded actions (MSE, MAE; padded steps masked out), and
   - agreement with the unquantized (bf16) prediction (relative L2, cosine) for the FP8 modes, and
   - with --rmse, per-layer (isolated) and cumulative relative RMSE of every quantized layer against
@@ -16,6 +17,9 @@ Modes:
   torchao     stock TorchAO Float8DynamicActivationFloat8WeightConfig, per-tensor
               (native FP8; needs compute capability >= 8.9, e.g. L40 / H100)
 
+--dtype float32 loads the baseline in float32, as the reference author serves SmolVLA
+(smolVLA-quant smolvla_inout/serve_smolvla.py:68-69).
+
 Example:
   python src/eval_policy.py --policy lerobot/smolvla_base \
       --dataset lerobot/svla_so100_pickplace --modes bf16 atlas atlas_hw torchao \
@@ -23,7 +27,9 @@ Example:
 """
 
 import argparse
+import contextlib
 import json
+import os
 import platform
 import random
 import subprocess
@@ -96,21 +102,40 @@ def to_batch(sample, preprocess):
     return preprocess(batch)
 
 
+@contextlib.contextmanager
+def seeded_rng(seed, device):
+    """Seed the global RNGs for the body only, then restore them (NEW).
+
+    lerobot's Multi-Task DiT takes no generator: its DDPM sampling draws the initial sample
+    (modeling_multi_task_dit.py:701) and one variance-noise tensor per denoising step
+    (diffusers DDPMScheduler.step, scheduling_ddpm.py:543-548) from the global RNG. Seeding right
+    here, immediately before sampling, makes those draws depend only on `seed`, not on whatever
+    consumed the global RNG earlier (data loading, a clean --rmse pass, a profile); forking keeps
+    the sampling from shifting anything that runs after it.
+    """
+    dev = torch.device(device)
+    cuda = [dev.index if dev.index is not None else torch.cuda.current_device()] if dev.type == "cuda" else []
+    with torch.random.fork_rng(devices=cuda):
+        torch.manual_seed(seed)  # seeds CPU and every CUDA device
+        yield
+
+
 def predict_chunk(policy, batch, seed, device):
-    """One action chunk for a preprocessed offline batch.
+    """One action chunk for a preprocessed offline batch, sampled under `seed`.
 
     Policies with an observation history (n_obs_steps > 1, e.g. Multi-Task DiT) normally fill it from
     an online queue that predict_action_chunk reads; offline the history is already in the batch (the
     dataset was built with the config's observation delta timestamps), so call the model directly.
     """
-    if getattr(policy.config, "n_obs_steps", 1) > 1 and hasattr(policy, "_generate_actions"):
-        b = {k: v for k, v in batch.items() if k != "action"}
-        return policy._generate_actions(policy._prepare_batch(b))
-    return policy.predict_action_chunk(batch, **noise_kwargs(policy, seed, device))
+    with seeded_rng(seed, device):
+        if getattr(policy.config, "n_obs_steps", 1) > 1 and hasattr(policy, "_generate_actions"):
+            b = {k: v for k, v in batch.items() if k != "action"}
+            return policy._generate_actions(policy._prepare_batch(b))
+        return policy.predict_action_chunk(batch, **noise_kwargs(policy, seed, device))
 
 
 def noise_kwargs(policy, seed, device):
-    """Explicit initial noise for policies that take it (SmolVLA). Others sample from the global RNG, which run_mode seeds per frame."""
+    """Explicit initial noise for policies that take it (SmolVLA). Others sample from the global RNG, which predict_chunk seeds."""
     import inspect
 
     if "noise" not in inspect.signature(policy.predict_action_chunk).parameters:
@@ -131,11 +156,10 @@ def run_mode(policy, ds, idx, preprocess, postprocess, seed, device, before_fram
         if before_frame is not None:
             before_frame(batch, seed + i)
         policy.reset()
-        torch.manual_seed(seed + i)  # same noise for every mode on this frame
         if device.startswith("cuda"):
             torch.cuda.synchronize()
         t0 = time.perf_counter()
-        chunk = predict_chunk(policy, batch, seed + i, device)
+        chunk = predict_chunk(policy, batch, seed + i, device)  # same noise for every mode on this frame
         if device.startswith("cuda"):
             torch.cuda.synchronize()
         times.append(time.perf_counter() - t0)
@@ -166,9 +190,59 @@ def error_vs_gt(preds, gts, pads):
 def agreement(preds, ref):
     p = torch.cat([x.flatten() for x in preds])
     r = torch.cat([x.flatten() for x in ref])
+    # NEW: per action dimension, since one flipped binary channel (e.g. a gripper) can dominate rel_l2
+    pd, rd = torch.cat(list(preds)), torch.cat(list(ref))
     return {"rel_l2": float((p - r).norm() / r.norm()),
             "cosine": float(torch.nn.functional.cosine_similarity(p, r, dim=0)),
-            "max_abs": float((p - r).abs().max())}
+            "max_abs": float((p - r).abs().max()),
+            "rel_l2_per_dim": ((pd - rd).norm(dim=0) / rd.norm(dim=0)).tolist()}
+
+
+def repeat_agreement(first, second):
+    """Determinism check (NEW): a second run of a mode with the same seeds must be bitwise identical."""
+    same = [torch.equal(a.view(torch.int8) if a.is_floating_point() else a,
+                        b.view(torch.int8) if b.is_floating_point() else b)
+            for a, b in zip(first, second)]
+    p = torch.cat([x.flatten() for x in first]).double()
+    q = torch.cat([x.flatten() for x in second]).double()
+    d = (p - q).nan_to_num(nan=float("inf")) if not all(same) else torch.zeros_like(p)
+    return {"deterministic": all(same) and len(first) == len(second),
+            "rel_l2": float(d.norm() / p.norm()), "max_abs": float(d.abs().max()),
+            "frames_differing": sum(not s for s in same)}
+
+
+def determinism_state():
+    """The settings that decide whether a repeat can differ (NEW; recorded in the JSON)."""
+    def get(f):
+        try:
+            return f()
+        except Exception:
+            return None
+
+    return {"use_deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+            "deterministic_warn_only": torch.is_deterministic_algorithms_warn_only_enabled(),
+            "cudnn_deterministic": torch.backends.cudnn.deterministic,
+            "cudnn_benchmark": torch.backends.cudnn.benchmark,
+            "cudnn_allow_tf32": get(lambda: torch.backends.cudnn.allow_tf32),
+            "cuda_matmul_allow_tf32": get(lambda: torch.backends.cuda.matmul.allow_tf32),
+            "cuda_matmul_allow_bf16_reduced_precision_reduction":
+                get(lambda: torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction),
+            "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+            "float32_matmul_precision": torch.get_float32_matmul_precision(),
+            # CPU reductions are split by thread, so the thread count changes bf16 results
+            "num_threads": torch.get_num_threads()}
+
+
+def make_deterministic():
+    """--deterministic (NEW): deterministic kernels, failing loudly on ops that have none."""
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")  # required by cuBLAS for determinism
+    torch.use_deterministic_algorithms(True)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def torch_dtype(name):
+    return {"bfloat16": torch.bfloat16, "float32": torch.float32}[name]
 
 
 def provenance(args):
@@ -190,7 +264,7 @@ def provenance(args):
             "host": platform.node(), "gpu": gpu, "compute_capability": cap}
 
 
-def main():
+def build_parser():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--policy", required=True, help="HF repo id or local checkpoint dir")
     ap.add_argument("--dataset", required=True, help="LeRobot dataset repo id")
@@ -208,8 +282,24 @@ def main():
                          "against a clean pass, written as the reference author's CSVs")
     ap.add_argument("--rmse-dir", default=None,
                     help="where the --rmse CSVs go (<dir>/<mode>/); default: <out stem>_rmse next to --out")
+    ap.add_argument("--dtype", choices=["bfloat16", "float32"], default="bfloat16",
+                    help="policy dtype for every mode (the baseline included); the reference author "
+                         "loads SmolVLA in float32 (serve_smolvla.py:68-69)")
+    ap.add_argument("--no-determinism-check", dest="determinism_check", action="store_false",
+                    help="run each mode once instead of twice (halves the time; determinism unchecked)")
+    ap.add_argument("--deterministic", action="store_true",
+                    help="torch.use_deterministic_algorithms(True), cuDNN deterministic, cuBLAS "
+                         "workspace config")
     ap.add_argument("--out", required=True)
+    return ap
+
+
+def main():
+    ap = build_parser()
     args = ap.parse_args()
+    if args.deterministic:
+        make_deterministic()
+    dtype = torch_dtype(args.dtype)
     for m in args.modes:
         try:
             require_mode_supported(m, args.device)  # fail early, before any model download
@@ -220,18 +310,18 @@ def main():
 
     from lerobot.policies.factory import make_pre_post_processors
 
-    result = {"provenance": provenance(args), "modes": {}}
+    result = {"provenance": provenance(args), "determinism_state": determinism_state(), "modes": {}}
     ref = None
     clean = None
     rmse_dir = Path(args.rmse_dir) if args.rmse_dir else Path(args.out).with_name(Path(args.out).stem + "_rmse")
     for mode in args.modes:
-        policy, cfg = load_policy(args.policy, args.device, torch.bfloat16)
+        policy, cfg = load_policy(args.policy, args.device, dtype)
         rename = camera_rename_map(cfg, args.dataset, args.rename_map)
         # The saved pipelines pin device='cuda'; override it, and cast float inputs to the policy dtype.
         preprocess, postprocess = make_pre_post_processors(
             cfg, pretrained_path=args.policy,
             preprocessor_overrides={
-                "device_processor": {"device": args.device, "float_dtype": "bfloat16"},
+                "device_processor": {"device": args.device, "float_dtype": args.dtype},
                 "rename_observations_processor": {"rename_map": rename}},
             postprocessor_overrides={"device_processor": {"device": "cpu"}})
         if ref is None:
@@ -245,14 +335,13 @@ def main():
             import layer_rmse
 
             if clean is None:
-                clean, _ = load_policy(args.policy, args.device, torch.bfloat16)
+                clean, _ = load_policy(args.policy, args.device, dtype)
             rm = layer_rmse.LayerRMSE(clean, policy)
 
             def before(batch, frame_seed):
                 def run_clean():
                     clean.reset()
-                    torch.manual_seed(frame_seed)  # the same noise as the quantized pass
-                    predict_chunk(clean, dict(batch), frame_seed, args.device)
+                    predict_chunk(clean, dict(batch), frame_seed, args.device)  # same noise
                 rm.capture(run_clean)
         preds, gts, pads, times = run_mode(policy, ds, idx, preprocess, postprocess,
                                            args.seed, args.device, before_frame=before)
@@ -261,6 +350,18 @@ def main():
         if rm is not None:
             rm.close()
             entry["rmse"] = {**rm.summary(), "csv": rm.write_csvs(rmse_dir / mode)}
+        if layers is not None and layers["quantized"] == 0:
+            print(f"WARNING: mode {mode} quantized no layers (dtype {args.dtype}); its numbers are the "
+                  "baseline's", flush=True)
+        entry["deterministic"] = None
+        if args.determinism_check:
+            again, *_ = run_mode(policy, ds, idx, preprocess, postprocess, args.seed, args.device)
+            entry["determinism"] = repeat_agreement(preds, again)
+            entry["deterministic"] = entry["determinism"]["deterministic"]
+            if not entry["deterministic"]:
+                print(f"WARNING: mode {mode} is not deterministic: a repeat with the same seeds gave "
+                      f"rel_l2 {entry['determinism']['rel_l2']:.3e} on "
+                      f"{entry['determinism']['frames_differing']} frame(s)", flush=True)
         if mode == "bf16":
             ref = preds
         else:
