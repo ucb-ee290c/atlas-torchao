@@ -162,7 +162,7 @@ def _smolvla_text_attention(self_inner, attention_mask, batch_size, head_dim,
     return out.permute(0, 2, 1, 3).reshape(batch_size, -1, n_heads * dv)          # 723
 
 
-def patch_attention(model: nn.Module, fm_factory=None) -> list:
+def patch_attention(model: nn.Module, fm_factory=None, skip=()) -> list:
     """Route the model's attention score matmuls through the reference routine.
 
     Returns the list of patched sites (recorded in the result JSON). Sites:
@@ -174,7 +174,7 @@ def patch_attention(model: nn.Module, fm_factory=None) -> list:
     Models with neither (e.g. custom attention modules) are left unchanged.
     """
     if any(type(m).__name__ == "PaliGemmaWithExpertModel" for m in model.modules()):
-        return patch_pi0_attention(model, fm_factory)
+        return patch_pi0_attention(model, fm_factory, skip)
     new_fm = (lambda: fm_factory()) if fm_factory else (lambda: None)
     sites = []
     for name, mod in model.named_modules():
@@ -295,7 +295,7 @@ PI0_COMPONENT_RULES = (                                                         
 )
 
 
-def patch_pi0_attention(model: nn.Module, fm_factory=None) -> list:
+def patch_pi0_attention(model: nn.Module, fm_factory=None, skip=()) -> list:
     """Pi0's attention score matmuls through the reference routine, as pi0-quant run_eval.py:774-796
     does with patch_attn_sdpa + patch_attn_eager + patch_attn_siglip_eager (ops `attention`, all
     groups): every module named `*.self_attn` (model_patcher.py:703-707, 893-900) gets its own
@@ -306,8 +306,8 @@ def patch_pi0_attention(model: nn.Module, fm_factory=None) -> list:
     new_fm = (lambda: fm_factory()) if fm_factory else (lambda: None)
     sites = []
     for name, mod in model.named_modules():
-        if name.split(".")[-1] != "self_attn":
-            continue
+        if name.split(".")[-1] != "self_attn" or any(x and x in name for x in skip):
+            continue                                # --skip leaves a site unpatched (NEW for Pi0)
         calls: dict = {}
         mod._atlas_ref_attn = {"fm_qk": new_fm(), "fm_av": new_fm(), "variant": "pi0", "calls": calls}
 
