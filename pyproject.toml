@@ -27,7 +27,7 @@ dependencies = [
 
 [tool.setuptools]
 package-dir = {"" = "src"}
-py-modules = ["atlas_quant", "atlas_torchao", "atlas_m2m", "quant_modes", "modelutils", "datautils", "eval", "eval_policy"]
+py-modules = ["atlas_quant", "atlas_torchao", "atlas_m2m", "quant_modes", "modelutils", "datautils", "eval", "eval_policy", "layer_rmse", "ppl_protocols"]
 
 # Not enabled yet: the m2m quantization adapter (atlas_m2m_adapter:atlas_fp8_adapter) is not written.
 # [project.entry-points."m2m.quantization_adapters"]

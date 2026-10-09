@@ -4,7 +4,10 @@ For each held-out frame the policy predicts one action chunk. Every mode sees th
 the same per-frame RNG seed, so the diffusion / flow-matching noise is identical and differences
 come from the numerics alone. Reported per mode:
   - error against the dataset's recorded actions (MSE, MAE; padded steps masked out), and
-  - agreement with the unquantized (bf16) prediction (relative L2, cosine) for the FP8 modes.
+  - agreement with the unquantized (bf16) prediction (relative L2, cosine) for the FP8 modes, and
+  - with --rmse, per-layer (isolated) and cumulative relative RMSE of every quantized layer against
+    a clean pass on the same frames and noise (src/layer_rmse.py; the reference author's
+    StatsTracker / ReferenceStore and CSV layout).
 
 Modes:
   bf16        the checkpoint cast to bfloat16 (the reference)
@@ -119,11 +122,14 @@ def noise_kwargs(policy, seed, device):
 
 
 @torch.no_grad()
-def run_mode(policy, ds, idx, preprocess, postprocess, seed, device):
+def run_mode(policy, ds, idx, preprocess, postprocess, seed, device, before_frame=None):
+    """before_frame(batch, frame_seed), if given, runs first on each frame (NEW; --rmse clean pass)."""
     preds, gts, pads, times = [], [], [], []
     for i in idx:
         sample = ds[i]
         batch = to_batch(sample, preprocess)
+        if before_frame is not None:
+            before_frame(batch, seed + i)
         policy.reset()
         torch.manual_seed(seed + i)  # same noise for every mode on this frame
         if device.startswith("cuda"):
@@ -197,6 +203,11 @@ def main():
     ap.add_argument("--skip", nargs="*", default=[], help="fqn substrings left unquantized")
     ap.add_argument("--rename-map", type=json.loads, default=None,
                     help='JSON {dataset_key: policy_key}; default pairs cameras in sorted order')
+    ap.add_argument("--rmse", action="store_true",
+                    help="per-layer (isolated) and cumulative relative RMSE of every quantized layer "
+                         "against a clean pass, written as the reference author's CSVs")
+    ap.add_argument("--rmse-dir", default=None,
+                    help="where the --rmse CSVs go (<dir>/<mode>/); default: <out stem>_rmse next to --out")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     for m in args.modes:
@@ -211,6 +222,8 @@ def main():
 
     result = {"provenance": provenance(args), "modes": {}}
     ref = None
+    clean = None
+    rmse_dir = Path(args.rmse_dir) if args.rmse_dir else Path(args.out).with_name(Path(args.out).stem + "_rmse")
     for mode in args.modes:
         policy, cfg = load_policy(args.policy, args.device, torch.bfloat16)
         rename = camera_rename_map(cfg, args.dataset, args.rename_map)
@@ -227,10 +240,27 @@ def main():
             result["data"] = {"dataset": args.dataset, "test_episodes": test_eps,
                               "frames": len(idx), "fps": meta.fps}
         layers = quantize(policy, mode, args.skip) if mode != "bf16" else None
+        rm = before = None
+        if args.rmse and mode != "bf16":
+            import layer_rmse
+
+            if clean is None:
+                clean, _ = load_policy(args.policy, args.device, torch.bfloat16)
+            rm = layer_rmse.LayerRMSE(clean, policy)
+
+            def before(batch, frame_seed):
+                def run_clean():
+                    clean.reset()
+                    torch.manual_seed(frame_seed)  # the same noise as the quantized pass
+                    predict_chunk(clean, dict(batch), frame_seed, args.device)
+                rm.capture(run_clean)
         preds, gts, pads, times = run_mode(policy, ds, idx, preprocess, postprocess,
-                                           args.seed, args.device)
+                                           args.seed, args.device, before_frame=before)
         entry = {"layers": layers, "vs_ground_truth": error_vs_gt(preds, gts, pads),
                  "latency_s": {"median": sorted(times)[len(times) // 2], "mean": sum(times) / len(times)}}
+        if rm is not None:
+            rm.close()
+            entry["rmse"] = {**rm.summary(), "csv": rm.write_csvs(rmse_dir / mode)}
         if mode == "bf16":
             ref = preds
         else:
@@ -241,6 +271,10 @@ def main():
         if args.device.startswith("cuda"):
             torch.cuda.empty_cache()
 
+    if args.rmse:
+        import layer_rmse
+
+        result["reference_provenance"] = layer_rmse.ref_provenance()
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out).write_text(json.dumps(result, indent=2, default=str))
     print("wrote", args.out)
