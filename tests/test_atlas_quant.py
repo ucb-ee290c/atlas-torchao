@@ -80,3 +80,10 @@ def test_hw_and_torch_activation_differ_only_via_tiny_values():
     x_zeroed[:, :8] = 0
     assert torch.equal(q_hw(x_tiny), q_t(x_zeroed))
     assert not torch.equal(q_t(x_tiny), q_hw(x_tiny))
+
+
+def test_weight_attribute_reports_original_dtype_but_buffer_is_fp8():
+    q = AtlasQuantLinear(_linear(), AtlasQConfig())
+    assert q.weight.dtype == torch.bfloat16 and q.weight.shape == (32, 64)
+    assert q.state_dict()["weight"].dtype == torch.float8_e4m3fn
+    assert dict(q.named_buffers())["weight"].dtype == torch.float8_e4m3fn
