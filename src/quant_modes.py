@@ -110,6 +110,9 @@ def _quantize_torchao_style(model: nn.Module, name: str, skip) -> dict:
             "untouched": sorted(set(planned) - set(changed))}
 
 
+OPS = ("linear", "conv2d", "attention")
+
+
 def add_profile_args(ap) -> None:
     """Options of the reference profiles, shared by the eval CLIs."""
     from accum_backends import DEFAULT_MXU, IMPLS, MXUS
@@ -120,6 +123,9 @@ def add_profile_args(ap) -> None:
                         "author's choice) or sa (per-step systolic array)")
     g.add_argument("--mxu-impl", choices=IMPLS, default="ref_cpu",
                    help="ref_cpu: the reference CPU models (oracles); torch: GPU-capable port")
+    g.add_argument("--ops", default=",".join(OPS),
+                   help="comma-separated ops the reference profiles cover: linear, conv2d, attention "
+                        "(smolVLA run_eval.py:7-18; default all)")
 
 
 def profile_options(options) -> dict:
@@ -127,8 +133,13 @@ def profile_options(options) -> dict:
     from accum_backends import DEFAULT_MXU
 
     get = options.get if isinstance(options, dict) else (lambda k, d=None: getattr(options, k, d))
+    ops = get("ops", None) or ",".join(OPS)
+    ops = tuple(o.strip() for o in (ops.split(",") if isinstance(ops, str) else ops) if o.strip())
+    bad = set(ops) - set(OPS)
+    if bad:
+        raise ValueError(f"unknown ops {sorted(bad)}; choose from {OPS}")
     return {"mxu": get("mxu", DEFAULT_MXU) or DEFAULT_MXU,
-            "mxu_impl": get("mxu_impl", "ref_cpu") or "ref_cpu"}
+            "mxu_impl": get("mxu_impl", "ref_cpu") or "ref_cpu", "ops": ops}
 
 
 def quantize(model: nn.Module, mode: str, skip=(), options=None) -> dict:
@@ -154,8 +165,17 @@ def quantize(model: nn.Module, mode: str, skip=(), options=None) -> dict:
 
             get_accumulator(opts["mxu"], opts["mxu_impl"])          # fail before replacing anything
             factory = lambda: get_accumulator(opts["mxu"], opts["mxu_impl"])  # noqa: E731
-        rep = quantize_reference(model, skip, fm_factory=factory)
-        rep["profile"] = {"name": name,
+        from ref_attention import patch_attention, quantize_conv2d
+
+        if "linear" in opts["ops"]:
+            rep = quantize_reference(model, skip, fm_factory=factory)
+        else:
+            rep = {"planned": 0, "quantized": 0, "untouched": []}
+        if "conv2d" in opts["ops"]:
+            rep["conv2d"] = quantize_conv2d(model, skip, fm_factory=factory)
+        if "attention" in opts["ops"]:
+            rep["attention_sites"] = patch_attention(model, fm_factory=factory)
+        rep["profile"] = {"name": name, "ops": list(opts["ops"]),
                           **({"accumulation": describe(opts["mxu"], opts["mxu_impl"])}
                              if name == "reference_hw" else {})}
         rep["reference_sources"] = ref_loader.provenance()
