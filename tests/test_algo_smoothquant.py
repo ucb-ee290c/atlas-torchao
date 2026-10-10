@@ -275,6 +275,25 @@ def test_profile_path_records_gain_and_static(mode):
         assert any("static_per_tensor(smoothquant)" in k for k in rec["granularity"]["activation"])
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("alpha", [0.5, "off"])
+def test_static_on_cuda_matches_cpu(alpha):
+    """static=true with the model on CUDA: the calibration maxima live on the GPU while the fold
+    divisors are moved to the CPU. prepare() must not mix devices, and the static exponents must
+    equal a CPU run's."""
+    need_refs()
+    exps = {}
+    for dev in ("cpu", "cuda"):
+        m = _llama(dtype=torch.bfloat16).to(dev)
+        batches = [b.to(dev) for b in _ids()]
+        algo, rec = _fold(m, batches, alpha=alpha, gain="true", static="true")
+        assert rec["static_act_scales"] > 0
+        exps[dev] = {k: v.cpu() for k, v in algo._static_exp.items()}
+    assert exps["cuda"].keys() == exps["cpu"].keys()
+    for k in exps["cpu"]:
+        assert torch.equal(exps["cuda"][k], exps["cpu"][k]), k
+
+
 def test_gain_brings_fixed_scale_inputs_into_range():
     """With the gain, every folded linear input's calibrated maximum sits in (224, 448]: the range
     the collaborator's fixed 2^0 activation scale covers without flushing small values early."""

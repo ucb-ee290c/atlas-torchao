@@ -376,8 +376,11 @@ class SmoothQuant(Algo):
         self._static_exp = {}
         if self.static:
             import ref_numerics as rn
+            # On the CPU in float64 whatever device the model ran on: the calibration maxima follow
+            # the model's device, the fold factors may not, and a CUDA run must give the CPU exponents.
             for fq, a in self._amax.items():
-                post = (a.double() / divisor[fq].double().cpu()).max() if fq in divisor else a.max().double()
+                a = a.double().cpu()
+                post = (a / divisor[fq].double().cpu()).max() if fq in divisor else a.max()
                 self._static_exp[fq] = rn.po2_scale_exp(post.float().reshape(()))
         sites = Counter(g.site for g in groups)
         gains = Counter(int(e) for _, e in plans if e is not None)
