@@ -15,6 +15,7 @@ import importlib
 REGISTRY = {
     "none": None,
     "example_identity": "algos.example_identity",
+    "rotation": "algos.rotation",
 }
 
 _CURRENT = []
