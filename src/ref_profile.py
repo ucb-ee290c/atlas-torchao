@@ -97,7 +97,7 @@ class RefQuantLinear(nn.Module):
                 raise NotImplementedError(f"{self.layer_name}: per-block activation scales under an "
                                           "MXU accumulation model are not defined in algo/base")
             y_unscaled = self.fm(rn.e4m3_unpack(x_q), self.weight_norm, None, static=True)
-            scale = torch.exp2(algo_hooks.output_exp(s_x, self.weight_scale_exp).float())
+            scale = algo_hooks.output_scale(s_x, self.weight_scale_exp)
             y = (y_unscaled * scale).to(dtype=dtype, device=x.device)
         else:
             x_dq = (algo_hooks.dequant(x_q, s_x, blk) if blk else rn.dequantize(x_q, s_x)).to(dtype)

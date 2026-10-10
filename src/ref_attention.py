@@ -414,7 +414,7 @@ class RefQuantConv2d(nn.Module):
                 raise NotImplementedError(f"{self.layer_name}: per-block activation scales under an "
                                           "MXU accumulation model are not defined in algo/base")
             y = self.fm(rn.e4m3_unpack(x_q), self.weight_norm, None, static=True)
-            return (y * torch.exp2(algo_hooks.output_exp(s_x, self.weight_scale_exp).float())).to(
+            return (y * algo_hooks.output_scale(s_x, self.weight_scale_exp)).to(
                 dtype=w.dtype, device=x_flat.device)
         w_dq = (algo_hooks.dequant(self.weight_codes, self.weight_scale_exp, self.weight_block)
                 if self.weight_block else rn.dequantize(self.weight_codes, self.weight_scale_exp))

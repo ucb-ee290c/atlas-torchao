@@ -53,6 +53,15 @@ def count_algo_cast(n: int, dynamic: bool) -> None:
                                 + ("; amax at run time" if dynamic else "; scale fixed ahead of time"))
 
 
+def count_algo_vpu(op: str, instrs: dict, reason: str, new: dict | None = None) -> None:
+    """Extra VPU instructions an algorithm's numerics need on the chip (src/algos), e.g. the
+    per-token pre-vpack vmul of the granularity track. Counted on its own VPU row `op`; `new`
+    ({choice, analogue, reason}) lists it under the report's new_decisions."""
+    if not _RUNNING or not instrs:
+        return
+    _RUNNING[-1].cov.add("VPU", op, sum(instrs.values()), instrs, reason=reason, new=new)
+
+
 def add_args(ap) -> None:
     g = ap.add_argument_group("chip profile")
     g.add_argument("--chip-rope", choices=("vpu", "host"), default=None,
