@@ -61,6 +61,27 @@ class RefQuantLinear(nn.Module):
             # Persistent normalized weight: exact E4M3 values at scale 1 (quant_linear.py:161-162).
             # Kept as one tensor so the reference models' weight cache stays valid across calls.
             self.register_buffer("weight_norm", rn.e4m3_unpack(w_q), persistent=False)
+        self.residual = self.algo.residual_passes(name, "linear") if self.algo is not None else None
+        if self.residual:
+            self._init_residual(fm)
+
+    def _init_residual(self, fm) -> None:
+        """(g) residual_passes: the weight residual w - dequant(w_q), cast with the reference rule
+        (its own per-tensor po2 scale). NEW, after the precision refinement of Markidis et al.
+        (arXiv 1803.04014, Sec. V) with FP8 parts; docs/algos/mixed-precision.md."""
+        if self.residual not in ("w", "wx"):
+            raise ValueError(f"{self.layer_name}: residual_passes must be None, 'w' or 'wx', got {self.residual!r}")
+        if self.weight_block:
+            raise NotImplementedError(f"{self.layer_name}: residual passes with per-block weight scales")
+        with torch.no_grad():
+            w = self.weight.detach()
+            w_r = (w.float() - self._dequant_weight().float()).to(w.dtype)
+            q2, s2 = rn.quantize(w_r)
+        self.register_buffer("weight_lo_codes", q2, persistent=False)
+        self.register_buffer("weight_lo_scale_exp", s2, persistent=False)
+        if fm is not None:
+            self.register_buffer("weight_lo_norm", rn.e4m3_unpack(q2), persistent=False)
+        self.algo.note("weight", f"linear:residual_{self.residual}", self.layer_name)
 
     def _dequant_weight(self) -> torch.Tensor:
         if self.weight_block:
@@ -92,6 +113,8 @@ class RefQuantLinear(nn.Module):
     def _forward_algo(self, x, dtype):
         """forward with the algorithm's activation hooks (c, d online); the same steps as forward."""
         x_q, s_x, blk = algo_hooks.act_cast(self.algo, self.layer_name, x, "linear")
+        if self.residual:
+            return self._forward_residual(x, x_q, s_x, blk, dtype)
         if self.fm is not None:
             if blk:
                 raise NotImplementedError(f"{self.layer_name}: per-block activation scales under an "
@@ -102,6 +125,31 @@ class RefQuantLinear(nn.Module):
         else:
             x_dq = (algo_hooks.dequant(x_q, s_x, blk) if blk else rn.dequantize(x_q, s_x)).to(dtype)
             y = F.linear(x_dq, self._dequant_weight().to(dtype))
+        if self.bias is not None:
+            y = y + self.bias
+        return y
+
+    def _pass(self, x_q, s_x, w_q, w_norm, s_w, dtype, device):
+        """One FP8 matmul pass: MXU model (+ x 2^(sx+sw)) or framework accumulation, as forward."""
+        if self.fm is not None:
+            y = self.fm(rn.e4m3_unpack(x_q), w_norm, None, static=True)
+            return (y * torch.exp2(algo_hooks.output_exp(s_x, s_w).float())).to(dtype=dtype, device=device)
+        return F.linear(rn.dequantize(x_q, s_x).to(dtype), rn.dequantize(w_q, s_w).to(dtype))
+
+    def _forward_residual(self, x, x_q, s_x, blk, dtype):
+        """x_hi.w_hi + x_hi.w_lo (+ x_lo.w_hi for "wx"): two or three FP8 passes, each rescaled
+        and summed in the layer dtype (on the chip: vmul / vadd on the VPU; whether the passes
+        could share the MXU accumulator is hardware ruling R4)."""
+        if blk:
+            raise NotImplementedError(f"{self.layer_name}: residual passes with per-block activation scales")
+        wn = getattr(self, "weight_norm", None)
+        wln = getattr(self, "weight_lo_norm", None)
+        y = self._pass(x_q, s_x, self.weight_codes, wn, self.weight_scale_exp, dtype, x.device)
+        y = y + self._pass(x_q, s_x, self.weight_lo_codes, wln, self.weight_lo_scale_exp, dtype, x.device)
+        if self.residual == "wx":
+            x_r = x - rn.dequantize(x_q, s_x).to(dtype)               # activation residual (VPU vsub)
+            xr_q, s_xr = rn.quantize(x_r)                             # reference cast of the residual
+            y = y + self._pass(xr_q, s_xr, self.weight_codes, wn, self.weight_scale_exp, dtype, x.device)
         if self.bias is not None:
             y = y + self.bias
         return y
