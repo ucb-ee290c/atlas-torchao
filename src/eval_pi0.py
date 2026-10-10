@@ -83,6 +83,7 @@ import torch
 import pi0_model
 from eval_policy import agreement, determinism_state, error_vs_gt, make_deterministic, repeat_agreement
 from pi0_model import CallCounter, inventory, patch_coverage
+import algos
 from quant_modes import (ALL_MODES, add_profile_args, add_subset_compare_arg, finalize_report, ladder_deltas,
                          ladder_record, quantize, require_mode_supported, subset_compare_modes)
 
@@ -184,6 +185,7 @@ def build_parser():
                     help="torch.use_deterministic_algorithms(True), cuDNN deterministic, cuBLAS config")
     ap.add_argument("--no-hash", action="store_true", help="do not hash model.safetensors")
     ap.add_argument("--out", required=True)
+    algos.add_args(ap, calib_sources=("auto", "droid", "dummy", "mxu_dummy"))
     add_profile_args(ap)
     add_subset_compare_arg(ap)
     return ap
@@ -405,11 +407,12 @@ def evaluate(args, frames, build, level, horizon, action_dim, out: Path) -> dict
     for mode in order:
         print(f"== {mode}", flush=True)
         model, inv, layers, policy = build(mode)
+        algo_rec = algos.entry_record(layers, mode, getattr(args, "algo", "none"))
         eq = (layers or {}).get("ladder", {}).get("equivalent_to")
         if eq in modes:
             # the op class this step adds is absent from the model: same model, same numbers
             modes[mode] = {**modes[eq], "layers": finalize_report(layers),
-                           "ladder": {**layers["ladder"], "duplicate_of": eq},
+                           "ladder": {**layers["ladder"], "duplicate_of": eq}, "algo": algo_rec,
                            "added_by_subset_compare": mode in added}
             print(f"{mode}: identical to {eq} (nothing added to quantize); not re-run", flush=True)
             del model, policy
@@ -445,6 +448,7 @@ def evaluate(args, frames, build, level, horizon, action_dim, out: Path) -> dict
         # after every pass, so the cross-check summary covers the repeat as well
         entry["layers"] = finalize_report(layers)
         entry["ladder"] = layers["ladder"] if layers is not None else ladder_record("bf16", {}, args)
+        entry["algo"] = algo_rec
         entry["added_by_subset_compare"] = mode in added
         entry["valid"] = bool((layers or {}).get("valid", True))
         if layers is not None and layers.get("quantized", 1) == 0 and not layers.get("attention_sites"):
@@ -584,6 +588,10 @@ def main(argv=None):
     ap = build_parser()
     args = ap.parse_args(argv)
     check_args(ap, args)
+    try:
+        algo = algos.make(args.algo)
+    except (ValueError, ImportError) as e:
+        ap.error(str(e))
     args.norm_stats_dir = args.norm_stats_dir or str(Path(args.checkpoint_dir) / "assets" / "droid")
     if args.threads:
         torch.set_num_threads(args.threads)
@@ -599,10 +607,14 @@ def main(argv=None):
         print(f"NOTE: {args.steps} flow steps instead of the reference's {REFERENCE_STEPS} "
               "(reduced_steps: true in the JSON)", flush=True)
 
+    calib_cache = []
+
     def build(mode):
         model = pi0_model.load_model(rt, args.config, args.checkpoint_dir, args.device)
         inv = inventory(model)
-        layers = quantize(model, mode, args.skip, options=args) if mode != "bf16" else None
+        calib = lambda: calibration(args, rt, cfg, model, frames, calib_cache)  # noqa: E731
+        layers = (algos.quantize(model, mode, args.skip, options=args, algo=algo, calib=calib)
+                  if mode != "bf16" else None)
         policy = (pi0_model.make_policy(rt, model, args.device, args.config, args.norm_stats_dir,
                                         args.tokenizer_path) if level == "policy" else None)
         return model, inv, layers, policy
@@ -612,6 +624,41 @@ def main(argv=None):
               "data": data_record(args, frames, level, cfg.action_horizon), "new_decisions": NEW_DECISIONS}
     result.update(evaluate(args, frames, build, level, cfg.action_horizon, cfg.action_dim, out))
     write_result(args, result, out)
+
+
+CALIB_LEVEL = {"droid": "policy", "dummy": "policy", "mxu_dummy": "model"}
+
+
+def calibration(args, rt, cfg, model, frames, cache):
+    """(f) calibration observations for algos.quantize, never the evaluated ones: --calib-source
+    auto picks DROID frames from other episodes for --obs droid, dummy observations under another
+    seed for --obs dummy, and model-level mxu_dummy ones otherwise (src/algos/calib.py)."""
+    from algos import calib as algo_calib
+
+    src = args.calib_source
+    if src == "auto":
+        src = {"droid": "droid", "dummy": "dummy"}.get(args.obs, "mxu_dummy")
+    level = CALIB_LEVEL[src]
+    n = args.calib_n or algo_calib.DEFAULT_N["pi0"]
+    if not cache:
+        if src == "droid":
+            cf, rec = algo_calib.pi0_droid(len(frames) if args.obs == "droid" else 0, n,
+                                           cfg.action_horizon, args.frame_idx, args.seed,
+                                           frames if args.obs == "droid" else ())
+            cf = client_resize(cf)
+        else:
+            cf, rec = algo_calib.pi0_dummy(n, args.calib_seed,
+                                           eval_seed=args.seed if args.obs == src else None,
+                                           model_level=level == "model", cfg=cfg, device=args.device)
+        cache.append((cf, {**rec, "level": level}))
+    cf, rec = cache[0]
+    policy = (pi0_model.make_policy(rt, model, args.device, args.config, args.norm_stats_dir,
+                                    args.tokenizer_path) if level == "policy" else None)
+    run_one = make_runner(model, policy, level, args.steps, args.device)
+    shape = (1, cfg.action_horizon, cfg.action_dim)
+    batches = [(fr["obs"], frame_noise(args.noise, level, args.calib_seed, i, shape, args.device))
+               for i, fr in enumerate(cf)]
+    return batches, (lambda m, b: run_one(*b)), rec
 
 
 def data_record(args, frames, level, horizon) -> dict:

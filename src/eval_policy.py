@@ -38,6 +38,7 @@ from pathlib import Path
 
 import torch
 
+import algos
 from quant_modes import (ALL_MODES, add_profile_args, add_subset_compare_arg, finalize_report, ladder_deltas,
                          ladder_record, quantize, require_mode_supported, subset_compare_modes)
 
@@ -294,12 +295,38 @@ def build_parser():
     ap.add_argument("--out", required=True)
     add_profile_args(ap)
     add_subset_compare_arg(ap)
+    algos.add_args(ap, calib_sources=("non_eval_episodes",))
     return ap
+
+
+def _calib_loader(cache, args, cfg, preprocess):
+    """(f) calibration frames from the episodes make_data does not hold out, loaded once per run;
+    each is run under its own seed (calib_seed + i) as run_mode does for the evaluated frames."""
+    def calib():
+        from algos import calib as algo_calib
+
+        if not cache:
+            cache.append(algo_calib.lerobot_frames(
+                cfg, args.dataset, args.n_test_episodes, args.seed,
+                args.calib_n or algo_calib.DEFAULT_N["policy"], args.calib_seed,
+                lambda sample: to_batch(sample, preprocess)))
+        batches, rec = cache[0]
+        seeds = {id(b): args.calib_seed + i for i, b in enumerate(batches)}
+
+        def run(policy, batch):
+            policy.reset()
+            return predict_chunk(policy, dict(batch), seeds[id(batch)], args.device)
+        return batches, run, rec
+    return calib
 
 
 def main():
     ap = build_parser()
     args = ap.parse_args()
+    try:
+        algo = algos.make(args.algo)
+    except (ValueError, ImportError) as e:
+        ap.error(str(e))
     if args.deterministic:
         make_deterministic()
     dtype = torch_dtype(args.dtype)
@@ -319,6 +346,7 @@ def main():
               "subset_compare": {"enabled": bool(added) or None, "added_modes": added}}
     ref = None
     clean = None
+    calib_cache = []
     rmse_dir = Path(args.rmse_dir) if args.rmse_dir else Path(args.out).with_name(Path(args.out).stem + "_rmse")
     for mode in args.modes:
         policy, cfg = load_policy(args.policy, args.device, dtype)
@@ -335,12 +363,15 @@ def main():
                                                 args.n_frames, args.seed)
             result["data"] = {"dataset": args.dataset, "test_episodes": test_eps,
                               "frames": len(idx), "fps": meta.fps}
-        layers = quantize(policy, mode, args.skip, options=args) if mode != "bf16" else None
+        calib = _calib_loader(calib_cache, args, cfg, preprocess)
+        layers = (algos.quantize(policy, mode, args.skip, options=args, algo=algo, calib=calib)
+                  if mode != "bf16" else None)
+        algo_rec = algos.entry_record(layers, mode, args.algo)
         eq = layers["ladder"].get("equivalent_to") if layers is not None else None
         if eq in result["modes"]:
             # the op class this step adds is absent from the model: same model, same numbers
             result["modes"][mode] = {**result["modes"][eq], "layers": finalize_report(layers),
-                                     "ladder": {**layers["ladder"], "duplicate_of": eq},
+                                     "ladder": {**layers["ladder"], "duplicate_of": eq}, "algo": algo_rec,
                                      "added_by_subset_compare": mode in added}
             print(f"{mode}: identical to {eq} (nothing added to quantize); not re-run", flush=True)
             del policy
@@ -362,6 +393,7 @@ def main():
                                            args.seed, args.device, before_frame=before)
         entry = {"layers": finalize_report(layers),
                  "ladder": layers["ladder"] if layers is not None else ladder_record("bf16", {}, args),
+                 "algo": algo_rec,
                  "added_by_subset_compare": mode in added,
                  "vs_ground_truth": error_vs_gt(preds, gts, pads),
                  "latency_s": {"median": sorted(times)[len(times) // 2], "mean": sum(times) / len(times)}}

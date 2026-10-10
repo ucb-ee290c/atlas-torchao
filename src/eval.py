@@ -38,6 +38,8 @@ def main():
 
     import torch
 
+    import algos
+    from algos import calib as algo_calib
     from datautils import get_wikitext2
     from modelutils import load_llama
     from ppl_protocols import PROTOCOLS, load_mxq_windows, mxq_eval
@@ -68,7 +70,12 @@ def main():
     ap.add_argument("--out", default=None, help="write results as JSON")
     add_profile_args(ap)
     add_subset_compare_arg(ap)
+    algos.add_args(ap, calib_sources=("wikitext2_train",))
     args = ap.parse_args()
+    try:
+        algo = algos.make(args.algo)
+    except (ValueError, ImportError) as e:
+        ap.error(str(e))
     # a subset: seeded / first-N mxq windows, or the first --max-windows of the split
     subset = bool(args.max_windows) if args.protocol != "mxq" else args.nsamples > 0
     args.modes, added = subset_compare_modes(args.modes, args.subset_compare == "on" and subset)
@@ -84,7 +91,7 @@ def main():
 
     result = {"args": vars(args), "torch": torch.__version__, "host": platform.node(),
               "gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else None,
-              "protocol": args.protocol, "ppl": {}, "layers": {}, "ladder": {},
+              "protocol": args.protocol, "ppl": {}, "layers": {}, "ladder": {}, "algo": {},
               "subset_compare": {"enabled": bool(added) or None, "added_modes": added}}
     if args.protocol == "mxq":
         windows, picked = load_mxq_windows(args.model, args.seqlen, args.nsamples,
@@ -97,6 +104,18 @@ def main():
             ids = ids[:, : args.max_windows * args.seqlen]
         result["windows"] = ids.shape[1] // args.seqlen
 
+    calib_cache = []
+
+    def calib():
+        """(f) WikiText-2 train windows (never the test split), loaded once per run."""
+        if not calib_cache:
+            batches, rec = algo_calib.wikitext2_train(
+                args.model, args.calib_n or algo_calib.DEFAULT_N["llm"], args.seqlen, args.calib_seed,
+                use_fast=args.protocol == "mxq")
+            calib_cache.append((batches, rec))
+        batches, rec = calib_cache[0]
+        return batches, (lambda m, ids: m(ids.to(args.device), use_cache=False)), rec
+
     clean = None
     if args.rmse:
         import layer_rmse
@@ -106,7 +125,9 @@ def main():
     for mode in args.modes:
         model = load_llama(args.model, seqlen=args.seqlen, device=args.device)  # fresh weights per mode
         if mode != "bf16":
-            result["layers"][mode] = quantize(model, mode, skip=["lm_head"], options=args)
+            result["layers"][mode] = algos.quantize(model, mode, skip=["lm_head"], options=args,
+                                                    algo=algo, calib=calib)
+        result["algo"][mode] = algos.entry_record(result["layers"].get(mode), mode, args.algo)
         result["ladder"][mode] = (result["layers"][mode]["ladder"] if mode != "bf16"
                                   else ladder_record("bf16", {}, args))
         eq = result["ladder"][mode].get("equivalent_to")
