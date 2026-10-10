@@ -409,7 +409,9 @@ lane-element ops, output elements otherwise), the host-fallback list with reason
 printed after the first pass and at exit. Options: `--chip-rope host|vpu` (default `host`, NEW:
 RoPE tables and the sinusoidal timestep table are compile-time host constants; `vpu` computes them on
 the VPU, the reference treatment, and is the `chip_rope_vpu` ladder step), `--chip-strict` (raise on
-an unmapped op).
+an unmapped op), `--chip-vadd trunc|rn|rne_hw` and `--chip-vadd-sites residual|data|all` (vadd/vsub
+numerics: default `trunc` is the hardware as built; `rn` and `rne_hw` are off-ladder options, see
+docs/algos/vpu-numerics.md).
 
     python src/eval.py --model /path/TinyLlama-1.1B-Chat-v1.0 --seqlen 128 --max-windows 2 \
         --modes bf16 chip --chip-mxu framework --device cpu --out out/tinyllama_chip.json

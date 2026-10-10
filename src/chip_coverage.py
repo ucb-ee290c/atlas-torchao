@@ -30,6 +30,7 @@ from collections import defaultdict
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
+import chip_numerics
 import chip_ops
 import op_unit_map as M
 import ref_loader
@@ -208,12 +209,21 @@ class ChipRouter(TorchDispatchMode):
     """Route a forward pass onto the Atlas units. One instance per model."""
 
     def __init__(self, coverage: Coverage, mxu: str = "ipt", mxu_impl: str = "ref_cpu",
-                 rope: str = "vpu", strict: bool = False, native_ops=()):
+                 rope: str = "vpu", strict: bool = False, native_ops=(), vadd="env"):
         super().__init__()
         self.native_ops = set(native_ops)
         self.cov = coverage
         self._instr = defaultdict(int)
-        self.vpu = chip_ops.ChipVPU(counter=self._count)
+        # --chip-vadd / --chip-vadd-sites (chip_numerics). None or mode "trunc": the profile unchanged.
+        # "env" (the default, for routers built outside the chip profile, e.g. multitask-dit-quant's
+        # chip_full adapter): ATLAS_CHIP_VADD / ATLAS_CHIP_VADD_SITES, unset = unchanged.
+        if isinstance(vadd, str) and vadd == "env":
+            vadd = chip_numerics.policy_from_env()
+        self.vadd = vadd if vadd is not None and vadd.active else None
+        if self.vadd is not None and self.vadd.sites == "all":
+            self.vpu = chip_numerics.NumericsVPU(self.vadd, counter=self._count)
+        else:
+            self.vpu = chip_ops.ChipVPU(counter=self._count)
         self.dec = _decomp()
         self.rope = rope
         self.strict = strict
@@ -407,6 +417,12 @@ def _binary(op):
         fa, fb = _as_f(a, args[0]), _as_f(b, args[0])
         if alpha != 1:
             fb = r.vpu.mul(*_bcast2(fb, _as_f(alpha, fb)))
+        if op in ("add", "sub") and r.vadd is not None and r.vadd.wants(r.ctx, name, fa, fb):
+            # --chip-vadd rn / rne_hw on this site (chip_numerics; instructions counted as issued)
+            xa, xb = _bcast2(fa, fb)
+            r.vadd.note(xa.numel())
+            out = chip_numerics.add(r.vadd.mode, r.vpu, xa, xb, sub=(op == "sub"))
+            return _result(out, func, name, args, dt)
         fa, fb = _bcast2(fa, fb)
         if op == "div":
             out = r.vpu.mul(fa, r.vpu.rcp(fb))                  # vpu_decomp.py:253-255
@@ -776,8 +792,11 @@ class MtditEmulator:
     name = "atlas_chip"
     emulates = True
 
-    def __init__(self, coverage: Coverage | None = None):
-        self.router = ChipRouter(coverage or Coverage("multitask_dit"), mxu_impl="ref_cpu")
+    def __init__(self, coverage: Coverage | None = None, vadd: str = "trunc", vadd_sites: str = "residual"):
+        # vadd / vadd_sites: --chip-vadd numerics (chip_numerics). There are no module context hooks
+        # here, so "residual" means every same-shape add of two computed tensors outside masks.
+        self.router = ChipRouter(coverage or Coverage("multitask_dit"), mxu_impl="ref_cpu",
+                                 vadd=chip_numerics.VaddPolicy(vadd, vadd_sites))
         self.router.active = False
         chip_ops.warm()
 
@@ -795,5 +814,11 @@ class MtditEmulator:
         return func(*args, **kwargs)
 
 
-def make_mtdit_op_emulator() -> MtditEmulator:
-    return MtditEmulator()
+def make_mtdit_op_emulator(**kw) -> MtditEmulator:
+    """kw: vadd, vadd_sites (MtditEmulator). Without them, the environment variables
+    ATLAS_CHIP_VADD / ATLAS_CHIP_VADD_SITES are read, so a caller that only names this factory
+    (multitask-dit-quant's load_op_emulator) can select --chip-vadd numerics; unset = unchanged."""
+    env = chip_numerics.policy_from_env()
+    kw.setdefault("vadd", env.mode)
+    kw.setdefault("vadd_sites", env.sites)
+    return MtditEmulator(**kw)

@@ -326,6 +326,12 @@ def ladder_record(mode: str, rep: dict, options=None) -> dict:
         off.append(f"--chip-rope {rec['rope_tables']} (chip_rope_vpu is that step)")
     if base == "chip" and chip_mxu == "framework":
         off.append("--chip-mxu framework (no MXU accumulation model)")
+    vadd = opts.get("chip_vadd") or "trunc"
+    if base == "chip" and vadd != "trunc":
+        sites = opts.get("chip_vadd_sites") or "residual"
+        off.append(f"--chip-vadd {vadd} --chip-vadd-sites {sites} ("
+                   + ("pending hardware ruling: RNE vadd narrowing" if vadd == "rne_hw"
+                      else "NEW round-to-nearest vadd sequence") + ")")
     added = {"ref_attn": "attention", "ref_conv": "conv2d"}.get(name)
     if added and not off and classes.get(added, 0) == 0:
         rec["equivalent_to"] = rec["previous"]
