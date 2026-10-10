@@ -8,10 +8,11 @@ from tqdm import tqdm
 
 
 @torch.no_grad()
-def llama_eval(model, testenc, seqlen=None, before_window=None):
+def llama_eval(model, testenc, seqlen=None, before_window=None, after_window=None):
     """Perplexity over non-overlapping windows of `seqlen` tokens.
     testenc: tokenizer output (with .input_ids) or a [1, N] tensor of token ids.
-    before_window(window), if given, runs before each window's forward (NEW; --rmse clean pass)."""
+    before_window(window), if given, runs before each window's forward (NEW; --rmse clean pass).
+    after_window(window, output), if given, runs after it (NEW; --kl)."""
     ids = getattr(testenc, "input_ids", testenc)          # accept BatchEncoding or tensor
     if ids.dim() == 1:
         ids = ids.unsqueeze(0)
@@ -24,9 +25,35 @@ def llama_eval(model, testenc, seqlen=None, before_window=None):
         window = ids[:, i * seqlen:(i + 1) * seqlen].to(dev)
         if before_window is not None:
             before_window(window)
-        losses.append(model(window, labels=window, use_cache=False).loss.float())
+        out = model(window, labels=window, use_cache=False)
+        losses.append(out.loss.float())
+        if after_window is not None:
+            after_window(window, out)
 
     return torch.exp(torch.stack(losses).mean()).item()
+
+
+class KLMeter:
+    """--kl (NEW, secondary metric; perplexity stays primary): token-mean KL(p_bf16 || p_mode) and
+    top-1 agreement against a clean bf16 copy of the model, run on the same window. On a few windows
+    it is less noisy than a perplexity delta (vpu-numerics screening)."""
+
+    def __init__(self, ref_model):
+        self.ref = ref_model
+        self.kl, self.top1, self.n = 0.0, 0.0, 0
+
+    @torch.no_grad()
+    def __call__(self, window, out):
+        r = torch.log_softmax(self.ref(window, use_cache=False).logits.float(), -1)
+        q = torch.log_softmax(out.logits.float(), -1)
+        n = r.shape[0] * r.shape[1]
+        self.kl += float((r.exp() * (r - q)).sum(-1).sum())
+        self.top1 += float((r.argmax(-1) == q.argmax(-1)).float().sum())
+        self.n += n
+
+    def summary(self):
+        return {"kl_vs_bf16": self.kl / max(self.n, 1), "top1_agree_vs_bf16": self.top1 / max(self.n, 1),
+                "tokens": self.n}
 
 
 def main():
@@ -68,6 +95,10 @@ def main():
     ap.add_argument("--modes", nargs="+", default=["bf16", "atlas"], choices=list(ALL_MODES))
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--out", default=None, help="write results as JSON")
+    ap.add_argument("--kl", action="store_true",
+                    help="also report token-mean KL(p_bf16 || p_mode) and top-1 agreement against a clean "
+                         "bf16 copy of the model on the same windows (NEW, secondary to perplexity; "
+                         "default protocol only)")
     add_profile_args(ap)
     add_subset_compare_arg(ap)
     algos.add_args(ap, calib_sources=("wikitext2_train",))
@@ -84,6 +115,8 @@ def main():
             require_mode_supported(m, args.device)
         except RuntimeError as e:
             ap.error(str(e))
+    if args.kl and args.protocol != "default":
+        ap.error("--kl supports the default protocol only")
     if args.rmse and not (args.rmse_dir or args.out):
         ap.error("--rmse needs --rmse-dir or --out")
     rmse_dir = Path(args.rmse_dir) if args.rmse_dir else (
@@ -122,6 +155,10 @@ def main():
 
         clean = load_llama(args.model, seqlen=args.seqlen, device=args.device)  # the clean bf16 pass
         result["rmse"] = {}
+    kl_ref = None
+    if args.kl:
+        kl_ref = load_llama(args.model, seqlen=args.seqlen, device=args.device)  # the bf16 reference
+        result["kl"] = {}
     for mode in args.modes:
         model = load_llama(args.model, seqlen=args.seqlen, device=args.device)  # fresh weights per mode
         if mode != "bf16":
@@ -135,6 +172,8 @@ def main():
             # the op class this step adds is absent (TinyLlama has no Conv2d): same model, same numbers
             result["ladder"][mode]["duplicate_of"] = eq
             result["ppl"][mode] = result["ppl"][eq]
+            if mode != "bf16" and eq in result.get("kl", {}):
+                result["kl"][mode] = result["kl"][eq]
             if args.protocol == "mxq":
                 result["per_sample"][mode] = result["per_sample"][eq]
             print(f"{mode}: identical to {eq} (nothing added to quantize); not re-run", flush=True)
@@ -151,10 +190,17 @@ def main():
             result["ppl"][mode] = r["ppl"]
             result["per_sample"][mode] = r["per_sample"]
         else:
-            result["ppl"][mode] = llama_eval(model, ids, seqlen=args.seqlen, before_window=before)
+            klm = KLMeter(kl_ref) if kl_ref is not None else None
+            result["ppl"][mode] = llama_eval(model, ids, seqlen=args.seqlen, before_window=before,
+                                             after_window=klm)
+            if klm is not None:
+                result["kl"][mode] = klm.summary()
         finalize_report(result["layers"].get(mode))
         print(f"{mode} ppl: {result['ppl'][mode]:.4f}  ({time.perf_counter() - t0:.1f}s, "
               f"{result['windows']} windows of {args.seqlen}, protocol {args.protocol})", flush=True)
+        if mode in result.get("kl", {}):
+            k = result["kl"][mode]
+            print(f"  {mode} kl_vs_bf16 {k['kl_vs_bf16']:.5f}  top1_agree {k['top1_agree_vs_bf16']:.4f}", flush=True)
         if rm is not None:
             rm.close()
             result["rmse"][mode] = {**rm.summary(), "csv": rm.write_csvs(rmse_dir / mode)}
