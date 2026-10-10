@@ -15,6 +15,7 @@ import importlib
 REGISTRY = {
     "none": None,
     "example_identity": "algos.example_identity",
+    "static_calib": "algos.static_calib",
 }
 
 _CURRENT = []
