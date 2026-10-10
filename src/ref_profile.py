@@ -19,7 +19,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import algos
 import ref_numerics as rn
+from algos import base as algo_hooks
 
 
 def _set_module(root: nn.Module, name: str, new: nn.Module) -> None:
@@ -47,22 +49,30 @@ class RefQuantLinear(nn.Module):
         self.bias = linear.bias
         self.in_features, self.out_features = linear.in_features, linear.out_features
         self.layer_name = name
+        self.algo = algos.current()              # None under --algo none (src/algos)
         with torch.no_grad():
-            w_q, s_w = rn.quantize(self.weight.detach())
+            w_q, s_w, self.weight_block = algo_hooks.weight_cast(self.algo, name, self.weight.detach(), "linear")
         self.register_buffer("weight_codes", w_q, persistent=False)
         self.register_buffer("weight_scale_exp", s_w, persistent=False)
+        if fm is not None and self.weight_block:
+            raise NotImplementedError(f"{name}: per-block weight scales under an MXU accumulation model "
+                                      "need per-block partial sums; not defined in algo/base")
         if fm is not None:
             # Persistent normalized weight: exact E4M3 values at scale 1 (quant_linear.py:161-162).
             # Kept as one tensor so the reference models' weight cache stays valid across calls.
             self.register_buffer("weight_norm", rn.e4m3_unpack(w_q), persistent=False)
 
     def _dequant_weight(self) -> torch.Tensor:
+        if self.weight_block:
+            return algo_hooks.dequant(self.weight_codes, self.weight_scale_exp, self.weight_block)
         return rn.dequantize(self.weight_codes, self.weight_scale_exp)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         dtype = self.weight.dtype
         # Operate in the weight dtype; some activations arrive as float32 (quant_linear.py:133-137).
         x = x.to(dtype)
+        if self.algo is not None:
+            return self._forward_algo(x, dtype)
         x_q, s_x = rn.quantize(x)                                   # quant_linear.py:153
         if self.fm is not None:
             x_norm = rn.e4m3_unpack(x_q)                            # quant_linear.py:161
@@ -79,9 +89,28 @@ class RefQuantLinear(nn.Module):
             y = y + self.bias                                       # BF16 bias after (quant_linear.py:171-172)
         return y
 
+    def _forward_algo(self, x, dtype):
+        """forward with the algorithm's activation hooks (c, d online); the same steps as forward."""
+        x_q, s_x, blk = algo_hooks.act_cast(self.algo, self.layer_name, x, "linear")
+        if self.fm is not None:
+            if blk:
+                raise NotImplementedError(f"{self.layer_name}: per-block activation scales under an "
+                                          "MXU accumulation model are not defined in algo/base")
+            y_unscaled = self.fm(rn.e4m3_unpack(x_q), self.weight_norm, None, static=True)
+            scale = torch.exp2(algo_hooks.output_exp(s_x, self.weight_scale_exp).float())
+            y = (y_unscaled * scale).to(dtype=dtype, device=x.device)
+        else:
+            x_dq = (algo_hooks.dequant(x_q, s_x, blk) if blk else rn.dequantize(x_q, s_x)).to(dtype)
+            y = F.linear(x_dq, self._dequant_weight().to(dtype))
+        if self.bias is not None:
+            y = y + self.bias
+        return y
+
     def extra_repr(self) -> str:
+        s_w = self.weight_scale_exp
+        s_w = int(s_w) if s_w.numel() == 1 else f"{tuple(s_w.shape)}"
         return (f"in_features={self.in_features}, out_features={self.out_features}, "
-                f"weight_scale_exp={int(self.weight_scale_exp)}, "
+                f"weight_scale_exp={s_w}, "
                 f"profile={'reference' if self.fm is None else 'reference_hw'}")
 
 

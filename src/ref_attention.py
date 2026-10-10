@@ -39,7 +39,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import algos
 import ref_numerics as rn
+from algos import base as algo_hooks
 
 ATTN_KEY = "atlas_ref"
 
@@ -55,17 +57,29 @@ def _mm(fm, a_q, a_s, b_q, b_s, dtype_out=torch.float32):
     return torch.matmul(a, b.transpose(-1, -2))
 
 
-def ref_attention(q, k, v, scaling, mask=None, fm_qk=None, fm_av=None, variant="text"):
+def _cast(algo, site, operand, x, dims):
+    """rn.quantize(x, dims) (per-(b, h) scales); with an algorithm, its act_cast hook."""
+    if algo is None:
+        return rn.quantize(x, dims)
+    q, s, blk = algo_hooks.act_cast(algo, site, x, "attention." + operand, dims)
+    if blk:
+        raise NotImplementedError(f"{site}: per-block scales on attention operands are not defined "
+                                  "in algo/base")
+    return q, s
+
+
+def ref_attention(q, k, v, scaling, mask=None, fm_qk=None, fm_av=None, variant="text", algo=None, site=""):
     """q [B, H, Sq, D], k [B, H, Skv, D], v [B, H, Skv, Dv] (GQA already expanded).
 
     mask: text variant - bool [B, Sq, Skv] or [B, 1|H, Sq, Skv] (True = attend), or an additive float
     mask of the same shapes; vision variant - additive float [B, 1|H, Sq, Skv] or None.
-    Returns bf16 [B, H, Sq, Dv].
+    Returns bf16 [B, H, Sq, Dv]. `algo` (src/algos; None under --algo none) gets the operand casts
+    as act_cast(site, x, "attention.q|k|p|v"); with no hook they are the per-(b, h) casts below.
     """
     q, k, v = q.to(torch.bfloat16), k.to(torch.bfloat16), v.to(torch.bfloat16)    # 649-651, 815-817
     hd = (-2, -1)
-    q_q, s_q = rn.quantize(q, hd)
-    k_q, s_k = rn.quantize(k, hd)
+    q_q, s_q = _cast(algo, site, "q", q, hd)
+    k_q, s_k = _cast(algo, site, "k", k, hd)
     scores = _mm(fm_qk, q_q, s_q, k_q, s_k) * scaling                              # 675-677
     if variant == "vision":
         scores = scores.to(torch.bfloat16)                                         # 827-829
@@ -95,8 +109,8 @@ def ref_attention(q, k, v, scaling, mask=None, fm_qk=None, fm_av=None, variant="
             else:
                 scores = scores + mask                                             # NEW: additive mask
         p = torch.softmax(scores, dim=-1).to(torch.bfloat16)                       # 684
-    p_q, s_p = rn.quantize(p, hd)                                                  # 689
-    v_q, s_v = rn.quantize(v, hd)                                                  # 690
+    p_q, s_p = _cast(algo, site, "p", p, hd)                                       # 689
+    v_q, s_v = _cast(algo, site, "v", v, hd)                                       # 690
     v_t_q = v_q.transpose(-1, -2)                                                  # v_norm.T (696)
     out = _mm(fm_av, p_q, s_p, v_t_q, s_v)                                         # 696
     return out.to(torch.bfloat16)                                                  # 696-698
@@ -129,7 +143,8 @@ def _hf_attention(module, query, key, value, attention_mask, scaling=None, dropo
     n_rep = query.shape[1] // key.shape[1]
     k, v = _expand_kv(key, n_rep), _expand_kv(value, n_rep)
     scaling = scaling if scaling is not None else query.shape[-1] ** -0.5
-    out = ref_attention(query, k, v, scaling, attention_mask, cfg["fm_qk"], cfg["fm_av"], cfg["variant"])
+    out = ref_attention(query, k, v, scaling, attention_mask, cfg["fm_qk"], cfg["fm_av"], cfg["variant"],
+                        cfg.get("algo"), cfg.get("site", ""))
     return out.to(query.dtype).transpose(1, 2).contiguous(), None                  # 852-853
 
 
@@ -157,9 +172,16 @@ def _smolvla_text_attention(self_inner, attention_mask, batch_size, head_dim,
     q = query_states.transpose(1, 2)                                               # [B, H, Sq, D]
     k = _expand_kv(key_states.transpose(1, 2), n_heads // n_kv)
     v = _expand_kv(value_states.transpose(1, 2), n_heads // n_kv)
-    out = ref_attention(q, k, v, head_dim ** -0.5, attention_mask, cfg["fm_qk"], cfg["fm_av"], "text")
+    out = ref_attention(q, k, v, head_dim ** -0.5, attention_mask, cfg["fm_qk"], cfg["fm_av"], "text",
+                        cfg.get("algo"), cfg.get("site", ""))
     dv = out.shape[-1]
     return out.permute(0, 2, 1, 3).reshape(batch_size, -1, n_heads * dv)          # 723
+
+
+def _algo_cfg(site) -> dict:
+    """{"algo", "site"} for a patched site while an algorithm is active (src/algos), else {}."""
+    algo = algos.current()
+    return {"algo": algo, "site": site} if algo is not None else {}
 
 
 def patch_attention(model: nn.Module, fm_factory=None, skip=()) -> list:
@@ -179,7 +201,7 @@ def patch_attention(model: nn.Module, fm_factory=None, skip=()) -> list:
     sites = []
     for name, mod in model.named_modules():
         if type(mod).__name__ == "SmolVLMWithExpertModel" and hasattr(mod, "eager_attention_forward"):
-            mod._atlas_ref_attn = {"fm_qk": new_fm(), "fm_av": new_fm(), "variant": "text"}
+            mod._atlas_ref_attn = {"fm_qk": new_fm(), "fm_av": new_fm(), "variant": "text", **_algo_cfg(name)}
             mod.eager_attention_forward = types.MethodType(_smolvla_text_attention, mod)
             sites.append({"site": name, "kind": "smolvla_text_expert", "variant": "text"})
     smolvla = bool(sites)
@@ -193,7 +215,7 @@ def patch_attention(model: nn.Module, fm_factory=None, skip=()) -> list:
         variant = "vision" if "vision" in type(mod).__name__.lower() else "text"
         if smolvla and variant == "text":
             continue          # SmolVLA text/expert attention runs through eager_attention_forward
-        mod._atlas_ref_attn = {"fm_qk": new_fm(), "fm_av": new_fm(), "variant": variant}
+        mod._atlas_ref_attn = {"fm_qk": new_fm(), "fm_av": new_fm(), "variant": variant, **_algo_cfg(name)}
         configs[id(cfg)] = cfg
         sites.append({"site": name, "kind": type(mod).__name__, "variant": variant})
     if configs:
@@ -229,7 +251,8 @@ def _pi0_gemma_eager(module, query, key, value, attention_mask, scaling, dropout
         return _PI0_ORIG["gemma"](module, query, key, value, attention_mask, scaling, dropout, **kwargs)
     n_rep = module.num_key_value_groups                                           # 925-926 repeat_kv
     k, v = _expand_kv(key, n_rep), _expand_kv(value, n_rep)
-    out = ref_attention(query, k, v, scaling, attention_mask, cfg["fm_qk"], cfg["fm_av"], "pi0")
+    out = ref_attention(query, k, v, scaling, attention_mask, cfg["fm_qk"], cfg["fm_av"], "pi0",
+                        cfg.get("algo"), cfg.get("site", ""))
     cfg["calls"]["gemma_eager"] = cfg["calls"].get("gemma_eager", 0) + 1
     return out.to(query.dtype).transpose(1, 2).contiguous(), None                  # 982-1005
 
@@ -241,7 +264,8 @@ def _pi0_siglip_eager(module, query, key, value, attention_mask, scaling, dropou
     cfg = _pi0_cfg(module)
     if cfg is None:
         return _PI0_ORIG["siglip"](module, query, key, value, attention_mask, scaling, dropout, **kwargs)
-    out = ref_attention(query, key, value, scaling, attention_mask, cfg["fm_qk"], cfg["fm_av"], "vision")
+    out = ref_attention(query, key, value, scaling, attention_mask, cfg["fm_qk"], cfg["fm_av"], "vision",
+                        cfg.get("algo"), cfg.get("site", ""))
     cfg["calls"]["siglip_eager"] = cfg["calls"].get("siglip_eager", 0) + 1
     return out.to(query.dtype).transpose(1, 2).contiguous(), None                  # 1151-1165
 
@@ -259,7 +283,8 @@ def _pi0_sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False,
     if mask is None and is_causal:                                                 # 728-734
         sq, skv = query.shape[-2], key.shape[-2]
         mask = torch.ones(sq, skv, dtype=torch.bool, device=query.device).tril()[None, None]
-    out = ref_attention(query, key, value, scale, mask, cfg["fm_qk"], cfg["fm_av"], "pi0")
+    out = ref_attention(query, key, value, scale, mask, cfg["fm_qk"], cfg["fm_av"], "pi0",
+                        cfg.get("algo"), cfg.get("site", ""))
     cfg["calls"]["sdpa"] = cfg["calls"].get("sdpa", 0) + 1
     return out.to(query.dtype)                                                     # 804
 
@@ -309,7 +334,8 @@ def patch_pi0_attention(model: nn.Module, fm_factory=None, skip=()) -> list:
         if name.split(".")[-1] != "self_attn" or any(x and x in name for x in skip):
             continue                                # --skip leaves a site unpatched (NEW for Pi0)
         calls: dict = {}
-        mod._atlas_ref_attn = {"fm_qk": new_fm(), "fm_av": new_fm(), "variant": "pi0", "calls": calls}
+        mod._atlas_ref_attn = {"fm_qk": new_fm(), "fm_av": new_fm(), "variant": "pi0", "calls": calls,
+                               **_algo_cfg(name)}
 
         def pre(m, *_):
             _pi0_current.module = m
@@ -345,8 +371,13 @@ class RefQuantConv2d(nn.Module):
             self.padding = (0, 0)
         self.out_channels = conv.out_channels
         self.layer_name, self.fm = name, fm
+        self.algo = algos.current()              # None under --algo none (src/algos)
         with torch.no_grad():
-            w_q, s_w = rn.quantize(self.weight.detach().reshape(self.out_channels, -1))   # 357, 362
+            w_q, s_w, self.weight_block = algo_hooks.weight_cast(
+                self.algo, name, self.weight.detach().reshape(self.out_channels, -1), "conv2d")   # 357, 362
+        if self.weight_block and fm is not None:
+            raise NotImplementedError(f"{name}: per-block weight scales under an MXU accumulation model "
+                                      "are not defined in algo/base")
         self.register_buffer("weight_codes", w_q, persistent=False)
         self.register_buffer("weight_scale_exp", s_w, persistent=False)
         if fm is not None:
@@ -360,17 +391,35 @@ class RefQuantConv2d(nn.Module):
         cols = F.unfold(x, kernel_size=self.kernel_size, stride=self.stride,
                         padding=self.padding, dilation=self.dilation)               # 354-355
         x_flat = cols.permute(0, 2, 1).reshape(B * oh * ow, -1).to(w.dtype)         # 356
-        x_q, s_x = rn.quantize(x_flat)                                              # 361
-        if self.fm is not None:
+        if self.algo is not None:
+            y = self._mm_algo(x_flat, w)
+        elif self.fm is not None:
+            x_q, s_x = rn.quantize(x_flat)                                          # 361
             y = self.fm(rn.e4m3_unpack(x_q), self.weight_norm, None, static=True)    # 369
             y = (y * torch.exp2((s_x + self.weight_scale_exp).float())).to(dtype=w.dtype, device=x.device)
         else:
+            x_q, s_x = rn.quantize(x_flat)                                          # 361
             y = F.linear(rn.dequantize(x_q, s_x).to(w.dtype),
                          rn.dequantize(self.weight_codes, self.weight_scale_exp).to(w.dtype))   # NEW
         y = y.reshape(B, oh * ow, self.out_channels).permute(0, 2, 1).reshape(B, self.out_channels, oh, ow)
         if self.bias is not None:
             y = y + self.bias.view(1, -1, 1, 1).to(dtype=w.dtype, device=x.device)  # 374-375
         return y
+
+    def _mm_algo(self, x_flat, w):
+        """The matmul of forward with the algorithm's activation hooks (c, d online)."""
+        x_q, s_x, blk = algo_hooks.act_cast(self.algo, self.layer_name, x_flat, "conv2d")
+        if self.fm is not None:
+            if blk:
+                raise NotImplementedError(f"{self.layer_name}: per-block activation scales under an "
+                                          "MXU accumulation model are not defined in algo/base")
+            y = self.fm(rn.e4m3_unpack(x_q), self.weight_norm, None, static=True)
+            return (y * torch.exp2(algo_hooks.output_exp(s_x, self.weight_scale_exp).float())).to(
+                dtype=w.dtype, device=x_flat.device)
+        w_dq = (algo_hooks.dequant(self.weight_codes, self.weight_scale_exp, self.weight_block)
+                if self.weight_block else rn.dequantize(self.weight_codes, self.weight_scale_exp))
+        x_dq = algo_hooks.dequant(x_q, s_x, blk) if blk else rn.dequantize(x_q, s_x)
+        return F.linear(x_dq.to(w.dtype), w_dq.to(w.dtype))
 
 
 def quantize_conv2d(model: nn.Module, skip=(), fm_factory=None) -> dict:

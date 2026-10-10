@@ -43,6 +43,9 @@ def _guard_depth() -> int:
     return getattr(_local, "guard", 0)
 
 
+BF16_OPT_OUT = "bf16_opt_out:"     # skip-context detail prefix of an algorithm's BF16 layers
+
+
 class guard:
     """Ops inside are part of an MXU operation (not routed, not counted)."""
 
@@ -252,7 +255,11 @@ class ChipRouter(TorchDispatchMode):
                 self.cov.add("data", name, _numel(out))
             else:
                 new, row = None, name
-                if kind == "skip":
+                if kind == "skip" and detail.startswith(BF16_OPT_OUT):
+                    # NEW: a layer an algorithm keeps in BF16 (src/algos bf16_layers): no BF16-operand
+                    # MXU mode exists, so it is host work, on its own row
+                    why, row = "kept in BF16 by the quantization algorithm (--algo, bf16_layers)", f"{name}@bf16_opt_out"
+                elif kind == "skip":
                     why = f"kept off the chip on request (--skip {detail})"
                 elif detail in M.TABLE_HOST:
                     why, new, row = M.TABLE_HOST[detail]["reason"], M.TABLE_HOST[detail], f"{name}@{detail}"

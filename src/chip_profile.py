@@ -37,6 +37,20 @@ import ref_numerics as rn
 ENTRY_POINTS = ("forward", "predict_action_chunk", "select_action", "_generate_actions",
                 "sample_actions", "conditional_sample")
 _ALL: list = []
+_RUNNING: list = []      # routers whose session is open (innermost last)
+
+
+def count_algo_cast(n: int, dynamic: bool) -> None:
+    """An FP8 operand cast with an algorithm's own scale (src/algos/base.cast_with), counted like
+    the reference cast: vpack, plus the amax chain when the scale is computed at run time."""
+    if not _RUNNING:
+        return
+    instr = {"vpack.bf16.fp8": n}
+    if dynamic:
+        instr.update({"vredmax.row.bf16": n, "vredmin.row.bf16": n})
+    _RUNNING[-1].cov.add("VPU", "fp8_operand_cast", sum(instr.values()), instr,
+                         reason="algorithm operand cast (src/algos): vpack with the algorithm's scale"
+                                + ("; amax at run time" if dynamic else "; scale fixed ahead of time"))
 
 
 def add_args(ap) -> None:
@@ -132,6 +146,7 @@ class _Session:
                 pass
             r.active = True
             r.__enter__()
+            _RUNNING.append(r)
         self.depth += 1
 
     def exit(self):
@@ -140,6 +155,7 @@ class _Session:
             r = self.router
             r.__exit__(None, None, None)
             r.active = False
+            _RUNNING.remove(r)
             rn.quantize = self.saved["quantize"]
             rn.e4m3_unpack = self.saved["e4m3_unpack"]
             rn.dequantize = self.saved["dequantize"]
@@ -261,7 +277,8 @@ def quantize_chip(model: nn.Module, skip=(), options=None) -> dict:
     for name, m in model.named_modules():
         s = next((s for s in skip if s and s in name), None)
         if s is not None and name:
-            ctx_hooks(m, "skip", s)
+            opt_out = s in (_opt(options, "_algo_bf16", None) or ())
+            ctx_hooks(m, "skip", cc.BF16_OPT_OUT + s if opt_out else s)
             n_skip += 1
         elif rope == "host" and type(m).__name__.endswith("RotaryEmbedding"):
             ctx_hooks(m, "rope_host", type(m).__name__)
