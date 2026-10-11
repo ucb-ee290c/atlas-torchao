@@ -94,5 +94,35 @@ outside the evaluated ones for the policies, and DROID or dummy observations for
 
 ## Verification commands (GPU)
 
-See the integration note in `out/artifacts/handoff/atlas-fp8/ATLAS_V1_INTEGRATION.md` of the
-workspace for the exact commands of the verification run.
+Run from the repository root with `PYTHONPATH=$PWD/src`. `$TL` is the TinyLlama checkpoint, `$NC`
+the chip window count of run 4 (so its noise floor applies), and `$P` the Pi0 environment's python.
+Each recipe is compared with `--algo none` on the same protocol.
+
+```bash
+for R in none atlas_v1 atlas_v1_awq atlas_v1_static; do
+  # TinyLlama: R (reference, full split) and C (chip, run-4 windows; --kl works with mxq)
+  python src/eval.py --model $TL --modes bf16 ref_conv --algo $R --out out/v1_R_tl_$R.json
+  python src/eval.py --model $TL --protocol mxq --nsamples $NC --seed 0 --modes bf16 chip --kl \
+      --algo $R --out out/v1_C_tl_$R.json
+  # SmolVLA
+  python src/eval_policy.py --policy lerobot/smolvla_base --dataset lerobot/svla_so100_pickplace \
+      --n-frames 200 --seed 0 --modes bf16 ref_conv --algo $R --out out/v1_R_smolvla_$R.json
+  python src/eval_policy.py --policy lerobot/smolvla_base --dataset lerobot/svla_so100_pickplace \
+      --n-frames 32 --seed 0 --modes chip --algo $R --out out/v1_C_smolvla_$R.json
+  # Multi-Task DiT (full recipe through this repo)
+  python src/eval_policy.py --policy TRI-ML/multitask-dit-robosuite-wrist-diffusion-064000 \
+      --dataset TRI-ML/PretrainFinetune --n-frames 200 --seed 0 --modes bf16 ref_conv \
+      --algo $R --out out/v1_R_dit_$R.json
+  # Pi0 (atlas-pi0 environment)
+  $P src/eval_pi0.py --obs droid --n-obs 32 --seed 0 --modes bf16 ref_conv chip --algo $R \
+      --out out/v1_pi0_$R.json
+done
+# Multi-Task DiT in multitask-dit-quant: the recipes' vadd component only (no --algo hooks there)
+ATLAS_TORCHAO_SRC=<this checkout>/src ATLAS_CHIP_VADD=rn ATLAS_CHIP_VADD_SITES=residual \
+  python experiments/run_eval.py --label v1_dit_vadd_rn --modes bf16 chip --n-episodes 2 \
+  --n-frames 32 --seed 0 --rmse-frames 0 --device cuda
+```
+
+The chip runs of `--algo none` use `--chip-vadd trunc` (the default); every recipe's chip run
+uses `rn`. To separate the vadd effect from the algorithms, add
+`--algo none --chip-vadd rn --chip-vadd-sites residual` (run 4's `vadd_rn`).
