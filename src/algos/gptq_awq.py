@@ -37,6 +37,11 @@ Parameters (--algo gptq_awq:k=v,...):
   damp=0.01                  GPTQ dampening (Sec. 4 Step 3: 1%)
   block=128                  GPTQ lazy-batch block (Sec. 4 Step 2: B = 128)
   grid=20                    AWQ alpha grid (Sec. 5.1)
+  hessians=cpu|device        where the calibration Hessians are kept (NEW, default cpu). Each
+                             batch's x^T x is computed on the activation's device and summed into
+                             a float32 CPU accumulator; GPTQ / AWQ move one layer's H to the
+                             weight's device at a time. With `device` every H stays on the GPU
+                             (all layers at once: about 42 GB for Pi0, more than an L40S holds).
 Only Linear weights are changed; Conv2d weights and every activation keep the reference rule.
 
 Weight grid under a stack (NEW; docs/algos/stacking.md): stacked after an algorithm that chooses
@@ -122,7 +127,7 @@ def awq_search(Ws, H, sx, grid=20, exp_fn=None):
     dW = Q(W diag(s)) - W diag(s) and Q the reference cast (exponent re-derived on W diag(s)), or
     the cast at exp_fn(W diag(s)) when a stacked algorithm chooses the weight grid."""
     exp_fn = exp_fn or rn.po2_scale_exp
-    H = H.float()
+    H = H.float().to(Ws[0].device)
     best = (float("inf"), None, None)
     for i in range(grid):
         a = i / grid
@@ -157,13 +162,16 @@ class GptqAwq(Algo):
         self.method = str(params.get("method", "gptq"))
         if self.method not in METHODS:
             raise ValueError(f"gptq_awq: method={self.method!r}; choose from {METHODS}")
-        unknown = set(params) - {"method", "actorder", "damp", "block", "grid"}
+        unknown = set(params) - {"method", "actorder", "damp", "block", "grid", "hessians"}
         if unknown:
             raise ValueError(f"gptq_awq: unknown parameters {sorted(unknown)}")
         self.actorder = bool(params.get("actorder", True))
         self.damp = float(params.get("damp", 0.01))
         self.block = int(params.get("block", 128))
         self.grid = int(params.get("grid", 20))
+        self.hessians = str(params.get("hessians", "cpu"))
+        if self.hessians not in ("cpu", "device"):
+            raise ValueError(f"gptq_awq: hessians={self.hessians!r}; choose cpu or device")
         self._calib_key = None
         self.H, self.sx, self.owner = {}, {}, {}     # owner: fqn -> fqn whose H it shares
         self.fold_checks = {}                       # norm / mlp fqn -> verified consumer info
@@ -226,10 +234,14 @@ class GptqAwq(Algo):
                 seen[k] = (weakref.ref(x), n)
             x2 = x.detach().reshape(-1, x.shape[-1]).float()
             if n not in self.H:
-                self.H[n] = torch.zeros(x2.shape[1], x2.shape[1], device=x2.device)
+                hdev = "cpu" if self.hessians == "cpu" else x2.device
+                self.H[n] = torch.zeros(x2.shape[1], x2.shape[1], device=hdev)
                 self.sx[n] = torch.zeros(x2.shape[1], device=x2.device)
                 n_tok[n] = 0
-            self.H[n].addmm_(x2.T, x2)
+            if self.H[n].device == x2.device:
+                self.H[n].addmm_(x2.T, x2)
+            else:
+                self.H[n] += (x2.T @ x2).to(self.H[n].device)
             self.sx[n] += x2.abs().sum(0)
             n_tok[n] += x2.shape[0]
             if first["on"] and n.endswith("mlp.down_proj"):
@@ -272,6 +284,7 @@ class GptqAwq(Algo):
     def _calib_summary(self):
         under = sorted(n for n, t in getattr(self, "n_tok", {}).items() if t < self.H[n].shape[0])
         return {"linears_with_hessian": len(self.H), "shared_inputs": len(self.owner),
+                "hessians": self.hessians,
                 # fewer calibration tokens than input channels: H is singular and only the
                 # dampening makes it invertible; GPTQ then fits the calibration set (NEW warning)
                 "rank_deficient_hessians": under,
@@ -411,8 +424,13 @@ class GptqAwq(Algo):
         key = (name, self.method, self.actorder, self.damp, self.block, _fingerprint(w),
                _fingerprint(s0.contiguous()))
         if key not in self._gptq_cache:
-            Hn = H if D is None else H * (1.0 / D).unsqueeze(0) * (1.0 / D).unsqueeze(1)
-            wq = gptq(w.to(H.device), Hn, s0.to(H.device), self.block, self.damp, self.actorder)
+            dev = w.device                  # one layer's H moves to the weight's device (gptq())
+            if D is not None:
+                Di = (1.0 / D).to(H.device)
+                Hn = H * Di.unsqueeze(0) * Di.unsqueeze(1)
+            else:
+                Hn = H
+            wq = gptq(w, Hn, s0.to(dev), self.block, self.damp, self.actorder)
             self._gptq_cache[key] = wq.to(device=w.device, dtype=w.dtype)
         out = self._gptq_cache[key]
         if not torch.equal(qdq(out, s0), out.float()):
