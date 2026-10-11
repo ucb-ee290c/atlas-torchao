@@ -121,7 +121,7 @@ a Newton step on the softmax reciprocal .0261; rsqrt plus a Newton step .0241; S
     python src/eval_policy.py ... --modes chip --chip-vadd rn
     python src/eval_pi0.py ... --modes chip --chip-vadd rne_hw
 
-`--kl` (src/eval.py, default protocol): token-mean KL(p_bf16 ‖ p_mode) and top-1 agreement against a
+`--kl` (src/eval.py, both `--protocol default` and `mxq`): token-mean KL(p_bf16 ‖ p_mode) and top-1 agreement against a
 clean bf16 copy of the model on the same windows, written under `kl` in the result JSON. Perplexity
 stays the primary metric; KL is less noisy on a few windows.
 

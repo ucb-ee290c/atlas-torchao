@@ -59,26 +59,33 @@ def load_mxq_windows(model_id: str, seqlen: int, nsamples: int, seed):
 
 
 @torch.no_grad()
-def sample_nll(model, ids: torch.Tensor) -> tuple[float, int]:
-    """llm_ppl.py:60-66: summed next-token NLL of one window and the number of tokens scored."""
+def sample_nll(model, ids: torch.Tensor, after_window=None) -> tuple[float, int]:
+    """llm_ppl.py:60-66: summed next-token NLL of one window and the number of tokens scored.
+
+    `after_window(window, output)` (NEW, --kl) sees the [1, seqlen] window and the model output of
+    this same forward; it does not change the NLL."""
     device = next(model.parameters()).device
     ids = ids.unsqueeze(0).to(device)
-    logits = model(ids, use_cache=False).logits[0, :-1, :]
+    out = model(ids, use_cache=False)
+    logits = out.logits[0, :-1, :]
     nll = -F.log_softmax(logits.float(), dim=-1).gather(1, ids[0, 1:].unsqueeze(1)).squeeze(1)
+    if after_window is not None:
+        after_window(ids, out)
     return nll.sum().item(), nll.numel()
 
 
-def mxq_eval(model, windows: torch.Tensor, before_window=None) -> dict:
+def mxq_eval(model, windows: torch.Tensor, before_window=None, after_window=None) -> dict:
     """Perplexity over `windows` ([n, seqlen]) as llm_ppl.py:182-185 aggregates it.
 
     `before_window(window)` (NEW) runs before each window's forward; eval.py uses it for the clean
-    pass of --rmse.
+    pass of --rmse. `after_window(window, output)` (NEW) runs after it; eval.py uses it for --kl
+    (eval.KLMeter), so the KL is over every position of the same windows the perplexity scores.
     """
     per_sample, total, tokens = [], 0.0, 0
     for i in range(windows.shape[0]):
         if before_window is not None:
             before_window(windows[i:i + 1])
-        nll, n = sample_nll(model, windows[i])
+        nll, n = sample_nll(model, windows[i], after_window=after_window)
         per_sample.append({"nll": nll, "tokens": n})
         total += nll
         tokens += n

@@ -69,3 +69,25 @@ def test_ppl_is_token_weighted_over_windows():
         logits = model(windows, use_cache=False).logits[:, :-1].float()
     ref = F.cross_entropy(logits.reshape(-1, 50), windows[:, 1:].reshape(-1), reduction="sum")
     assert total == pytest.approx(float(ref), rel=1e-5)
+
+
+def test_kl_meter_on_mxq_windows():
+    """--kl under --protocol mxq: the meter sees every window's own forward (all seqlen positions),
+    and the perplexity is the same with or without it."""
+    from eval import KLMeter
+
+    model = _tiny_llama()
+    windows = torch.randint(0, 50, (3, 9), generator=torch.Generator().manual_seed(4))
+    plain = mxq_eval(model, windows)
+    k = KLMeter(model)
+    r = mxq_eval(model, windows, after_window=k)
+    assert r["ppl"] == plain["ppl"] and r["per_sample"] == plain["per_sample"]
+    s = k.summary()
+    assert s["tokens"] == 27 and abs(s["kl_vs_bf16"]) < 1e-6 and s["top1_agree_vs_bf16"] == 1.0
+    other = _tiny_llama()
+    with torch.no_grad():
+        for p in other.parameters():
+            p.add_(0.05 * torch.randn_like(p))
+    k2 = KLMeter(model)
+    mxq_eval(other, windows, after_window=k2)
+    assert k2.summary()["kl_vs_bf16"] > 0 and k2.summary()["tokens"] == 27

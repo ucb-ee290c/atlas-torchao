@@ -98,7 +98,7 @@ def main():
     ap.add_argument("--kl", action="store_true",
                     help="also report token-mean KL(p_bf16 || p_mode) and top-1 agreement against a clean "
                          "bf16 copy of the model on the same windows (NEW, secondary to perplexity; "
-                         "default protocol only)")
+                         "both protocols)")
     add_profile_args(ap)
     add_subset_compare_arg(ap)
     algos.add_args(ap, calib_sources=("wikitext2_train",))
@@ -115,8 +115,6 @@ def main():
             require_mode_supported(m, args.device)
         except RuntimeError as e:
             ap.error(str(e))
-    if args.kl and args.protocol != "default":
-        ap.error("--kl supports the default protocol only")
     if args.rmse and not (args.rmse_dir or args.out):
         ap.error("--rmse needs --rmse-dir or --out")
     rmse_dir = Path(args.rmse_dir) if args.rmse_dir else (
@@ -185,16 +183,16 @@ def main():
             rm = layer_rmse.LayerRMSE(clean, model, default_component="LANGUAGE")
         before = (lambda w: rm.capture(lambda: clean(w.to(args.device), use_cache=False))) if rm else None
         t0 = time.perf_counter()
+        klm = KLMeter(kl_ref) if kl_ref is not None else None
         if args.protocol == "mxq":
-            r = mxq_eval(model, windows, before_window=before)
+            r = mxq_eval(model, windows, before_window=before, after_window=klm)
             result["ppl"][mode] = r["ppl"]
             result["per_sample"][mode] = r["per_sample"]
         else:
-            klm = KLMeter(kl_ref) if kl_ref is not None else None
             result["ppl"][mode] = llama_eval(model, ids, seqlen=args.seqlen, before_window=before,
                                              after_window=klm)
-            if klm is not None:
-                result["kl"][mode] = klm.summary()
+        if klm is not None:
+            result["kl"][mode] = klm.summary()
         finalize_report(result["layers"].get(mode))
         print(f"{mode} ppl: {result['ppl'][mode]:.4f}  ({time.perf_counter() - t0:.1f}s, "
               f"{result['windows']} windows of {args.seqlen}, protocol {args.protocol})", flush=True)
