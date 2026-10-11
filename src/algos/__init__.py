@@ -19,6 +19,7 @@ REGISTRY = {
     "mixed_precision": "algos.mixed_precision",
     "static_calib": "algos.static_calib",
     "smoothquant": "algos.smoothquant",
+    "gptq_awq": "algos.gptq_awq",
 }
 
 _CURRENT = []
