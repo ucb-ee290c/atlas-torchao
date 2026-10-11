@@ -258,3 +258,13 @@ def test_bad_parameters_are_refused():
         algos.make("gptq_awq:method=smoothquant")
     with pytest.raises(ValueError, match="unknown"):
         algos.make("gptq_awq:alpha=0.5")
+
+
+def test_hessians_param():
+    """hessians= is validated, defaults to cpu and is recorded in the calibration summary."""
+    import algos
+
+    assert algos.make("gptq_awq:method=gptq").hessians == "cpu"
+    assert algos.make("gptq_awq:method=gptq,hessians=device").hessians == "device"
+    with pytest.raises(ValueError, match="hessians"):
+        algos.make("gptq_awq:method=gptq,hessians=gpu")

@@ -79,3 +79,21 @@ def test_cuda_matches_cpu(key, monkeypatch):
         for i, (a, b) in enumerate(zip(a_c, a_g)):
             assert torch.equal(a, b), f"activation cast {i}: exponent differs"
     assert r_c["granularity"] == r_g["granularity"]
+
+
+@pytest.mark.parametrize("method", ["gptq", "awq_gptq"])
+def test_gptq_hessians_on_cpu_match_device(method, monkeypatch):
+    """hessians=cpu (the default) keeps every calibration Hessian off the GPU and moves one layer's H
+    at a time; it pins the same exponents as hessians=device and agrees on the codes."""
+    need_refs()
+    base = f"gptq_awq:method={method},actorder=true"
+    w_d, _, _, r_d = _run_on("cuda", base + ",hessians=device", monkeypatch)
+    w_h, _, y_h, r_h = _run_on("cuda", base, monkeypatch)
+    assert torch.isfinite(y_h).all()
+    assert r_h["calibration"]["result"]["hessians"] == "cpu"
+    assert r_d["calibration"]["result"]["hessians"] == "device"
+    assert w_d.keys() == w_h.keys() and w_d
+    for n in w_d:
+        assert torch.equal(w_d[n][1], w_h[n][1]), f"{n}: weight exponent differs"
+        agree = (w_d[n][0] == w_h[n][0]).float().mean().item()
+        assert agree >= CODE_AGREE, f"{n}: only {agree:.4f} of the codes agree"
