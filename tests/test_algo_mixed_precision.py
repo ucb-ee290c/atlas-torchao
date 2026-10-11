@@ -105,6 +105,25 @@ def test_ranking_reproducible():
     assert {"fisher_out", "hawq_w", "iso_rel_rmse", "macs"} <= set(some)
     assert a["meta"]["calibration"] == rec and a["meta"]["profile"] == "ref_linear"
     assert all(v["fisher_out"] >= 0 and v["hawq_w"] >= 0 for v in a["layers"].values())
+    assert a["meta"]["device"] == "cpu"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_ranking_on_cuda():
+    """The model on CUDA, the calibration batches on the CPU (as calib.wikitext2_train returns
+    them): every layer is scored, with finite scores, and the record names the device."""
+    need_refs()
+    sys.path.insert(0, str(REPO / "scripts"))
+    import rank_layers
+
+    g = torch.Generator().manual_seed(7)
+    batches = [torch.randint(0, 128, (1, 24), generator=g) for _ in range(2)]
+    cpu = rank_layers.rank(tiny_llama(layers=2), batches, {"seed": 7})
+    gpu = rank_layers.rank(tiny_llama(layers=2).to("cuda"), batches, {"seed": 7})
+    assert gpu["meta"]["device"].startswith("cuda")
+    assert gpu["layers"].keys() == cpu["layers"].keys()
+    for v in gpu["layers"].values():
+        assert all(torch.isfinite(torch.tensor(v[k])) for k in ("fisher_out", "hawq_w", "iso_rel_rmse"))
 
 
 # -- FP8x3 -------------------------------------------------------------------------------------

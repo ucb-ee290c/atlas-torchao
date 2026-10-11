@@ -8,7 +8,7 @@ residuals (`keep_as=fp8x3` / `fp8x2_w`).
 ## Usage
 
 ```
-python scripts/rank_layers.py --model $TINYLLAMA --seqlen 512 --calib-n 4 --calib-seed 1234 \
+python scripts/rank_layers.py --model $TINYLLAMA --seqlen 512 --calib-n 4 --calib-seed 1234 --device cuda \
     --out rank.json
 python src/eval.py --model $TINYLLAMA --modes bf16 ref_linear chip \
     --algo mixed_precision:rank_file=rank.json,k=1                  # or mac_budget=0.05

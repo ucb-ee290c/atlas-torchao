@@ -2,7 +2,7 @@
 --algo mixed_precision:rank_file=...; docs/algos/mixed-precision.md).
 
     python scripts/rank_layers.py --model /path/TinyLlama-1.1B-Chat-v1.0 --seqlen 512 \
-        --calib-n 4 --calib-seed 1234 --out out/rank_tinyllama.json
+        --calib-n 4 --calib-seed 1234 --device cuda --out out/rank_tinyllama.json
 
 Calibration windows come from algos.calib.wikitext2_train (WikiText-2 TRAIN; the evaluation reads
 the test split). Scores (algos.mixed_precision.score_layers) are computed against the profile
@@ -46,6 +46,7 @@ def rank(clean, batches, calib_rec, profile="ref_linear", skip=("lm_head",), iso
              if type(m) is nn.Linear and not any(s in n for s in skip)]
 
     def loss_fn(model, ids, no_grad=False):
+        ids = ids.to(next(model.parameters()).device)   # batches stay on the CPU; the model may not
         ctx = torch.no_grad() if no_grad else torch.enable_grad()
         with ctx:
             logits = model(ids, use_cache=False).logits[0, :-1].float()
@@ -55,6 +56,7 @@ def rank(clean, batches, calib_rec, profile="ref_linear", skip=("lm_head",), iso
     meta = {"model": model_id, "profile": profile, "skip": list(skip), "calibration": calib_rec,
             "scores": ["fisher_out", "hawq_w", "iso_rel_rmse"] if iso else ["fisher_out", "hawq_w"],
             "macs": "in_features x out_features per token",
+            "device": str(next(clean.parameters()).device),
             "commit": _git("rev-parse", "HEAD"), "dirty": bool(_git("status", "--porcelain", "src", "scripts")),
             "torch": torch.__version__, "host": platform.node()}
     if iso:
@@ -72,18 +74,20 @@ def main():
     ap.add_argument("--profile", default="ref_linear")
     ap.add_argument("--no-iso", action="store_true", help="skip the rel-RMSE pass (needs the reference repos)")
     ap.add_argument("--threads", type=int, default=0)
+    ap.add_argument("--device", default=None, help="default: cuda if available, else cpu")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     import torch
 
     from algos import calib
+    device = a.device or ("cuda" if torch.cuda.is_available() else "cpu")
     from modelutils import load_llama
 
     if a.threads:
         torch.set_num_threads(a.threads)
     torch.manual_seed(0)
     batches, rec = calib.wikitext2_train(a.model, a.calib_n, a.seqlen, a.calib_seed)
-    clean = load_llama(a.model, seqlen=a.seqlen, device="cpu")
+    clean = load_llama(a.model, seqlen=a.seqlen, device=device)
     out = rank(clean, batches, rec, a.profile, iso=not a.no_iso, model_id=a.model)
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
     Path(a.out).write_text(json.dumps(out, indent=1))
