@@ -31,6 +31,7 @@ import torch
 import torch.nn as nn
 
 import chip_coverage as cc
+import chip_numerics
 import chip_ops
 import ref_numerics as rn
 
@@ -72,6 +73,15 @@ def add_args(ap) -> None:
     g.add_argument("--chip-native", nargs="*", default=[],
                    help="aten ops (overload-packet names) run on the host instead, for ablations; "
                         "they are reported as host fallback")
+    g.add_argument("--chip-vadd", choices=chip_numerics.MODES, default="trunc",
+                   help="vadd/vsub numerics: trunc (the hardware as built: FP32 add, upper-16-bit slice; "
+                        "default, unchanged), rn (NEW: round-to-nearest from 24 VPU instructions, "
+                        "chip_numerics.vadd_rn), rne_hw (model of an RNE narrowing in the adder; pending "
+                        "a hardware ruling). rn and rne_hw are recorded off the ladder")
+    g.add_argument("--chip-vadd-sites", choices=chip_numerics.SITES, default="residual",
+                   help="where --chip-vadd applies: residual (same-shape adds of computed tensors outside "
+                        "norm/attention/MLP/matmul modules), data (every add of two computed tensors "
+                        "except additive masks), all (every vadd/vsub, decompositions included)")
     g.add_argument("--chip-mxu", choices=("model", "framework"), default="model",
                    help="model: MXU accumulation through the reference_hw model (--mxu/--mxu-impl); "
                         "framework: FP8 operands, float32 matmul rounded to BF16 (NEW, for fast CPU smokes)")
@@ -171,6 +181,8 @@ class _Session:
             if "_mm" in self.saved:
                 import ref_attention
                 ref_attention._mm = self.saved["_mm"]
+            if r.vadd is not None and getattr(r, "vadd_record", None) is not None:
+                r.vadd_record.update(r.vadd.record())
             r.cov.refresh()
             self.calls += 1
             if self.calls == 1:
@@ -256,9 +268,14 @@ def quantize_chip(model: nn.Module, skip=(), options=None) -> dict:
     opts = quant_modes.profile_options(options or {})
     rope = _opt(options, "chip_rope", "host") or "host"
     cov = cc.Coverage(type(model).__name__)
+    vadd_mode = _opt(options, "chip_vadd", "trunc") or "trunc"
+    # explicit (never the environment): the CLI flags define the chip profile
+    vadd = chip_numerics.VaddPolicy(vadd_mode, _opt(options, "chip_vadd_sites", "residual") or "residual")
+    vadd = vadd if vadd.active else None
     router = cc.ChipRouter(cov, opts["mxu"], opts["mxu_impl"], rope=rope,
                            strict=bool(_opt(options, "chip_strict", False)),
-                           native_ops=_opt(options, "chip_native", None) or ())
+                           native_ops=_opt(options, "chip_native", None) or (),
+                           vadd=vadd if vadd is not None else chip_numerics.VaddPolicy("trunc"))
     router.active = False
     if mxu_kind == "framework":
         router.fm = framework_fm
@@ -294,6 +311,13 @@ def quantize_chip(model: nn.Module, skip=(), options=None) -> dict:
         elif type(m).__name__ in ("RefQuantLinear", "RefQuantConv2d"):
             ctx_hooks(m, "mxu_module", type(m).__name__)
 
+    if vadd is not None and vadd.sites == "residual":
+        # module contexts that exclude an add from the residual site (chip_numerics.VaddPolicy)
+        for name, m in model.named_modules():
+            k = chip_numerics.module_kind(m)
+            if k is not None:
+                ctx_hooks(m, k, type(m).__name__)
+
     if any(s.get("variant") == "pi0" for s in rep.get("attention_sites", [])):
         # Pi0: every attention route (Gemma eager, SigLIP sdpa) is already the reference routine,
         # whose softmax and mask are separate ops; switching SigLIP to eager would change its
@@ -313,6 +337,9 @@ def quantize_chip(model: nn.Module, skip=(), options=None) -> dict:
                       "rope": rope, "host_tables": tables, "entry_points": entries, "eager_attention_set": eager,
                       "skipped_to_host": list(skip), "skip_modules": n_skip,
                       "vpu_lut_sha256_16": chip_ops.lut_provenance()}
+    if vadd is not None:
+        router.vadd_record = vadd.record()
+        rep["profile"]["vadd"] = router.vadd_record
     import ref_loader
     rep["reference_sources"] = ref_loader.provenance()
     rep["coverage"] = cov.refresh()
