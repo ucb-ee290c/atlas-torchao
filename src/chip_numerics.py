@@ -185,6 +185,16 @@ def policy_from_env() -> VaddPolicy:
     outside the chip profile's CLI (multitask-dit-quant: mtdit_inout/chip_full.py builds
     ChipRouter(cov, mxu=, mxu_impl=) and chip_coverage.make_mtdit_op_emulator)."""
     import os
+    algo = (os.environ.get("ATLAS_ALGO") or "none").strip()
+    if algo != "none":
+        # NEW: an --algo / recipe cannot act through this path (docs/algos/atlas_v1.md); refuse it
+        # rather than run the profile without it
+        raise NotImplementedError(
+            f"ATLAS_ALGO={algo!r}: a router built from the environment (multitask-dit-quant "
+            "run_eval.py) has no algorithm hooks: that repo quantizes the DiT itself. Run the "
+            "algorithm on Multi-Task DiT with atlas-torchao src/eval_policy.py --policy <checkpoint> "
+            f"--algo {algo}, or set only ATLAS_CHIP_VADD=rn ATLAS_CHIP_VADD_SITES=residual for a "
+            "recipe's vadd component")
     return VaddPolicy(os.environ.get("ATLAS_CHIP_VADD") or "trunc",
                       os.environ.get("ATLAS_CHIP_VADD_SITES") or "residual")
 

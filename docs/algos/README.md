@@ -13,6 +13,9 @@ Several algorithms can be stacked with `+`, e.g.
 `--algo smoothquant:alpha=0.5+gptq_awq:method=gptq+granularity:w=channel,a=token,rule=nc`. The
 order, the conflict rule and the record are in [stacking.md](stacking.md) (NEW).
 
+Named recipes expand to documented stacks: `--algo atlas_v1`, `atlas_v1_awq` and `atlas_v1_static`
+([atlas_v1.md](atlas_v1.md), NEW).
+
 ## Hook API (`src/algos/base.py`)
 
 Subclass `algos.base.Algo`, override only the hooks you need, and set `ALGO = YourClass` in the

@@ -73,9 +73,9 @@ def add_args(ap) -> None:
     g.add_argument("--chip-native", nargs="*", default=[],
                    help="aten ops (overload-packet names) run on the host instead, for ablations; "
                         "they are reported as host fallback")
-    g.add_argument("--chip-vadd", choices=chip_numerics.MODES, default="trunc",
+    g.add_argument("--chip-vadd", choices=chip_numerics.MODES, default=None,
                    help="vadd/vsub numerics: trunc (the hardware as built: FP32 add, upper-16-bit slice; "
-                        "default, unchanged), rn (NEW: round-to-nearest from 24 VPU instructions, "
+                        "default, unchanged, unless an --algo recipe such as atlas_v1 sets rn), rn (NEW: round-to-nearest from 24 VPU instructions, "
                         "chip_numerics.vadd_rn), rne_hw (model of an RNE narrowing in the adder; pending "
                         "a hardware ruling). rn and rne_hw are recorded off the ladder")
     g.add_argument("--chip-vadd-sites", choices=chip_numerics.SITES, default="residual",

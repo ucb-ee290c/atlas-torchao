@@ -28,6 +28,35 @@ REGISTRY = {
     "gptq_awq": "algos.gptq_awq",
 }
 
+# Named recipes (NEW; docs/algos/atlas_v1.md): `--algo NAME` expands to a documented stack, and
+# NAME+other:k=v appends opt-in members (e.g. atlas_v1+mixed_precision:...). `chip` options apply
+# to the chip profiles unless the command line sets them (--chip-vadd). smoothquant runs with
+# partial=true in every recipe so that a policy's SigLIP / CLIP / DiT blocks are left unfolded and
+# listed in the record (prepare: unsupported_blocks) instead of refusing the model; on a pure
+# decoder stack (TinyLlama) partial=true folds exactly what partial=false folds.
+RECIPES = {
+    "atlas_v1": {
+        "spec": "smoothquant:alpha=0.5,po2=true,gain=false,partial=true"
+                "+gptq_awq:method=gptq,actorder=true"
+                "+granularity:w=channel,a=token,rule=nc",
+        "chip": {"chip_vadd": "rn", "chip_vadd_sites": "residual"},
+        "activation_scales": "dynamic per token (run-time amax on chip)",
+    },
+    "atlas_v1_awq": {
+        "spec": "gptq_awq:method=awq_gptq,actorder=true"
+                "+granularity:w=channel,a=token,rule=nc",
+        "chip": {"chip_vadd": "rn", "chip_vadd_sites": "residual"},
+        "activation_scales": "dynamic per token (run-time amax on chip)",
+    },
+    "atlas_v1_static": {
+        "spec": "smoothquant:alpha=0.5,po2=true,gain=true,static=true,partial=true"
+                "+gptq_awq:method=gptq,actorder=true",
+        "chip": {"chip_vadd": "rn", "chip_vadd_sites": "residual"},
+        "activation_scales": "static per tensor for every calibrated Linear input (no run-time amax "
+                             "there); attention operands keep the reference dynamic per-(batch, head) rule",
+    },
+}
+
 _CURRENT = []
 
 
@@ -39,7 +68,7 @@ def split(spec: str | None) -> list:
     parts = []
     for tok in spec.split("+"):
         head = tok.strip().partition(":")[0].strip()
-        if parts and head not in REGISTRY:
+        if parts and head not in REGISTRY and head not in RECIPES:
             parts[-1] += "+" + tok
         else:
             parts.append(tok.strip())
@@ -72,9 +101,30 @@ def parse(spec: str | None) -> tuple[str, dict]:
     return name, params
 
 
+def recipe_of(spec: str | None):
+    """(recipe name, its dict) if `spec` uses a named recipe, else (None, None). Recipes take no
+    parameters, and at most one recipe may appear in a spec."""
+    names = [p.strip() for p in split(spec) if p.partition(":")[0].strip() in RECIPES]
+    if not names:
+        return None, None
+    if len(names) > 1:
+        raise ValueError(f"--algo {spec!r}: more than one recipe ({names})")
+    if ":" in names[0]:
+        raise ValueError(f"--algo {spec!r}: recipe {names[0].partition(':')[0]!r} takes no parameters; "
+                         "write its stack out (docs/algos/atlas_v1.md) to change one")
+    return names[0], RECIPES[names[0]]
+
+
+def expand(spec: str | None) -> str:
+    """`spec` with a named recipe replaced by its stack."""
+    parts = split(spec)
+    return "+".join(RECIPES[p.strip()]["spec"] if p.strip() in RECIPES else p for p in parts)
+
+
 def parse_stack(spec: str | None) -> list:
-    """[(name, params), ...] of every algorithm in `spec`, in the order written."""
-    out = [parse(p) for p in split(spec)]
+    """[(name, params), ...] of every algorithm in `spec` (recipes expanded), in the order written."""
+    recipe_of(spec)                                  # validates recipe use
+    out = [parse(p) for p in split(expand(spec))]
     if len(out) > 1 and any(n == "none" for n, _ in out):
         raise ValueError(f"--algo {spec!r}: 'none' cannot be stacked")
     return out
@@ -105,7 +155,13 @@ def make(spec: str | None):
         return None if REGISTRY[name] is None else _make_one(name, params)
     from algos.stack import Stack
 
-    return Stack([_make_one(n, p) for n, p in parsed], spec=(spec or "").strip())
+    st = Stack([_make_one(n, p) for n, p in parsed], spec=(spec or "").strip())
+    name, rcp = recipe_of(spec)
+    if name is not None:
+        st.recipe = {"name": name, "spec": rcp["spec"], "expanded": expand(spec),
+                     "chip_defaults": dict(rcp["chip"]), "activation_scales": rcp["activation_scales"],
+                     "doc": "docs/algos/atlas_v1.md"}
+    return st
 
 
 def current():
@@ -127,7 +183,8 @@ def add_args(ap, calib_sources=("auto",)) -> None:
     g.add_argument("--algo", default="none",
                    help="NAME[:k=v,...] from src/algos, or several joined by '+' "
                         "(docs/algos/stacking.md; default none: the profiles unchanged); "
-                        f"registered: {', '.join(sorted(REGISTRY))}")
+                        f"registered: {', '.join(sorted(REGISTRY))}; recipes "
+                        f"(docs/algos/atlas_v1.md): {', '.join(RECIPES)}")
     g.add_argument("--calib-n", type=int, default=None,
                    help="calibration samples (windows / frames / observations); default: the algorithm's")
     g.add_argument("--calib-seed", type=int, default=1234,
@@ -148,6 +205,9 @@ def none_record(spec, mode=None) -> dict:
         by = dict(parsed)
         rec = {"name": name, "spec": str(spec).strip(), "order": order([n for n, _ in parsed]),
                "params": by, "calibration": None}
+        rname, rcp = recipe_of(spec)
+        if rname is not None:
+            rec["recipe"] = {"name": rname, "spec": rcp["spec"], "expanded": expand(spec)}
     if name != "none" and mode == "bf16":
         rec.update(applied=False, reason="bf16 baseline: no algorithm applied")
     return rec
@@ -178,6 +238,13 @@ def quantize(model, mode, skip=(), options=None, algo=None, calib=None) -> dict:
     else:
         algo.reset()
     skip = list(skip or ())
+    recipe = getattr(algo, "recipe", None)
+    chip_applied = {}
+    if recipe and quant_modes.PROFILES[quant_modes.canonical(mode)].base == "chip":
+        # the recipe's chip defaults, unless the command line set them (an explicit --chip-vadd wins)
+        opts = quant_modes._options_dict(options)
+        chip_applied = {k: v for k, v in recipe["chip_defaults"].items() if opts.get(k) is None}
+        options = {**opts, **chip_applied}
     bf16 = list(algo.bf16_layers(model, mode) or [])
     if algo.needs_calibration and calib is None:
         raise RuntimeError(f"algorithm {algo.name!r} needs calibration data and none was provided")
@@ -210,6 +277,8 @@ def quantize(model, mode, skip=(), options=None, algo=None, calib=None) -> dict:
     rec = algo.record()
     base = quant_modes.PROFILES[quant_modes.canonical(mode)].base
     hooks = algo.overridden_module_hooks()
+    if recipe:
+        rec["recipe"] = {**recipe, "chip_options_applied": chip_applied}
     rec.update(applied=True, bf16_opt_out=bf16, prepare=prep,
                module_hooks=hooks, module_hooks_applied=base in ("reference", "reference_hw", "chip"))
     if hooks and not rec["module_hooks_applied"]:
