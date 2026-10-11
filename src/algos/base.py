@@ -27,6 +27,10 @@ receive the model-level hooks only):
   online_transform(name, kind)        (d, online) None, or a callable x -> x' applied at run time
                                       before the activation cast (its weight-side counterpart is
                                       applied in transform_weight)
+  residual_passes(name, kind)         (g, proposed on algo/mixed-precision) None, or "w" / "wx":
+                                      extra FP8 MXU passes on the residual of the weight ("w":
+                                      x_hi.w_hi + x_hi.w_lo) or of both operands ("wx": + x_lo.w_hi),
+                                      each residual cast with the reference rule (Linear only)
 
 `kind` is "linear", "conv2d" or "attention.q|k|p|v" (attention operands; `name` is the site).
 """
@@ -66,7 +70,7 @@ class Algo:
     needs_calibration = False
     # Hooks a subclass actually overrides that act inside the reference modules; recorded so a
     # result under collab_v0 / torchao says they did not apply.
-    module_hooks = ("transform_weight", "weight_scale", "act_scale", "online_transform")
+    module_hooks = ("transform_weight", "weight_scale", "act_scale", "online_transform", "residual_passes")
 
     def __init__(self, **params):
         self.params = dict(params)
@@ -101,6 +105,9 @@ class Algo:
         return None
 
     def online_transform(self, name, kind):
+        return None
+
+    def residual_passes(self, name, kind) -> str | None:
         return None
 
     # -- bookkeeping ---------------------------------------------------------------------------

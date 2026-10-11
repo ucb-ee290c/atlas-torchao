@@ -16,6 +16,7 @@ REGISTRY = {
     "none": None,
     "example_identity": "algos.example_identity",
     "granularity": "algos.granularity",
+    "mixed_precision": "algos.mixed_precision",
 }
 
 _CURRENT = []
