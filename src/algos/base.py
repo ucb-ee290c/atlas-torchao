@@ -205,6 +205,21 @@ def output_exp(s_x, s_w):
     return s_x + s_w
 
 
+def output_scale(s_x, s_w):
+    """2^(sx+sw) for the BF16 output rescale (quant_linear.py:169-170).
+
+    Per-tensor exponents on both sides: computed exactly as the reference modules always did (so
+    the chip router counts it as before). A per-row / per-column exponent table (NEW, e.g. the
+    granularity track): the [..., out] table is built under the chip guard, because on Atlas the
+    factors come from the scale derivation and are applied as vmul.bf16 on the output, not as a
+    vexp2 over every output element; the algorithm that chose such scales counts those vmuls
+    itself (chip_profile.count_algo_vpu)."""
+    if s_x.numel() == 1 and s_w.numel() == 1:
+        return torch.exp2(output_exp(s_x, s_w).float())
+    with _guard():
+        return torch.exp2(output_exp(s_x, s_w).float())
+
+
 # ---------------------------------------------------------------------------------------------
 # Calibration helpers
 # ---------------------------------------------------------------------------------------------

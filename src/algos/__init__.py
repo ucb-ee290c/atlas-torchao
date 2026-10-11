@@ -15,6 +15,7 @@ import importlib
 REGISTRY = {
     "none": None,
     "example_identity": "algos.example_identity",
+    "granularity": "algos.granularity",
 }
 
 _CURRENT = []
