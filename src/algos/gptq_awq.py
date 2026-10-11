@@ -38,6 +38,13 @@ Parameters (--algo gptq_awq:k=v,...):
   block=128                  GPTQ lazy-batch block (Sec. 4 Step 2: B = 128)
   grid=20                    AWQ alpha grid (Sec. 5.1)
 Only Linear weights are changed; Conv2d weights and every activation keep the reference rule.
+
+Weight grid under a stack (NEW; docs/algos/stacking.md): stacked after an algorithm that chooses
+the weight scale (e.g. granularity:w=channel), `weight_grid` is that algorithm's weight_scale. GPTQ
+then quantizes onto ITS grid (a per-channel exponent [out, 1] quantizes each column per row), and
+pins that exponent exactly as it pins s0 alone, with the chooser's granularity descriptor; AWQ's
+search evaluates Q with the same rule. A per-block grid is refused (NotImplementedError): GPTQ's
+column order would have to respect the blocks, which is not implemented here.
 """
 
 from __future__ import annotations
@@ -66,15 +73,19 @@ FOLD_TOL = 2.0 ** -6          # NEW: relative tolerance of the fold self-check (
 # ---------------------------------------------------------------------------------------------
 
 def qdq(w: torch.Tensor, s) -> torch.Tensor:
-    """The Atlas cast at a fixed exponent: e4m3(vpack(w, s)) * 2^s, float32 (exact)."""
+    """The Atlas cast at a fixed exponent: e4m3(vpack(w, s)) * 2^s, float32 (exact). `s` is a
+    scalar or broadcastable against `w` (a per-row [out, 1] exponent)."""
     s = torch.as_tensor(s, dtype=torch.int32, device=w.device)
     return rn.e4m3_unpack(rn.e4m3_vpack(w, s)) * torch.exp2(s.float())
 
 
 @torch.no_grad()
 def gptq(W: torch.Tensor, H: torch.Tensor, s, block=128, damp=0.01, actorder=True) -> torch.Tensor:
-    """GPTQ Algorithm 1 (arXiv 2210.17323) with quant() = qdq(., s). W [out, in], H [in, in].
+    """GPTQ Algorithm 1 (arXiv 2210.17323) with quant() = qdq(., s). W [out, in], H [in, in], s a
+    scalar exponent or one per output row ([out, 1], as GPTQ's own per-row quantizer).
     Returns the dequantized weight (float32); every entry lies on the E4M3 x 2^s grid."""
+    s = torch.as_tensor(s, dtype=torch.int32, device=W.device)
+    s = s.reshape(-1) if s.dim() == 2 else s                 # one exponent per entry of a column
     W = W.detach().clone().float()
     H = H.detach().clone().double().to(W.device)
     K = W.shape[1]
@@ -106,9 +117,11 @@ def gptq(W: torch.Tensor, H: torch.Tensor, s, block=128, damp=0.01, actorder=Tru
     return Q
 
 
-def awq_search(Ws, H, sx, grid=20):
+def awq_search(Ws, H, sx, grid=20, exp_fn=None):
     """(s, alpha, loss) minimizing sum over the group of tr(dW D H D dW^T), D = diag(1/s), with
-    dW = Q(W diag(s)) - W diag(s) and Q the reference cast (exponent re-derived on W diag(s))."""
+    dW = Q(W diag(s)) - W diag(s) and Q the reference cast (exponent re-derived on W diag(s)), or
+    the cast at exp_fn(W diag(s)) when a stacked algorithm chooses the weight grid."""
+    exp_fn = exp_fn or rn.po2_scale_exp
     H = H.float()
     best = (float("inf"), None, None)
     for i in range(grid):
@@ -118,7 +131,7 @@ def awq_search(Ws, H, sx, grid=20):
         loss = 0.0
         for W in Ws:
             Wsc = (W.float() * s).to(W.dtype).float()        # what the folded checkpoint holds
-            dW = (qdq(Wsc, rn.po2_scale_exp(Wsc)) - Wsc) / s
+            dW = (qdq(Wsc, exp_fn(Wsc)) - Wsc) / s
             loss += float(((dW @ H) * dW).sum())
         if loss < best[0]:
             best = (loss, s, a)
@@ -158,6 +171,10 @@ class GptqAwq(Algo):
         self.s0 = {}                                # fqn -> pinned exponent
         self._gptq_cache = {}
         self.layers = {}                            # fqn -> what was done (per mode)
+        self.s0_granularity = {}                    # fqn -> descriptor of the pinned exponent
+        # weight_grid(name, w, kind) -> Scale | None: the weight-scale choice of an algorithm stacked
+        # after this one (algos.stack); None = the reference per-tensor rule
+        self.weight_grid = None
 
     @property
     def uses_gptq(self):
@@ -336,7 +353,7 @@ class GptqAwq(Algo):
                 refused[key] = "no calibration statistics"
                 continue
             Ws = [mods[c].weight.detach() for c in cons]
-            s, alpha, _ = awq_search(Ws, H, sx, self.grid)
+            s, alpha, _ = awq_search(Ws, H, sx, self.grid, self._grid_exp_fn(cons[0]))
             prod = mods[chk["producer"]]
             if chk["rows"]:
                 prod.weight.copy_((prod.weight.float() / s.unsqueeze(1).to(prod.weight.device)).to(prod.weight.dtype))
@@ -360,21 +377,39 @@ class GptqAwq(Algo):
         return {"method": self.method, "awq_folded": folded, "awq_unscaled": refused}
 
     # -- (a, b) weights ----------------------------------------------------------------------------
+    def _grid(self, name, w, kind):
+        """(exponent, descriptor) of the grid `w` is quantized onto: the stacked chooser's, else
+        the reference per-tensor rule."""
+        sc = self.weight_grid(name, w, kind) if self.weight_grid is not None else None
+        if sc is None:
+            return rn.po2_scale_exp(w), "per_tensor"
+        if sc.block:
+            raise NotImplementedError(f"{name}: gptq_awq on a per-block weight grid ({sc.describe()}) "
+                                      "is not implemented")
+        return sc.exp.to(torch.int32), sc.granularity
+
+    def _grid_exp_fn(self, name):
+        if self.weight_grid is None:
+            return None
+        return lambda W: self._grid(name, W, "linear")[0].to(W.device)
+
     def transform_weight(self, name, w, kind):
         if kind != "linear":
             self.layers[name] = f"{kind}: reference cast (GPTQ applies to Linear only)"
             return w
-        s0 = rn.po2_scale_exp(w)
         self.s0.pop(name, None)
+        self.s0_granularity.pop(name, None)
         if not self.uses_gptq:
             self.layers[name] = "awq" if name in self.awq_scale else "rtn"
             return w
+        s0, gran = self._grid(name, w, kind)
         H = self.H.get(self.owner.get(name, name))
         if H is None:
             self.layers[name] = "rtn: not reached by the calibration data"
             return w
         D = self.awq_scale.get(name)
-        key = (name, self.method, self.actorder, self.damp, self.block, _fingerprint(w))
+        key = (name, self.method, self.actorder, self.damp, self.block, _fingerprint(w),
+               _fingerprint(s0.contiguous()))
         if key not in self._gptq_cache:
             Hn = H if D is None else H * (1.0 / D).unsqueeze(0) * (1.0 / D).unsqueeze(1)
             wq = gptq(w.to(H.device), Hn, s0.to(H.device), self.block, self.damp, self.actorder)
@@ -383,13 +418,14 @@ class GptqAwq(Algo):
         if not torch.equal(qdq(out, s0), out.float()):
             raise RuntimeError(f"{name}: GPTQ weight is not representable at the pinned exponent")
         self.s0[name] = s0                  # pinned: weight_scale hands it back as a static Scale
+        self.s0_granularity[name] = gran
         self.layers[name] = "gptq" + ("+awq" if D is not None else "")
         return out
 
     def weight_scale(self, name, w, kind):
         if kind != "linear" or name not in self.s0:
             return None
-        return Scale(self.s0[name], "per_tensor", dynamic=False)
+        return Scale(self.s0[name], self.s0_granularity.get(name, "per_tensor"), dynamic=False)
 
     def record(self) -> dict:
         rec = super().record()

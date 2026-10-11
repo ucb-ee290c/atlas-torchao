@@ -139,6 +139,15 @@ saturation edges and through the shared exponent. The screen shows this: flat on
 layers. The two `down_proj` exceptions come from a smaller activation range, which is SmoothQuant's
 mechanism.
 
+## Under a stack: a chosen weight grid (NEW)
+
+Stacked after an algorithm that chooses the weight scale (for example `granularity:w=channel`),
+`gptq_awq` quantizes onto that algorithm's grid instead of the per-tensor reference exponent. A
+per-row exponent `[out, 1]` quantizes each column per row (GPTQ's own per-row quantizer), the
+exponent is pinned as above with the chooser's granularity descriptor, and AWQ's search evaluates
+Q with the same rule. A per-block grid raises `NotImplementedError`. Alone, nothing changes. See
+[stacking.md](stacking.md).
+
 ## torchao 0.18 prototypes (not usable for Atlas FP8)
 
 - **GPTQ.** `torchao/prototype/gptq/api.py` accepts only `Int4WeightOnlyConfig`,

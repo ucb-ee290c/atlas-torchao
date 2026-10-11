@@ -5,6 +5,12 @@
 
 Registration is one line per algorithm in REGISTRY: name -> module. The module defines `ALGO`, an
 `algos.base.Algo` subclass constructed with the parsed k=v params.
+
+Stacks (NEW; docs/algos/stacking.md): `--algo A:k=v+B:k=v` joins several algorithms with `+` into
+an `algos.stack.Stack`. A `+` starts a new algorithm only when the text after it names a registered
+algorithm, so a value such as smoothquant's `sites=qkv+fc1` keeps its `+`. Likewise a parameter
+token without `=` continues the previous value: `rotation:online=down,o,impl=fp32` gives
+online="down,o". A single spec parses and behaves exactly as before.
 """
 
 from __future__ import annotations
@@ -25,21 +31,53 @@ REGISTRY = {
 _CURRENT = []
 
 
+def split(spec: str | None) -> list:
+    """'A:k=v+B:k=v' -> ['A:k=v', 'B:k=v']. A '+' separates algorithms only when the text after it
+    starts with a registered name (followed by ':' or the end of that part); otherwise it belongs
+    to the current value (e.g. smoothquant sites=qkv+fc1)."""
+    spec = (spec or "none").strip()
+    parts = []
+    for tok in spec.split("+"):
+        head = tok.strip().partition(":")[0].strip()
+        if parts and head not in REGISTRY:
+            parts[-1] += "+" + tok
+        else:
+            parts.append(tok.strip())
+    return parts
+
+
 def parse(spec: str | None) -> tuple[str, dict]:
-    """'name:k=v,k2=v2' -> (name, {k: v}); values are int, float, true/false or strings."""
+    """'name:k=v,k2=v2' -> (name, {k: v}); values are int, float, true/false or strings.
+
+    A token without '=' continues the previous value with a comma ('online=down,o' -> 'down,o');
+    such a joined value stays a string."""
     spec = (spec or "none").strip()
     name, _, rest = spec.partition(":")
-    params = {}
+    name = name.strip()
+    raw, last = {}, None
     for item in filter(None, (p.strip() for p in rest.split(","))):
         k, eq, v = item.partition("=")
         if not eq:
-            raise ValueError(f"--algo {spec!r}: parameter {item!r} is not k=v")
-        params[k.strip()] = _value(v.strip())
+            if last is None:
+                raise ValueError(f"--algo {spec!r}: parameter {item!r} is not k=v")
+            raw[last] = (raw[last][0] + "," + item, True)
+            continue
+        last = k.strip()
+        raw[last] = (v.strip(), False)
+    params = {k: (v if joined else _value(v)) for k, (v, joined) in raw.items()}
     if name not in REGISTRY:
         raise ValueError(f"unknown algorithm {name!r}; choose from {sorted(REGISTRY)}")
     if name == "none" and params:
         raise ValueError("--algo none takes no parameters")
     return name, params
+
+
+def parse_stack(spec: str | None) -> list:
+    """[(name, params), ...] of every algorithm in `spec`, in the order written."""
+    out = [parse(p) for p in split(spec)]
+    if len(out) > 1 and any(n == "none" for n, _ in out):
+        raise ValueError(f"--algo {spec!r}: 'none' cannot be stacked")
+    return out
 
 
 def _value(v: str):
@@ -53,14 +91,21 @@ def _value(v: str):
     return v
 
 
-def make(spec: str | None):
-    """The Algo instance for `spec`, or None for `none`."""
-    name, params = parse(spec)
-    if REGISTRY[name] is None:
-        return None
+def _make_one(name, params):
     algo = importlib.import_module(REGISTRY[name]).ALGO(**params)
     algo.name = name
     return algo
+
+
+def make(spec: str | None):
+    """The Algo instance for `spec`, an algos.stack.Stack for 'A+B+...', or None for `none`."""
+    parsed = parse_stack(spec)
+    if len(parsed) == 1:
+        name, params = parsed[0]
+        return None if REGISTRY[name] is None else _make_one(name, params)
+    from algos.stack import Stack
+
+    return Stack([_make_one(n, p) for n, p in parsed], spec=(spec or "").strip())
 
 
 def current():
@@ -80,7 +125,8 @@ def active(algo):
 def add_args(ap, calib_sources=("auto",)) -> None:
     g = ap.add_argument_group("quantization algorithm (docs/algos/README.md)")
     g.add_argument("--algo", default="none",
-                   help="NAME[:k=v,...] from src/algos (default none: the profiles unchanged); "
+                   help="NAME[:k=v,...] from src/algos, or several joined by '+' "
+                        "(docs/algos/stacking.md; default none: the profiles unchanged); "
                         f"registered: {', '.join(sorted(REGISTRY))}")
     g.add_argument("--calib-n", type=int, default=None,
                    help="calibration samples (windows / frames / observations); default: the algorithm's")
@@ -91,8 +137,17 @@ def add_args(ap, calib_sources=("auto",)) -> None:
 
 
 def none_record(spec, mode=None) -> dict:
-    name, params = parse(spec)
-    rec = {"name": name, "params": params, "calibration": None}
+    parsed = parse_stack(spec)
+    if len(parsed) == 1:
+        name, params = parsed[0]
+        rec = {"name": name, "params": params, "calibration": None}
+    else:
+        from algos.stack import order
+
+        name = "stack"
+        by = dict(parsed)
+        rec = {"name": name, "spec": str(spec).strip(), "order": order([n for n, _ in parsed]),
+               "params": by, "calibration": None}
     if name != "none" and mode == "bf16":
         rec.update(applied=False, reason="bf16 baseline: no algorithm applied")
     return rec
@@ -117,16 +172,36 @@ def quantize(model, mode, skip=(), options=None, algo=None, calib=None) -> dict:
         return quant_modes.quantize(model, mode, skip, options)
     from algos.base import Algo
 
-    Algo.__init__(algo, **algo.params)          # fresh per-mode stats (the instance is reused)
+    members = getattr(algo, "members", None)     # an algos.stack.Stack
+    if members is None:
+        Algo.__init__(algo, **algo.params)      # fresh per-mode stats (the instance is reused)
+    else:
+        algo.reset()
     skip = list(skip or ())
     bf16 = list(algo.bf16_layers(model, mode) or [])
-    if algo.needs_calibration:
-        if calib is None:
-            raise RuntimeError(f"algorithm {algo.name!r} needs calibration data and none was provided")
-        batches, run, crec = calib()
-        out = algo.calibrate(model, batches, run)
-        algo.calibration = {**crec, **({"result": out} if out else {})}
-    prep = algo.prepare(model, mode)
+    if algo.needs_calibration and calib is None:
+        raise RuntimeError(f"algorithm {algo.name!r} needs calibration data and none was provided")
+    loaded = []
+
+    def calibrate(a):
+        if not loaded:
+            loaded.append(calib())
+        batches, run, crec = loaded[0]
+        out = a.calibrate(model, batches, run)
+        a.calibration = {**crec, **({"result": out} if out else {})}
+
+    if members is None:
+        if algo.needs_calibration:
+            calibrate(algo)
+        prep = algo.prepare(model, mode)
+    else:
+        # per member in the stack's fixed order: calibrate on the model as the earlier members'
+        # prepare left it, then prepare (NEW; docs/algos/stacking.md)
+        prep = {}
+        for a in members:
+            if a.needs_calibration:
+                calibrate(a)
+            prep[a.name] = a.prepare(model, mode)
     if bf16:
         # the chip profile labels these skips as BF16 opt-outs in its coverage report
         options = {**quant_modes._options_dict(options), "_algo_bf16": tuple(bf16)}
