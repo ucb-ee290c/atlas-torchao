@@ -213,3 +213,71 @@ def test_fp8x3_refused_for_conv_and_collab_records_note():
     rep = algos.quantize(model, "collab_v0", ["lm_head"], dict(FAST),
                          algo=algos.make(f"mixed_precision:units={DOWN0},keep_as=fp8x3"))
     assert rep["algo"]["module_hooks_applied"] is False and "module_hooks_note" in rep["algo"]
+
+
+# -- FP8x3 with per-token / per-channel scales (granularity) -------------------------------------
+
+def _token_channel_x3():
+    """granularity:w=channel,a=token,rule=nc whose every Linear also takes the fp8x3 passes."""
+    from algos.granularity import Granularity
+
+    class TokenChannelX3(Granularity):
+        name = "token_channel_x3"
+
+        def residual_passes(self, name, kind):
+            return "wx" if kind == "linear" else None
+
+    return TokenChannelX3(w="channel", a="token", rule="nc")
+
+
+@pytest.mark.parametrize("mxu", ["ipt", "sa"])
+def test_fp8x3_with_token_channel_scales_on_mxu_model(mxu):
+    """Each residual pass is rescaled by the [..., out] exponent table 2^(sx[m] + sw[n]) of
+    algos.base.output_scale: x_hi.w_hi with both tables, x_hi.w_lo with the per-token row only,
+    x_lo.w_hi with the per-channel column only, summed in BF16."""
+    need_refs()
+    import accum_torch as at
+    from algos.granularity import scale_exp
+
+    torch.manual_seed(0)
+    lin = nn.Linear(96, 40, bias=False).to(torch.bfloat16)
+    x = (torch.randn(2, 5, 96) * torch.exp(torch.randn(2, 5, 1) * 3)).to(torch.bfloat16)
+    m = nn.Sequential(copy.deepcopy(lin))
+    rep = algos.quantize(m, "reference_hw", options={**FAST, "mxu": mxu}, algo=_token_channel_x3())
+    with torch.no_grad():
+        y = m(x)
+    fm = at.ipt_linear if mxu == "ipt" else (lambda a, b, c: at.sa_linear(a, b, c, compile=False))
+    w = lin.weight.detach()
+    sw = scale_exp(w, (-1,), "nc")
+    sx = scale_exp(x, (-1,), "nc")
+    wq, xq = rn.e4m3_vpack(w, sw), rn.e4m3_vpack(x, sx)
+    w_lo = (w.float() - rn.dequantize(wq, sw).float()).to(w.dtype)
+    wlq, swl = rn.quantize(w_lo)
+    x_lo = x - rn.dequantize(xq, sx).to(x.dtype)
+    xlq, sxl = rn.quantize(x_lo)
+
+    def p(a_q, sa, b_q, sb):
+        sb = sb.reshape(-1) if sb.dim() == 2 else sb
+        return (fm(rn.e4m3_unpack(a_q), rn.e4m3_unpack(b_q), None) * torch.exp2((sa + sb).float())).to(torch.bfloat16)
+
+    want = p(xq, sx, wq, sw) + p(xq, sx, wlq, swl) + p(xlq, sxl, wq, sw)
+    assert torch.equal(_bits(y), _bits(want))
+    g = rep["algo"]["granularity"]
+    assert g["weight"]["linear:per_channel"] == 1 and g["weight"]["linear:residual_wx"] == 1
+
+
+def test_fp8x3_with_token_channel_scales_on_chip_counts_no_vexp2():
+    """chip: the residual passes' exponent tables are built under the chip guard like the single
+    pass (no vexp2 over every output element), and the per-token cast's vmuls are counted."""
+    need_refs()
+    model = tiny_llama()
+    rep = algos.quantize(model, "chip", ["lm_head"], dict(FAST), algo=_token_channel_x3())
+    with torch.no_grad():
+        y = model(IDS).logits
+    assert torch.isfinite(y.float()).all()
+    ops = rep["coverage"]["ops"]
+    # before output_scale, every pass built its [..., out] table outside the guard: counted as
+    # one exp2 per output element (and an add per table) on the scalar unit
+    assert not [r for r in ops if r["op"] == "exp2"]
+    rows = {r["op"]: r for r in ops if r["unit"] == "VPU"}
+    assert rows["granularity_rescale"]["instructions"]["vmul.bf16"] > 0

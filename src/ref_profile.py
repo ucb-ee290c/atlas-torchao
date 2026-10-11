@@ -130,10 +130,15 @@ class RefQuantLinear(nn.Module):
         return y
 
     def _pass(self, x_q, s_x, w_q, w_norm, s_w, dtype, device):
-        """One FP8 matmul pass: MXU model (+ x 2^(sx+sw)) or framework accumulation, as forward."""
+        """One FP8 matmul pass: MXU model (+ x 2^(sx+sw)) or framework accumulation, as forward.
+
+        The rescale goes through algo_hooks.output_scale, as _forward_algo does, so a per-token /
+        per-channel exponent table (e.g. granularity) broadcasts to [..., out] and its table is
+        built under the chip guard (the algorithm counts the extra vmuls; the multiply itself is
+        counted by the router like any other pass)."""
         if self.fm is not None:
             y = self.fm(rn.e4m3_unpack(x_q), w_norm, None, static=True)
-            return (y * torch.exp2(algo_hooks.output_exp(s_x, s_w).float())).to(dtype=dtype, device=device)
+            return (y * algo_hooks.output_scale(s_x, s_w)).to(dtype=dtype, device=device)
         return F.linear(rn.dequantize(x_q, s_x).to(dtype), rn.dequantize(w_q, s_w).to(dtype))
 
     def _forward_residual(self, x, x_q, s_x, blk, dtype):
