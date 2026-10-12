@@ -126,3 +126,27 @@ ATLAS_TORCHAO_SRC=<this checkout>/src ATLAS_CHIP_VADD=rn ATLAS_CHIP_VADD_SITES=r
 The chip runs of `--algo none` use `--chip-vadd trunc` (the default); every recipe's chip run
 uses `rn`. To separate the vadd effect from the algorithms, add
 `--algo none --chip-vadd rn --chip-vadd-sites residual` (run 4's `vadd_rn`).
+
+## Export (GPU)
+
+Each recipe can be shipped as files: `--export-dir DIR --export-only` quantizes the `ref_conv`
+model with the recipe (calibration, folds, GPTQ), writes `model.safetensors`, `policy.json` and
+`manifest.json`, and stops ([export.md](export.md)). The calibration flags are those of the
+verification commands above, so the exported weights are the evaluated ones. `--from-export DIR`
+re-evaluates an export without calibration.
+
+```bash
+E=~/atlas-fp8/exports/atlas_v1
+for R in atlas_v1 atlas_v1_awq atlas_v1_static; do
+  python src/eval.py --model $TL --modes ref_conv --algo $R \
+      --export-dir $E/tinyllama/$R --export-only --out $E/tinyllama/$R.run.json
+  python src/eval_policy.py --policy lerobot/smolvla_base --dataset lerobot/svla_so100_pickplace \
+      --n-frames 200 --seed 0 --modes ref_conv --algo $R \
+      --export-dir $E/smolvla/$R --export-only --out $E/smolvla/$R.run.json
+  python src/eval_policy.py --policy TRI-ML/multitask-dit-robosuite-wrist-diffusion-064000 \
+      --dataset TRI-ML/PretrainFinetune --n-frames 200 --seed 0 --modes ref_conv --algo $R \
+      --export-dir $E/multitask_dit/$R --export-only --out $E/multitask_dit/$R.run.json
+  $P src/eval_pi0.py --obs droid --n-obs 32 --seed 0 --modes ref_conv --algo $R \
+      --export-dir $E/pi0/$R --export-only --out $E/pi0/$R.run.json
+done
+```
