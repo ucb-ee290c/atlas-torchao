@@ -65,7 +65,12 @@ the tests also checks the policy. It is meant to become the m2m adapter's policy
     The entry also gives `output_rescale` (`2^(s_x+s_w)` in float32, then the layer dtype, bias
     after), `residual_passes`, and for a Conv2d the im2col geometry.
   - **Attention**: one rule per operand `q`, `k`, `p`, `v`.
-  - **BF16 opt-outs**: status `host` and the reason.
+  - **BF16 opt-outs**: status `host` and the reason. NEW: canonical `atlas_v1` on
+    `multi_task_dit` keeps the exact CLIP patch embedding Conv2d in BF16. Its top-level
+    `bf16_opt_out` row has `match: exact`; the loader excludes only that site, preserving
+    similarly named siblings. Historical exports without `match` retain substring replay.
+    Full-model release export/round-trip validation is pending; all run-5.3 DiT exports
+    had zero BF16 opt-outs.
   - **`--skip` layers**: status `skipped`.
 - **`runtime`**:
   - `chip_options`: the recipe's chip defaults, such as `chip_vadd rn` on residual sites, plus any
@@ -127,7 +132,7 @@ The loader works in six steps:
 ## Tests (`tests/test_export.py`)
 
 - **Bit-identical round trip on a tiny Llama.** The logits of the reloaded model equal the
-  in-memory quantized model for `none`, `atlas_v1`, `atlas_v1_awq` and `atlas_v1_static` (the
+  in-memory quantized model for `none`, `atlas_v1`, `atlas_v1_sq`, `atlas_v1_awq` and `atlas_v1_static` (the
   recipe names where `algos.RECIPES` exists, otherwise the written-out stacks):
   - under `ref_conv`;
   - under `ref_linear` rebuilt from the same export;

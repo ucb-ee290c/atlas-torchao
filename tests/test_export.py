@@ -17,7 +17,8 @@ from test_ladder import FAST, ConvNet, tiny_llama
 # The atlas_v1 recipes written out (docs/algos/atlas_v1.md); on a branch with algos.RECIPES the
 # recipe names are used instead, and their expansion is checked against these.
 RECIPE_SPECS = {
-    "atlas_v1": "smoothquant:alpha=0.5,po2=true,gain=false,partial=true"
+    "atlas_v1": "gptq_awq:method=awq_gptq,actorder=true+granularity:w=channel,a=token,rule=nc",
+    "atlas_v1_sq": "smoothquant:alpha=0.5,po2=true,gain=false,partial=true"
                 "+gptq_awq:method=gptq,actorder=true+granularity:w=channel,a=token,rule=nc",
     "atlas_v1_awq": "gptq_awq:method=awq_gptq,actorder=true+granularity:w=channel,a=token,rule=nc",
     "atlas_v1_static": "smoothquant:alpha=0.5,po2=true,gain=true,static=true,partial=true"
@@ -74,7 +75,8 @@ def test_round_trip_bit_identical(tmp_path, spec):
     assert torch.equal(_logits(m2, IDS), _logits(m3, IDS))
 
 
-@pytest.mark.parametrize("spec", [SPECS[0], SPECS[1], SPECS[3]])
+@pytest.mark.parametrize("spec", [SPECS[0], SPECS[1], RECIPE_SPECS["atlas_v1_static"]
+                                 if not HAVE_RECIPES else "atlas_v1_static"])
 def test_round_trip_chip_framework(tmp_path, spec):
     opts = {**FAST, "chip_mxu": "framework"}
     m0, d, man, _ = _quantize_export(tmp_path, spec, mode="chip", opts=opts)
@@ -127,6 +129,38 @@ def test_conv2d_round_trip(tmp_path):
         assert torch.equal(m0(x), m1(x))
     st = load_file(str(tmp_path / "model.safetensors"))
     assert "conv.weight" not in st and st["conv.weight_codes"].shape == (8, 27)
+
+
+@pytest.mark.parametrize("mode", ["ref_conv", "reference_hw", "chip"])
+def test_canonical_dit_bf16_exception_round_trip(tmp_path, mode):
+    from test_algo_atlas_v1 import DIT_PATCH, TinyDiT, dit_calib
+
+    torch.manual_seed(17)
+    m0 = TinyDiT()
+    fresh = copy.deepcopy(m0)
+    opts = {**FAST, "chip_mxu": "framework"}
+    a = algos.make("atlas_v1")
+    rep = algos.quantize(m0, mode, options=opts, algo=a, calib=dit_calib())
+    man = quant_export.export(m0, tmp_path, mode=mode, report=rep, algo=a,
+                              algo_spec="atlas_v1", options=opts)
+    pol = json.loads((tmp_path / "policy.json").read_text())
+    assert pol["bf16_opt_out"] == [{"site": DIT_PATCH,
+        "reason": pol["sites"][DIT_PATCH]["reason"], "match": "exact"}]
+    assert "NEW" in pol["sites"][DIT_PATCH]["reason"]
+    assert man["counts"]["host"] == 1
+    assert any("patch_embedding" in d for d in man["new_decisions"])
+    st = load_file(str(tmp_path / "model.safetensors"))
+    assert st[DIT_PATCH + ".weight"].dtype == torch.bfloat16
+    assert DIT_PATCH + ".weight_codes" not in st
+    assert DIT_PATCH + "_extra.weight_codes" in st
+    m1, loaded, _ = load_quantized.load_quantized(None, tmp_path,
+                         build=lambda: copy.deepcopy(fresh), mode=mode, options=opts)
+    assert loaded["algo"]["bf16_opt_out_exact"] == [DIT_PATCH]
+    assert type(m1.get_submodule(DIT_PATCH)) is torch.nn.Conv2d
+    assert type(m1.get_submodule(DIT_PATCH + "_extra")).__name__ == "RefQuantConv2d"
+    x = torch.randn(2, 3, 4, 4, dtype=torch.bfloat16)
+    with torch.no_grad():
+        assert torch.equal(m0(x), m1(x))
 
 
 @pytest.mark.parametrize("spec", SPECS)

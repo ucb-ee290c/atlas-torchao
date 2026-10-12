@@ -572,8 +572,15 @@ def export(model: nn.Module, export_dir, *, mode: str, report: dict, algo, algo_
     algo_rec = report.get("algo") or {}
     bf16 = list(algo_rec.get("bf16_opt_out") or [])
     reasons = _opt_out_reasons(algo, bf16)
+    exact_bf16 = list(algo_rec.get("bf16_opt_out_exact") or [])
+    for n in exact_bf16:
+        reasons[n] = "NEW: canonical atlas_v1 DiT patch_embedding BF16 exception; run-5.2 ref_conv evidence; pending R4"
     quant = {}
     policy = build_policy(model, mode, report, algo, options, list(skip or ()), bf16, reasons, quant)
+    # NEW: exact site identity avoids excluding similarly named sibling layers on replay.
+    for row in policy["bf16_opt_out"]:
+        if row["site"] in exact_bf16:
+            row["match"] = "exact"
 
     qmods = quantized_modules(model)
     skip_keys = {f"{n}.weight" for n in qmods}
@@ -634,7 +641,7 @@ def export(model: nn.Module, export_dir, *, mode: str, report: dict, algo, algo_
                        "argv": list(sys.argv), **(jsonable(extra_provenance) or {})},
         "sites": site_list,
         "counts": {s: sum(1 for x in site_list if x["status"] == s) for s in ("quantized", "host", "skipped")},
-        "new_decisions": NEW_DECISIONS,
+        "new_decisions": NEW_DECISIONS + list((getattr(algo, "recipe", None) or {}).get("new_decisions", [])),
         "pending_hardware_rulings": PENDING_RULINGS,
         "m2m_manifest_v2_aligned": "partial",
         "m2m_manifest_v2_matching_fields": M2M_V2_MATCHING,

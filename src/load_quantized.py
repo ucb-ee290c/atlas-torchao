@@ -205,6 +205,7 @@ def apply_export(model, tensors, policy, device, mode=None, options=None):
             mods[n].weight.data = w.reshape(s["weight_shape"]).to(device=device, dtype=dtype)
     skip = list(policy.get("skip", []))
     bf16 = [r["site"] for r in policy.get("bf16_opt_out", [])]
+    exact_bf16 = [r["site"] for r in policy.get("bf16_opt_out", []) if r.get("match") == "exact"]
     opts = dict(quant_modes._options_dict(options))
     if base == "chip":
         for k, v in (policy.get("runtime", {}).get("chip_options") or {}).items():
@@ -212,10 +213,11 @@ def apply_export(model, tensors, policy, device, mode=None, options=None):
                 opts[k] = v
     if bf16:
         opts["_algo_bf16"] = tuple(bf16)
+        opts["_algo_bf16_exact"] = tuple(exact_bf16)
     replay = PolicyAlgo(policy, {k: v.to(device) for k, v in tensors.items()
                                  if k.endswith(tuple(__import__("quant_export").QUANT_SUFFIXES))})
     with algos.active(replay):
-        rep = quant_modes.quantize(model, mode, skip + bf16, opts)
+        rep = quant_modes.quantize(model, mode, skip + [n for n in bf16 if n not in exact_bf16], opts)
     # the codes the modules derived must be the exported ones, bit for bit
     with torch.no_grad():
         for n, m in model.named_modules():
@@ -235,6 +237,7 @@ def apply_export(model, tensors, policy, device, mode=None, options=None):
                     m.weight_lo_norm = __import__("ref_numerics").e4m3_unpack(lo)
     rep["loaded_from_export"] = True
     rep["algo"] = {"name": "export_policy", "applied": True, "bf16_opt_out": bf16,
+                   "bf16_opt_out_exact": exact_bf16,
                    "granularity": replay.stats}
     return rep
 

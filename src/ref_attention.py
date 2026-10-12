@@ -422,14 +422,14 @@ class RefQuantConv2d(nn.Module):
         return F.linear(x_dq.to(w.dtype), w_dq.to(w.dtype))
 
 
-def quantize_conv2d(model: nn.Module, skip=(), fm_factory=None) -> dict:
+def quantize_conv2d(model: nn.Module, skip=(), fm_factory=None, exact_skip=()) -> dict:
     """Replace every nn.Conv2d (model_patcher.py:508-511) that the reference path supports:
     groups == 1 (339-343) and integer or 'valid' padding (330-337); others are reported."""
     from ref_profile import _set_module
 
     done, untouched = [], []
     for n, m in list(model.named_modules()):
-        if type(m) is not nn.Conv2d or any(s in n for s in skip):
+        if type(m) is not nn.Conv2d or n in exact_skip or any(s in n for s in skip):
             continue
         if m.groups != 1 or (isinstance(m.padding, str) and m.padding != "valid") or m.padding_mode != "zeros":
             untouched.append(n)

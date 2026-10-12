@@ -30,12 +30,25 @@ REGISTRY = {
 
 # Named recipes (NEW; docs/algos/atlas_v1.md): `--algo NAME` expands to a documented stack, and
 # NAME+other:k=v appends opt-in members (e.g. atlas_v1+mixed_precision:...). `chip` options apply
-# to the chip profiles unless the command line sets them (--chip-vadd). smoothquant runs with
-# partial=true in every recipe so that a policy's SigLIP / CLIP / DiT blocks are left unfolded and
+# to the chip profiles unless the command line sets them (--chip-vadd). In the SQ/static recipes,
+# smoothquant runs with partial=true so that a policy's SigLIP / CLIP / DiT blocks are left unfolded and
 # listed in the record (prepare: unsupported_blocks) instead of refusing the model; on a pure
 # decoder stack (TinyLlama) partial=true folds exactly what partial=false folds.
 RECIPES = {
     "atlas_v1": {
+        "spec": "gptq_awq:method=awq_gptq,actorder=true"
+                "+granularity:w=channel,a=token,rule=nc",
+        "chip": {"chip_vadd": "rn", "chip_vadd_sites": "residual"},
+        "activation_scales": "dynamic per token (run-time amax on chip)",
+        "new_decisions": ["NEW: promote run-5.x AWQ+GPTQ+granularity with residual vadd rn",
+                          "NEW: recipe declares conditional multi_task_dit exact patch_embedding "
+                          "Conv2d BF16 exception (bf16_opt_out_exact records application); "
+                          "run-5.2 ref_conv evidence only, chip result pending"],
+        "bf16_by_policy": {"multi_task_dit": [
+            "observation_encoder.vision_encoder.model.vision_model.embeddings.patch_embedding"]},
+    },
+    # Historical run-5.x atlas_v1, retained under a distinct name for replay (NEW name).
+    "atlas_v1_sq": {
         "spec": "smoothquant:alpha=0.5,po2=true,gain=false,partial=true"
                 "+gptq_awq:method=gptq,actorder=true"
                 "+granularity:w=channel,a=token,rule=nc",
@@ -43,6 +56,7 @@ RECIPES = {
         "activation_scales": "dynamic per token (run-time amax on chip)",
     },
     "atlas_v1_awq": {
+        # Historical compatibility alias: no automatic DiT exception, matching run 5.3.
         "spec": "gptq_awq:method=awq_gptq,actorder=true"
                 "+granularity:w=channel,a=token,rule=nc",
         "chip": {"chip_vadd": "rn", "chip_vadd_sites": "residual"},
@@ -160,6 +174,8 @@ def make(spec: str | None):
     if name is not None:
         st.recipe = {"name": name, "spec": rcp["spec"], "expanded": expand(spec),
                      "chip_defaults": dict(rcp["chip"]), "activation_scales": rcp["activation_scales"],
+                     "new_decisions": list(rcp.get("new_decisions", [])),
+                     "bf16_by_policy": dict(rcp.get("bf16_by_policy", {})),
                      "doc": "docs/algos/atlas_v1.md"}
     return st
 
@@ -246,6 +262,18 @@ def quantize(model, mode, skip=(), options=None, algo=None, calib=None) -> dict:
         chip_applied = {k: v for k, v in recipe["chip_defaults"].items() if opts.get(k) is None}
         options = {**opts, **chip_applied}
     bf16 = list(algo.bf16_layers(model, mode) or [])
+    # NEW: resolve the canonical recipe's exact model exception before calibration. This
+    # Conv2d is outside GPTQ/AWQ's Linear calibration/folds, and must never reach cast hooks.
+    exact_bf16 = []
+    policy_type = getattr(getattr(model, "config", None), "type", None)
+    for name in (recipe or {}).get("bf16_by_policy", {}).get(policy_type, []):
+        import torch.nn as nn
+
+        mod = dict(model.named_modules()).get(name)
+        if type(mod) is not nn.Conv2d:
+            raise ValueError(f"recipe {recipe['name']}: expected exact BF16 Conv2d {name!r}")
+        exact_bf16.append(name)
+    bf16 = list(dict.fromkeys(bf16 + exact_bf16))
     if algo.needs_calibration and calib is None:
         raise RuntimeError(f"algorithm {algo.name!r} needs calibration data and none was provided")
     loaded = []
@@ -271,15 +299,17 @@ def quantize(model, mode, skip=(), options=None, algo=None, calib=None) -> dict:
             prep[a.name] = a.prepare(model, mode)
     if bf16:
         # the chip profile labels these skips as BF16 opt-outs in its coverage report
-        options = {**quant_modes._options_dict(options), "_algo_bf16": tuple(bf16)}
+        options = {**quant_modes._options_dict(options), "_algo_bf16": tuple(bf16),
+                   "_algo_bf16_exact": tuple(exact_bf16)}
     with active(algo):
-        rep = quant_modes.quantize(model, mode, skip + bf16, options)
+        rep = quant_modes.quantize(model, mode, skip + [n for n in bf16 if n not in exact_bf16], options)
     rec = algo.record()
     base = quant_modes.PROFILES[quant_modes.canonical(mode)].base
     hooks = algo.overridden_module_hooks()
     if recipe:
         rec["recipe"] = {**recipe, "chip_options_applied": chip_applied}
     rec.update(applied=True, bf16_opt_out=bf16, prepare=prep,
+               bf16_opt_out_exact=exact_bf16,
                module_hooks=hooks, module_hooks_applied=base in ("reference", "reference_hw", "chip"))
     if hooks and not rec["module_hooks_applied"]:
         rec["module_hooks_note"] = f"{mode}: module hooks {hooks} act only in the reference modules"

@@ -302,6 +302,8 @@ def quantize_chip(model: nn.Module, skip=(), options=None) -> dict:
     n_skip = 0
     for name, m in model.named_modules():
         s = next((s for s in skip if s and s in name), None)
+        if name in (_opt(options, "_algo_bf16_exact", None) or ()):
+            s = name
         if s is not None and name:
             opt_out = s in (_opt(options, "_algo_bf16", None) or ())
             ctx_hooks(m, "skip", cc.BF16_OPT_OUT + s if opt_out else s)
@@ -335,7 +337,8 @@ def quantize_chip(model: nn.Module, skip=(), options=None) -> dict:
                       "mxu": mxu_kind,
                       "vpu": "chip_ops.ChipVPU (bit-exact to VectorRTLFunctions, 16 lanes)",
                       "rope": rope, "host_tables": tables, "entry_points": entries, "eager_attention_set": eager,
-                      "skipped_to_host": list(skip), "skip_modules": n_skip,
+                      "skipped_to_host": list(dict.fromkeys(list(skip) + list(
+                          _opt(options, "_algo_bf16_exact", None) or ()))), "skip_modules": n_skip,
                       "vpu_lut_sha256_16": chip_ops.lut_provenance()}
     if vadd is not None:
         router.vadd_record = vadd.record()

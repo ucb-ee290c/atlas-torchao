@@ -1,6 +1,7 @@
 """Named recipes atlas_v1, atlas_v1_awq and atlas_v1_static (docs/algos/atlas_v1.md): expansion,
 recorded chip defaults, explicit refusals, and one quantized forward per recipe."""
 import copy
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -10,9 +11,87 @@ from refutil import need_refs
 from test_ladder import FAST, tiny_llama
 
 IDS = torch.randint(0, 128, (1, 16), generator=torch.Generator().manual_seed(1))
-ORDERS = {"atlas_v1": ["smoothquant", "gptq_awq", "granularity"],
+ORDERS = {"atlas_v1": ["gptq_awq", "granularity"],
           "atlas_v1_awq": ["gptq_awq", "granularity"],
+          "atlas_v1_sq": ["smoothquant", "gptq_awq", "granularity"],
           "atlas_v1_static": ["smoothquant", "gptq_awq"]}
+
+DIT_PATCH = "observation_encoder.vision_encoder.model.vision_model.embeddings.patch_embedding"
+
+
+class TinyDiT(torch.nn.Module):
+    """The exact policy identity/path plus a sibling that substring skips would also exclude."""
+
+    def __init__(self, policy_type="multi_task_dit"):
+        super().__init__()
+        self.config = SimpleNamespace(type=policy_type)
+        parent = self
+        for name in DIT_PATCH.split(".")[:-1]:
+            child = torch.nn.Module()
+            parent.add_module(name, child)
+            parent = child
+        parent.patch_embedding = torch.nn.Conv2d(3, 4, 2, stride=2)
+        parent.patch_embedding_extra = torch.nn.Conv2d(3, 4, 2, stride=2)
+        self.head = torch.nn.Linear(4, 3)
+        self.to(torch.bfloat16).eval()
+
+    def forward(self, x):
+        emb = self.get_submodule(DIT_PATCH.rsplit(".", 1)[0])
+        return self.head((emb.patch_embedding(x) + emb.patch_embedding_extra(x)).mean((2, 3)))
+
+
+def dit_calib():
+    x = torch.randn(2, 3, 4, 4, dtype=torch.bfloat16,
+                    generator=torch.Generator().manual_seed(42))
+    return lambda: ([x], lambda m, b: m(b), {"source": "test", "n_samples": 2, "seed": 42})
+
+
+@pytest.mark.parametrize("policy_type,recipe,expected", [
+    ("multi_task_dit", "atlas_v1", [DIT_PATCH]),
+    ("smolvla", "atlas_v1", []),
+    ("pi0", "atlas_v1", []),
+    ("multi_task_dit", "atlas_v1_awq", []),
+])
+def test_exact_dit_exception_and_historical_alias(policy_type, recipe, expected):
+    need_refs()
+    m = TinyDiT(policy_type)
+    w0 = m.get_submodule(DIT_PATCH).weight.detach().clone()
+    a = algos.make(recipe)
+    rep = algos.quantize(m, "ref_conv", algo=a, calib=dit_calib())
+    assert rep["algo"]["bf16_opt_out"] == expected
+    assert rep["algo"]["bf16_opt_out_exact"] == expected
+    assert (type(m.get_submodule(DIT_PATCH)) is torch.nn.Conv2d) == bool(expected)
+    assert type(m.get_submodule(DIT_PATCH + "_extra")).__name__ == "RefQuantConv2d"
+    if expected:
+        assert torch.equal(m.get_submodule(DIT_PATCH).weight, w0)
+        assert all(DIT_PATCH not in member.layers for member in a.members if hasattr(member, "layers"))
+        assert rep["algo"]["recipe"]["new_decisions"]
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_dit_exception_refuses_changed_structure_before_calibration(missing):
+    m = TinyDiT()
+    emb = m.get_submodule(DIT_PATCH.rsplit(".", 1)[0])
+    if missing:
+        del emb.patch_embedding
+    else:
+        emb.patch_embedding = torch.nn.Identity()
+    def unexpected_calib():
+        pytest.fail("the exact exception must be validated before calibration")
+    with pytest.raises(ValueError, match="expected exact BF16 Conv2d"):
+        algos.quantize(m, "ref_conv", algo=algos.make("atlas_v1"), calib=unexpected_calib)
+
+
+def test_canonical_non_dit_matches_historical_awq_bit_for_bit():
+    need_refs()
+    canonical = tiny_llama(layers=2)
+    historical = copy.deepcopy(canonical)
+    for m, name in ((canonical, "atlas_v1"), (historical, "atlas_v1_awq")):
+        rep = algos.quantize(m, "ref_conv", ["lm_head"], dict(FAST),
+                             algo=algos.make(name), calib=_calib())
+        assert rep["algo"]["bf16_opt_out"] == []
+    with torch.no_grad():
+        assert torch.equal(canonical(IDS).logits, historical(IDS).logits)
 
 
 def _calib(n=2, T=12):
@@ -35,11 +114,12 @@ def test_recipe_expands_to_its_documented_stack(name):
 
 
 def test_recipe_components():
-    v1, awq, st = (algos.make(n) for n in ORDERS)
-    sq = v1.members[0]
+    v1, awq, historical, st = (algos.make(n) for n in ORDERS)
+    sq = historical.members[0]
     assert sq.alpha == 0.5 and sq.po2 and not sq.gain and not sq.static
-    assert v1.members[1].method == "gptq" and v1.members[1].actorder
-    g = v1.members[2]
+    assert v1.members[0].method == "awq_gptq" and v1.members[0].actorder
+    assert historical.members[1].method == "gptq"
+    g = v1.members[1]
     assert (g.w, g.a, g.rule) == ("channel", "token", "nc")
     assert awq.members[0].method == "awq_gptq"
     assert st.members[0].static and st.members[0].gain and st.members[1].method == "gptq"
