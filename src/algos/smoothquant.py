@@ -39,7 +39,9 @@ joint layers tie the VLM's and the expert's V; cross-attention layers feed the V
 expert's v_proj, whose columns undo the VLM fold) and Pi0 (PaliGemmaWithExpertModel: every layer is
 joint, so V is tied across PaliGemma and the expert). Any other transformer block (SigLIP / CLIP
 encoder layers, DiT blocks, ...) is not implemented: prepare raises NotImplementedError unless
-partial=true, which folds what is supported and lists every unfolded block in the record.
+partial=true, which folds what is supported and lists every unfolded block in the record. With
+partial=true and no supported layer at all, prepare folds nothing and records folded_groups: 0 and
+a warning (NEW); static=true still gives every Linear its static exponent from calibration.
 
 Parameters (`--algo smoothquant:k=v,...`):
   alpha=0.5     migration strength; `off` disables smoothing (gain only)
@@ -55,6 +57,7 @@ Parameters (`--algo smoothquant:k=v,...`):
 from __future__ import annotations
 
 import math
+import warnings as _warnings
 from collections import Counter
 
 import torch
@@ -275,9 +278,17 @@ def build_groups(model, sites, partial=False):
             f"smoothquant: folding is not implemented for {len(unsupported)} block(s) of type {kinds} "
             f"(first: {unsupported[0]}); pass partial=true to fold only the supported decoder layers "
             f"and record the rest as not folded")
+    warnings = []
     if not groups:
-        raise NotImplementedError("smoothquant: no supported decoder layers found in the model")
-    return groups, {"structures": notes, "not_folded_blocks": unsupported}
+        if not partial:
+            raise NotImplementedError("smoothquant: no supported decoder layers found in the model")
+        # NEW: partial=true on a model with nothing foldable (e.g. a DiT) is a recorded no-op, so a
+        # stack that starts with smoothquant still runs; static=true still scales every Linear.
+        warnings.append(f"smoothquant: partial=true and no supported decoder layers; nothing folded "
+                        f"({len(unsupported)} unsupported block(s) listed in not_folded_blocks)")
+        _warnings.warn(warnings[-1], stacklevel=2)
+    return groups, {"structures": notes, "not_folded_blocks": unsupported,
+                    "folded_groups": len(groups), "warnings": warnings}
 
 
 def _rel(parent, child):
