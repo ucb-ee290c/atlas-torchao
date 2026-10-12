@@ -268,3 +268,30 @@ def test_hessians_param():
     assert algos.make("gptq_awq:method=gptq,hessians=device").hessians == "device"
     with pytest.raises(ValueError, match="hessians"):
         algos.make("gptq_awq:method=gptq,hessians=gpu")
+
+
+def test_gptq_retries_dampening_on_indefinite_hessian():
+    """A slightly indefinite H (as float32 rounding can leave a large calibration sum) fails the
+    paper's 1% dampening; gptq() retries with 10x, records it, and still lands on the grid. A
+    positive-definite H is factored on the first attempt, unchanged."""
+    torch.manual_seed(0)
+    K = 32
+    Qm, _ = torch.linalg.qr(torch.randn(K, K, dtype=torch.float64))
+    eig = torch.rand(K, dtype=torch.float64) + 0.5
+    eig[0] = -0.05 * eig.mean()                     # below -1% of the mean diagonal
+    H = (Qm * eig) @ Qm.T
+    W = torch.randn(8, K)
+    s = rn.po2_scale_exp(W.abs().amax())
+    info = {}
+    Q = ga.gptq(W, H, s, block=8, info=info)
+    assert info["damp"] == pytest.approx(0.1)
+    assert torch.equal(ga.qdq(Q, s), Q)
+    good = {}
+    ga.gptq(W, (Qm * eig.abs()) @ Qm.T, s, block=8, info=good)
+    assert good["damp"] == 0.01
+
+
+def test_gptq_refuses_hopeless_hessian():
+    H = -torch.eye(16, dtype=torch.float64)
+    with pytest.raises(RuntimeError, match="not positive-definite"):
+        ga.gptq(torch.randn(4, 16), H, 0, block=4)

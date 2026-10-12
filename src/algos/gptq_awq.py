@@ -84,11 +84,19 @@ def qdq(w: torch.Tensor, s) -> torch.Tensor:
     return rn.e4m3_unpack(rn.e4m3_vpack(w, s)) * torch.exp2(s.float())
 
 
+DAMP_RETRIES = 3              # NEW: on a failed Cholesky, retry with 10x then 100x the dampening
+
+
 @torch.no_grad()
-def gptq(W: torch.Tensor, H: torch.Tensor, s, block=128, damp=0.01, actorder=True) -> torch.Tensor:
+def gptq(W: torch.Tensor, H: torch.Tensor, s, block=128, damp=0.01, actorder=True, info=None) -> torch.Tensor:
     """GPTQ Algorithm 1 (arXiv 2210.17323) with quant() = qdq(., s). W [out, in], H [in, in], s a
     scalar exponent or one per output row ([out, 1], as GPTQ's own per-row quantizer).
-    Returns the dequantized weight (float32); every entry lies on the E4M3 x 2^s grid."""
+    Returns the dequantized weight (float32); every entry lies on the E4M3 x 2^s grid.
+
+    If the dampened H cannot be factored (rounding in the float32 calibration sum can leave a
+    large, badly scaled H slightly indefinite), the factorisation is retried with 10x and then 100x
+    the dampening (NEW, as common GPTQ implementations do); `info["damp"]` records the value
+    used. The first attempt is exactly the paper's step, so a layer that factors is unchanged."""
     s = torch.as_tensor(s, dtype=torch.int32, device=W.device)
     s = s.reshape(-1) if s.dim() == 2 else s                 # one exponent per entry of a column
     W = W.detach().clone().float()
@@ -101,8 +109,23 @@ def gptq(W: torch.Tensor, H: torch.Tensor, s, block=128, damp=0.01, actorder=Tru
     if actorder:
         perm = torch.argsort(torch.diag(H), descending=True)
         W, H = W[:, perm], H[perm][:, perm]
-    H += damp * torch.mean(torch.diag(H)) * torch.eye(K, dtype=H.dtype, device=H.device)
-    Hinv = torch.linalg.cholesky(torch.cholesky_inverse(torch.linalg.cholesky(H)), upper=True).float()
+    eye = torch.eye(K, dtype=H.dtype, device=H.device)
+    mean_diag = torch.mean(torch.diag(H))
+    Hinv = None
+    for attempt in range(DAMP_RETRIES):
+        d = damp * 10 ** attempt
+        L, err = torch.linalg.cholesky_ex(H + d * mean_diag * eye)
+        if int(err) == 0:
+            U, err = torch.linalg.cholesky_ex(torch.cholesky_inverse(L), upper=True)
+            if int(err) == 0:
+                Hinv = U.float()
+                break
+    if Hinv is None:
+        raise RuntimeError(f"gptq: H is not positive-definite even with damp={d} "
+                           f"(K={K}, mean diag {float(mean_diag):.3e})")
+    if info is not None:
+        info["damp"] = d
+    del eye
     Q = torch.zeros_like(W)
     for i1 in range(0, K, block):
         i2 = min(i1 + block, K)
@@ -178,6 +201,7 @@ class GptqAwq(Algo):
         self.awq_scale = {}                         # consumer fqn -> s (folded for this mode)
         self.s0 = {}                                # fqn -> pinned exponent
         self._gptq_cache = {}
+        self.damp_raised = {}                       # fqn -> dampening a failed Cholesky retried with
         self.layers = {}                            # fqn -> what was done (per mode)
         self.s0_granularity = {}                    # fqn -> descriptor of the pinned exponent
         # weight_grid(name, w, kind) -> Scale | None: the weight-scale choice of an algorithm stacked
@@ -425,12 +449,15 @@ class GptqAwq(Algo):
                _fingerprint(s0.contiguous()))
         if key not in self._gptq_cache:
             dev = w.device                  # one layer's H moves to the weight's device (gptq())
-            if D is not None:
-                Di = (1.0 / D).to(H.device)
-                Hn = H * Di.unsqueeze(0) * Di.unsqueeze(1)
+            if D is not None:                # rescaled in float64: AWQ's 1/s spans many binades
+                Di = (1.0 / D.double()).to(H.device)
+                Hn = H.double() * Di.unsqueeze(0) * Di.unsqueeze(1)
             else:
                 Hn = H
-            wq = gptq(w, Hn, s0.to(dev), self.block, self.damp, self.actorder)
+            ginfo = {}
+            wq = gptq(w, Hn, s0.to(dev), self.block, self.damp, self.actorder, info=ginfo)
+            if ginfo.get("damp", self.damp) != self.damp:
+                self.damp_raised[name] = ginfo["damp"]
             self._gptq_cache[key] = wq.to(device=w.device, dtype=w.dtype)
         out = self._gptq_cache[key]
         if not torch.equal(qdq(out, s0), out.float()):
@@ -451,6 +478,7 @@ class GptqAwq(Algo):
         for v in self.layers.values():
             counts[v] = counts.get(v, 0) + 1
         rec["weights"] = counts
+        rec["damp_raised"] = dict(self.damp_raised)
         return rec
 
 
