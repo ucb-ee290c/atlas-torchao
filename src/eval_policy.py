@@ -39,6 +39,7 @@ from pathlib import Path
 import torch
 
 import algos
+import ckpt_keys
 from quant_modes import (ALL_MODES, add_profile_args, add_subset_compare_arg, finalize_report, ladder_deltas,
                          ladder_record, quantize, require_mode_supported, subset_compare_modes)
 
@@ -51,7 +52,11 @@ def load_policy(path, device, dtype):
     cfg = PreTrainedConfig.from_pretrained(path)
     cfg.device = device
     policy = get_policy_class(cfg.type).from_pretrained(path, config=cfg)
+    # NEW: a non-strict load leaves keys a newer library nests one level deeper (e.g. the DiT's
+    # fine-tuned CLIP) at the constructor's weights; repair the nesting or refuse (src/ckpt_keys.py).
+    key_repair = ckpt_keys.repair_checkpoint_keys(policy, path)
     policy = policy.to(device=device, dtype=dtype).eval()
+    policy.checkpoint_key_repair = key_repair
     # lerobot's SmolVLA integrates the flow in float32: the action expert output is cast to float32
     # before action_out_proj and x_t stays float32, so the action in/out projections and the
     # action-time MLP must stay float32 (bf16 there fails with a dtype mismatch). quantize() only
@@ -350,6 +355,7 @@ def main():
     rmse_dir = Path(args.rmse_dir) if args.rmse_dir else Path(args.out).with_name(Path(args.out).stem + "_rmse")
     for mode in args.modes:
         policy, cfg = load_policy(args.policy, args.device, dtype)
+        result["provenance"].setdefault("checkpoint_key_repair", policy.checkpoint_key_repair)
         rename = camera_rename_map(cfg, args.dataset, args.rename_map)
         # The saved pipelines pin device='cuda'; override it, and cast float inputs to the policy dtype.
         preprocess, postprocess = make_pre_post_processors(
