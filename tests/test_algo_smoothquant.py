@@ -323,3 +323,93 @@ def test_pi0_tiny_fold():
     assert rec["structures"] == ["pi0:paligemma_with_expert"] and rec["not_folded_blocks"]
     with torch.no_grad():
         torch.testing.assert_close(run(m1, 0), run(m0, 0), rtol=1e-3, atol=1e-4)
+
+
+# ---------------------------------------------------------------------------------------------
+# partial=true on a model with no supported decoder layers (a ViT/DiT-like stack)
+# ---------------------------------------------------------------------------------------------
+
+class FooBlock(nn.Module):
+    """A pre-LayerNorm transformer-ish block smoothquant does not fold (LayerNorm with bias)."""
+
+    def __init__(self, d=64):
+        super().__init__()
+        self.norm = nn.LayerNorm(d)
+        self.fc1 = nn.Linear(d, 2 * d)
+        self.fc2 = nn.Linear(2 * d, d)
+
+    def forward(self, x):
+        return x + self.fc2(torch.nn.functional.gelu(self.fc1(self.norm(x))))
+
+
+class FooStack(nn.Module):
+    def __init__(self, n=2, d=64):
+        super().__init__()
+        torch.manual_seed(0)
+        self.blocks = nn.ModuleList([FooBlock(d) for _ in range(n)])
+        self.head = nn.Linear(d, 8)
+
+    def forward(self, x):
+        for b in self.blocks:
+            x = b(x)
+        return self.head(x)
+
+
+def _feats(seed=1, n=2):
+    g = torch.Generator().manual_seed(seed)
+    return [torch.randn(1, 16, 64, generator=g) * 3 for _ in range(n)]
+
+
+def test_no_supported_layers_refused_without_partial():
+    with pytest.raises(NotImplementedError, match="FooBlock"):
+        _fold(FooStack(), _feats())
+    # nothing unsupported either: the refusal names the missing decoder layers
+    with pytest.raises(NotImplementedError, match="no supported decoder layers"):
+        sq.build_groups(nn.Sequential(nn.Linear(2, 2)), sq.SITES)
+
+
+def test_no_supported_layers_partial_is_a_recorded_no_op():
+    m = FooStack()
+    before = copy.deepcopy(m.state_dict())
+    with pytest.warns(UserWarning, match="nothing folded"):
+        algo, rec = _fold(m, _feats(), partial="true")
+    assert rec["folded_groups"] == 0 and rec["groups"] == {}
+    assert rec["not_folded_blocks"] == ["blocks.0 (FooBlock)", "blocks.1 (FooBlock)"]
+    assert rec["warnings"] and "nothing folded" in rec["warnings"][0]
+    assert rec["gain"]["exp_histogram"] == {} and rec["static_act_scales"] == 0
+    after = m.state_dict()
+    assert all(torch.equal(before[k], after[k]) for k in before)
+
+
+def test_no_supported_layers_partial_static_scales_every_linear():
+    m = FooStack()
+    with pytest.warns(UserWarning, match="nothing folded"):
+        algo, rec = _fold(m, _feats(), partial="true", static="true")
+    linears = {n for n, x in m.named_modules() if isinstance(x, nn.Linear)}
+    assert rec["static_act_scales"] == len(linears) == 5
+    assert set(algo._static_exp) == linears
+    import ref_numerics as rn
+    for n in linears:   # no fold: the exponent comes straight from the calibrated maximum
+        assert torch.equal(algo._static_exp[n], rn.po2_scale_exp(algo._amax[n].max().reshape(())))
+    s = algo.act_scale("blocks.0.fc1", torch.zeros(1), "linear")
+    assert s is not None and s.dynamic is False
+
+
+@pytest.mark.parametrize("mode", ["ref_linear", "chip"])
+def test_no_supported_layers_partial_profile_path_runs(mode):
+    """Through algos.quantize: prepare is a no-op, the quantization after it still runs, and the
+    static scales reach the reference modules."""
+    need_refs()
+    m = FooStack().to(torch.bfloat16)
+    feats = [f.to(torch.bfloat16) for f in _feats()]
+    algo = algos.make("smoothquant:partial=true,static=true")
+    calib = lambda: (feats, _run, {"source": "test", "n_samples": 2, "seed": 1})   # noqa: E731
+    with pytest.warns(UserWarning, match="nothing folded"):
+        rep = algos.quantize(m, mode, [], dict(FAST), algo=algo, calib=calib)
+    prep = rep["algo"]["prepare"]
+    assert prep["folded_groups"] == 0 and prep["static_act_scales"] == 5
+    with torch.no_grad():
+        y = m(feats[0])
+    assert torch.isfinite(y).all()
+    # the activation record fills in during the forward
+    assert rep["algo"]["granularity"]["activation"] == {"linear:static_per_tensor(smoothquant)": 5}

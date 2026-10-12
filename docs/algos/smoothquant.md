@@ -61,6 +61,13 @@ only the supported decoder layers; the record then lists every unfolded block un
 `not_folded_blocks`. SmolVLA and Pi0 currently need `partial=true`, because their vision towers are
 SigLIP.
 
+A model with no supported decoder layer at all (e.g. the Multi-Task DiT: CLIP encoders and DiT
+blocks only) is refused without `partial=true`. With `partial=true` smoothquant is a recorded
+no-op (NEW): nothing is folded, every unsupported block is listed in `not_folded_blocks`, the record
+has `folded_groups: 0` and a `warnings` entry, and a Python warning is raised. With `static=true`
+every Linear still gets its static exponent from its calibrated input maximum (no fold divides it),
+and the quantization (and any algorithm after smoothquant) runs as usual.
+
 Planned folds (phase-1 design, handoff smoothquant.md):
 - **SigLIP/CLIP:** γ and β divided by s; v rows and v bias.
 - **DiT:** adaLN shift rows divided by s; scale rows W/s with b' = (1+b)/s − 1.
