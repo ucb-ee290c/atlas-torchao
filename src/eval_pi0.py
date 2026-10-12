@@ -188,6 +188,7 @@ def build_parser():
     algos.add_args(ap, calib_sources=("auto", "droid", "dummy", "mxu_dummy"))
     add_profile_args(ap)
     add_subset_compare_arg(ap)
+    __import__("quant_export").add_args(ap)
     return ap
 
 
@@ -608,19 +609,44 @@ def main(argv=None):
               "(reduced_steps: true in the JSON)", flush=True)
 
     calib_cache = []
+    import quant_export
+
+    export_mode = quant_export.check_args(ap, args)
+    prov = provenance(args, openpi)
+    exported = {}
 
     def build(mode):
         model = pi0_model.load_model(rt, args.config, args.checkpoint_dir, args.device)
         inv = inventory(model)
         calib = lambda: calibration(args, rt, cfg, model, frames, calib_cache)  # noqa: E731
-        layers = (algos.quantize(model, mode, args.skip, options=args, algo=algo, calib=calib)
-                  if mode != "bf16" else None)
+        if args.from_export and mode != "bf16":
+            import load_quantized
+
+            # no calibration; every exported tensor overwrites the checkpoint's (docs/algos/export.md)
+            _, layers, _man = load_quantized.load_quantized(None, args.from_export, args.device,
+                                                            build=lambda: model, mode=mode, options=args)
+        else:
+            layers = (algos.quantize(model, mode, args.skip, options=args, algo=algo, calib=calib)
+                      if mode != "bf16" else None)
+        if mode == export_mode and not exported:
+            exported.update(quant_export.export(
+                model, args.export_dir, mode=mode, report=layers, algo=algo, algo_spec=args.algo,
+                options=args, skip=args.skip, device=args.device,
+                model_record={"kind": "pi0", "cli": "src/eval_pi0.py", "config": args.config,
+                              "checkpoint": prov.get("checkpoint")},
+                calib_batches=[fr["obs"] for fr in calib_cache[0][0]] if calib_cache else None,
+                calib_record=calib_cache[0][1] if calib_cache else None,
+                extra_provenance={"openpi": prov.get("openpi"), "obs": args.obs,
+                                  "norm_stats": prov.get("norm_stats"), "tokenizer": prov.get("tokenizer")}))
         policy = (pi0_model.make_policy(rt, model, args.device, args.config, args.norm_stats_dir,
                                         args.tokenizer_path) if level == "policy" else None)
         return model, inv, layers, policy
 
     out = Path(args.out)
-    result = {"model": "pi0", "provenance": provenance(args, openpi), "determinism_state": determinism_state(),
+    if args.export_only:
+        build(export_mode)                       # quantize, export, evaluate nothing
+        return
+    result = {"model": "pi0", "provenance": prov, "determinism_state": determinism_state(),
               "data": data_record(args, frames, level, cfg.action_horizon), "new_decisions": NEW_DECISIONS}
     result.update(evaluate(args, frames, build, level, cfg.action_horizon, cfg.action_dim, out))
     write_result(args, result, out)

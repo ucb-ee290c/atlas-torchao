@@ -102,6 +102,9 @@ def main():
     add_profile_args(ap)
     add_subset_compare_arg(ap)
     algos.add_args(ap, calib_sources=("wikitext2_train",))
+    import quant_export
+
+    quant_export.add_args(ap)
     args = ap.parse_args()
     try:
         algo = algos.make(args.algo)
@@ -115,6 +118,10 @@ def main():
             require_mode_supported(m, args.device)
         except RuntimeError as e:
             ap.error(str(e))
+    export_mode = quant_export.check_args(ap, args)
+    if args.export_only:
+        # quantize the exported mode, write the export, evaluate nothing
+        args.modes, added, args.rmse, args.kl = [export_mode], [], False, False
     if args.rmse and not (args.rmse_dir or args.out):
         ap.error("--rmse needs --rmse-dir or --out")
     rmse_dir = Path(args.rmse_dir) if args.rmse_dir else (
@@ -124,7 +131,9 @@ def main():
               "gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else None,
               "protocol": args.protocol, "ppl": {}, "layers": {}, "ladder": {}, "algo": {},
               "subset_compare": {"enabled": bool(added) or None, "added_modes": added}}
-    if args.protocol == "mxq":
+    if args.export_only:
+        result["windows"] = 0
+    elif args.protocol == "mxq":
         windows, picked = load_mxq_windows(args.model, args.seqlen, args.nsamples,
                                            None if args.sequential else args.seed)
         result.update(windows=windows.shape[0], window_indices=picked, per_sample={})
@@ -158,10 +167,30 @@ def main():
         kl_ref = load_llama(args.model, seqlen=args.seqlen, device=args.device)  # the bf16 reference
         result["kl"] = {}
     for mode in args.modes:
-        model = load_llama(args.model, seqlen=args.seqlen, device=args.device)  # fresh weights per mode
-        if mode != "bf16":
+        if args.from_export and mode != "bf16":
+            import load_quantized
+
+            # no calibration, no float weights of the quantized layers (docs/algos/export.md)
+            model, result["layers"][mode], man = load_quantized.load_quantized(
+                args.model, args.from_export, args.device, mode=mode, options=args, seqlen=args.seqlen)
+            result["from_export"] = {"dir": args.from_export, "files": man["files"],
+                                     "exported_mode": man["exported_mode"], "algo": man["recipe"]["algo"]}
+        else:
+            model = load_llama(args.model, seqlen=args.seqlen, device=args.device)  # fresh weights per mode
+        if mode != "bf16" and not args.from_export:
             result["layers"][mode] = algos.quantize(model, mode, skip=["lm_head"], options=args,
                                                     algo=algo, calib=calib)
+        if mode == export_mode and "export" not in result:
+            man = quant_export.export(
+                model, args.export_dir, mode=mode, report=result["layers"][mode], algo=algo,
+                algo_spec=args.algo, options=args, skip=["lm_head"], device=args.device,
+                model_record={"kind": "causal_lm", "cli": "src/eval.py", "id": args.model, "seqlen": args.seqlen,
+                              "checkpoint": quant_export.checkpoint_record(args.model)},
+                calib_batches=calib_cache[0][0] if calib_cache else None,
+                calib_record=calib_cache[0][1] if calib_cache else None)
+            result["export"] = {"dir": args.export_dir, "mode": mode, "files": man["files"]}
+            if args.export_only:
+                break
         result["algo"][mode] = algos.entry_record(result["layers"].get(mode), mode, args.algo)
         result["ladder"][mode] = (result["layers"][mode]["ladder"] if mode != "bf16"
                                   else ladder_record("bf16", {}, args))
