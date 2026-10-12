@@ -296,6 +296,7 @@ def build_parser():
     add_profile_args(ap)
     add_subset_compare_arg(ap)
     algos.add_args(ap, calib_sources=("non_eval_episodes",))
+    __import__("quant_export").add_args(ap)
     return ap
 
 
@@ -339,6 +340,11 @@ def main():
         args.modes = ["bf16", *args.modes]  # every FP8 mode is compared against it
     # the frames are always a sample, so a subset profile gets ref_conv on the same frames
     args.modes, added = subset_compare_modes(args.modes, args.subset_compare == "on")
+    import quant_export
+
+    export_mode = quant_export.check_args(ap, args)
+    if args.export_only:
+        args.modes, added, args.rmse = [export_mode], [], False   # quantize, export, evaluate nothing
 
     from lerobot.policies.factory import make_pre_post_processors
 
@@ -358,14 +364,36 @@ def main():
                 "device_processor": {"device": args.device, "float_dtype": args.dtype},
                 "rename_observations_processor": {"rename_map": rename}},
             postprocessor_overrides={"device_processor": {"device": "cpu"}})
-        if ref is None:
+        if ref is None and not args.export_only:
             ds, meta, test_eps, idx = make_data(cfg, args.dataset, args.n_test_episodes,
                                                 args.n_frames, args.seed)
             result["data"] = {"dataset": args.dataset, "test_episodes": test_eps,
                               "frames": len(idx), "fps": meta.fps}
         calib = _calib_loader(calib_cache, args, cfg, preprocess)
-        layers = (algos.quantize(policy, mode, args.skip, options=args, algo=algo, calib=calib)
-                  if mode != "bf16" else None)
+        if args.from_export and mode != "bf16":
+            import load_quantized
+
+            # no calibration; every exported tensor overwrites the checkpoint's (docs/algos/export.md)
+            _, layers, man = load_quantized.load_quantized(args.policy, args.from_export, args.device,
+                                                           build=lambda: policy, mode=mode, options=args)
+            result["from_export"] = {"dir": args.from_export, "files": man["files"],
+                                     "exported_mode": man["exported_mode"], "algo": man["recipe"]["algo"]}
+        else:
+            layers = (algos.quantize(policy, mode, args.skip, options=args, algo=algo, calib=calib)
+                      if mode != "bf16" else None)
+        if mode == export_mode and "export" not in result:
+            man = quant_export.export(
+                policy, args.export_dir, mode=mode, report=layers, algo=algo, algo_spec=args.algo,
+                options=args, skip=args.skip, device=args.device,
+                model_record={"kind": "lerobot_policy", "cli": "src/eval_policy.py", "id": args.policy,
+                              "dtype": args.dtype, "checkpoint": quant_export.checkpoint_record(args.policy)},
+                calib_batches=calib_cache[0][0] if calib_cache else None,
+                calib_record=calib_cache[0][1] if calib_cache else None,
+                extra_provenance={"lerobot_dataset": args.dataset, "n_test_episodes": args.n_test_episodes,
+                                  "eval_seed": args.seed})
+            result["export"] = {"dir": args.export_dir, "mode": mode, "files": man["files"]}
+            if args.export_only:
+                break
         algo_rec = algos.entry_record(layers, mode, args.algo)
         eq = layers["ladder"].get("equivalent_to") if layers is not None else None
         if eq in result["modes"]:
