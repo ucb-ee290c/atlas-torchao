@@ -1,0 +1,768 @@
+{
+  "schema_version": 1,
+  "evidence": {
+    "kind": "user_reported_gpu_results",
+    "reported_date": "2026-10-12",
+    "gpu": "L40S",
+    "queue_status": "ALL DONE at 09:18",
+    "original_jsons_locally_verified": false,
+    "hardware_execution_validated": false
+  },
+  "selection": {
+    "default": "atlas_v1",
+    "source_candidate": "atlas_v1_awq",
+    "components": [
+      "AWQ",
+      "GPTQ",
+      "granularity:token/channel,nc",
+      "vadd:rn"
+    ],
+    "fallback": "atlas_v1_static",
+    "new_choices": [
+      "NEW: canonical AWQ composite",
+      "NEW: DiT BF16 patch embedding exception",
+      "NEW: granularity_rescale",
+      "NEW: vadd=rn",
+      "NEW: CPU Hessians",
+      "NEW: recorded Cholesky damping retry"
+    ],
+    "dit_exception": "observation_encoder.vision_encoder.model.vision_model.embeddings.patch_embedding",
+    "canonical_dit_export_status": "passed: full-checkpoint export and eight-frame round trip at 5ff028ee58b28606873278236a379dcc09339b82",
+    "canonical_dit_chip_status": "unmeasured benchmark gap; not a release export gate"
+  },
+  "source_commits": {
+    "run5": "0447807",
+    "run5.1": "46b0b1d",
+    "run5.2_atlas": "4ab3889",
+    "run5.2_dit": "3baa5d6",
+    "run5.3": "a30779b",
+    "release": "5ff028ee58b28606873278236a379dcc09339b82"
+  },
+  "candidate_names": {
+    "atlas_v1": "historical SmoothQuant candidate, not the renamed release default",
+    "atlas_v1_awq": "historical AWQ candidate selected for release",
+    "atlas_v1_static": "static fallback"
+  },
+  "noise_qualifications": [
+    "Floors are supplied 2 sigma spread thresholds, not formal significance tests.",
+    "TinyLlama pt unit is unresolved between raw perplexity points and percentage points of bf16-normalized perplexity increase; retain supplied classifications as reported.",
+    "TinyLlama original noise protocol uses 40 mxq windows; current reference uses 166 and chip uses 4.",
+    "Pi0 original noise protocol specifies 32 observations; current headline evaluation uses 5.",
+    "DiT floor is transferred from a separate harness with different bf16 ground-truth MSE."
+  ],
+  "tinyllama": {
+    "metric": "perplexity",
+    "reference_windows": 166,
+    "chip_windows": 4,
+    "chip_protocol": "mxq",
+    "calibration": "16 WikiText-2 train windows",
+    "bf16": {
+      "reference": 7.9745,
+      "chip_sample": 8.056
+    },
+    "noise_2sigma": {
+      "reference": 0.077,
+      "chip": 0.244,
+      "unit_reported": "pt",
+      "unit_resolved": false
+    },
+    "evaluated_layers": [
+      154,
+      154
+    ],
+    "rows": [
+      {
+        "recipe": "none",
+        "reference": 8.1067,
+        "chip_sample_reference": 8.2092,
+        "chip": 8.2559,
+        "reference_bf16_increase_pct_reported": 1.66,
+        "chip_sample_reference_bf16_increase_pct_reported": 1.9,
+        "chip_bf16_increase_pct_reported": 2.48,
+        "chip_kl": 0.0259,
+        "chip_top1_pct": 92.4,
+        "minutes_reference_chip": [
+          18,
+          136
+        ]
+      },
+      {
+        "recipe": "atlas_v1",
+        "reference": 8.0662,
+        "chip_sample_reference": 8.1756,
+        "chip": 8.1921,
+        "reference_bf16_increase_pct_reported": 1.15,
+        "chip_sample_reference_bf16_increase_pct_reported": 1.48,
+        "chip_bf16_increase_pct_reported": 1.69,
+        "reference_vs_none_normalized_pp_reported": -0.51,
+        "chip_vs_none_normalized_pp_reported": -0.79,
+        "reference_above_floor_reported": true,
+        "chip_above_floor_reported": true,
+        "chip_kl": 0.0174,
+        "chip_top1_pct": 93.8,
+        "minutes_reference_chip": [
+          26,
+          125
+        ]
+      },
+      {
+        "recipe": "atlas_v1_awq",
+        "reference": 8.066,
+        "chip_sample_reference": 8.1523,
+        "chip": 8.1444,
+        "reference_bf16_increase_pct_reported": 1.15,
+        "chip_sample_reference_bf16_increase_pct_reported": 1.19,
+        "chip_bf16_increase_pct_reported": 1.1,
+        "reference_vs_none_normalized_pp_reported": -0.51,
+        "chip_vs_none_normalized_pp_reported": -1.38,
+        "reference_above_floor_reported": true,
+        "chip_above_floor_reported": true,
+        "chip_kl": 0.0169,
+        "chip_top1_pct": 93.8,
+        "minutes_reference_chip": [
+          22,
+          129
+        ]
+      },
+      {
+        "recipe": "atlas_v1_static",
+        "reference": 8.0731,
+        "chip_sample_reference": 8.1661,
+        "chip": 8.1461,
+        "reference_bf16_increase_pct_reported": 1.24,
+        "chip_sample_reference_bf16_increase_pct_reported": 1.37,
+        "chip_bf16_increase_pct_reported": 1.12,
+        "reference_vs_none_normalized_pp_reported": -0.42,
+        "chip_vs_none_normalized_pp_reported": -1.36,
+        "reference_above_floor_reported": true,
+        "chip_above_floor_reported": true,
+        "chip_kl": 0.0173,
+        "chip_top1_pct": 94.1,
+        "minutes_reference_chip": [
+          26,
+          130
+        ]
+      }
+    ],
+    "derived_awq_vs_none_raw_ppl": -0.1115,
+    "derived_awq_vs_smoothquant_raw_ppl": -0.0477,
+    "derived_awq_vs_smoothquant_normalized_pp": -0.5921052632,
+    "awq_vs_smoothquant_above_floor": "depends on unresolved floor unit"
+  },
+  "smolvla": {
+    "metric": "action relative L2 vs bf16",
+    "bf16": 0,
+    "reference_frames": 200,
+    "chip_frames": 32,
+    "calibration": "32 frames from non-test episodes",
+    "evaluated_layers": [
+      303,
+      303
+    ],
+    "noise_2sigma": {
+      "reference": 0.0095,
+      "chip": 0.02
+    },
+    "rows": [
+      {
+        "recipe": "none",
+        "reference": 0.1519,
+        "chip_sample_reference": 0.1458,
+        "chip": 0.1908,
+        "minutes_reference_chip": [
+          45,
+          429
+        ]
+      },
+      {
+        "recipe": "atlas_v1",
+        "reference": 0.1243,
+        "chip_sample_reference": 0.1361,
+        "chip": 0.1618,
+        "reference_vs_none": -0.0276,
+        "chip_vs_none": -0.029,
+        "reference_above_floor": true,
+        "chip_above_floor": true,
+        "minutes_reference_chip": [
+          54,
+          411
+        ]
+      },
+      {
+        "recipe": "atlas_v1_awq",
+        "reference": 0.1271,
+        "chip_sample_reference": 0.1327,
+        "chip": 0.1459,
+        "reference_vs_none": -0.0248,
+        "chip_vs_none": -0.0449,
+        "reference_above_floor": true,
+        "chip_above_floor": true,
+        "minutes_reference_chip": [
+          66,
+          430
+        ]
+      },
+      {
+        "recipe": "atlas_v1_static",
+        "reference": 0.1251,
+        "chip_sample_reference": 0.1257,
+        "chip": 0.1796,
+        "reference_vs_none": -0.0268,
+        "chip_vs_none": -0.0112,
+        "reference_above_floor": true,
+        "chip_above_floor": false,
+        "minutes_reference_chip": [
+          72,
+          449
+        ]
+      }
+    ],
+    "derived_awq_vs_smoothquant_chip": -0.0159,
+    "awq_vs_smoothquant_above_floor": false
+  },
+  "pi0": {
+    "metric": "absolute action relative L2 vs bf16",
+    "secondary_metric": "delta-space action relative L2 vs bf16",
+    "bf16": 0,
+    "observations": 5,
+    "seed": 0,
+    "calibration": "8 DROID observations from episodes not evaluated",
+    "evaluated_layers": [
+      420,
+      420
+    ],
+    "noise_2sigma_absolute": {
+      "reference": 0.0056,
+      "chip": 0.0027
+    },
+    "rows": [
+      {
+        "recipe": "none",
+        "commit": "0447807",
+        "reference": 0.012,
+        "reference_delta": 0.106,
+        "chip": 0.0144,
+        "chip_delta": 0.127,
+        "peak_gpu_gb": 23,
+        "minutes": 327
+      },
+      {
+        "recipe": "atlas_v1",
+        "commit": "46b0b1d",
+        "reference": 0.0081,
+        "reference_delta": 0.071,
+        "chip": 0.01,
+        "chip_delta": 0.088,
+        "reference_vs_none": -0.0039,
+        "chip_vs_none": -0.0044,
+        "reference_above_floor_reported": false,
+        "chip_above_floor_reported": true,
+        "damp_raised": [],
+        "peak_gpu_gb": 32.8,
+        "minutes": 378
+      },
+      {
+        "recipe": "atlas_v1_awq",
+        "commit": "a30779b",
+        "reference": 0.0066,
+        "reference_delta": 0.058,
+        "chip": 0.0076,
+        "chip_delta": 0.067,
+        "reference_vs_none": -0.0054,
+        "chip_vs_none": -0.0068,
+        "reference_above_floor_reported": false,
+        "chip_above_floor_reported": true,
+        "damp_raised": [
+          {
+            "layer_suffix": "language_model.layers.6.mlp.down_proj",
+            "damp": 0.1
+          }
+        ],
+        "peak_gpu_gb": 36.5,
+        "minutes": 357
+      },
+      {
+        "recipe": "atlas_v1_static",
+        "commit": "46b0b1d",
+        "reference": 0.0106,
+        "reference_delta": 0.093,
+        "chip": 0.0082,
+        "chip_delta": 0.072,
+        "reference_vs_none": -0.0014,
+        "chip_vs_none": -0.0062,
+        "reference_above_floor_reported": false,
+        "chip_above_floor_reported": true,
+        "damp_raised": [],
+        "peak_gpu_gb": 32.8,
+        "minutes": 389
+      }
+    ],
+    "derived_awq_vs_smoothquant_chip": -0.0024,
+    "awq_vs_smoothquant_above_floor": false
+  },
+  "dit_recipe_harness": {
+    "commit": "4ab3889",
+    "frames": 200,
+    "episodes": [
+      136,
+      363,
+      380,
+      464,
+      474
+    ],
+    "checkpoint_key_repair_remapped": 395,
+    "bf16_gt_mse": 0.01822,
+    "noise_2sigma_rel_l2_other_harness": 0.0559,
+    "evaluated_layers": [
+      179,
+      179
+    ],
+    "chip_rows": null,
+    "rows": [
+      {
+        "recipe": "none",
+        "reference_rel_l2": 0.1572,
+        "cosine": 0.9876,
+        "gt_mse": 0.0189,
+        "bf16_optouts": 0,
+        "minutes": 82
+      },
+      {
+        "recipe": "atlas_v1",
+        "reference_rel_l2": 0.1394,
+        "vs_none": -0.0178,
+        "above_floor": false,
+        "cosine": 0.9902,
+        "gt_mse": 0.02025,
+        "bf16_optouts": 0,
+        "minutes": 122
+      },
+      {
+        "recipe": "atlas_v1_awq",
+        "reference_rel_l2": 0.1394,
+        "vs_none": -0.0178,
+        "above_floor": false,
+        "cosine": 0.9902,
+        "gt_mse": 0.02025,
+        "bf16_optouts": 0,
+        "minutes": 149
+      },
+      {
+        "recipe": "atlas_v1_static",
+        "reference_rel_l2": 0.1514,
+        "vs_none": -0.0058,
+        "above_floor": false,
+        "cosine": 0.9885,
+        "gt_mse": 0.01955,
+        "bf16_optouts": 0,
+        "minutes": 130
+      },
+      {
+        "recipe": "atlas_v1+patch_embed_bf16",
+        "reference_rel_l2": 0.0883,
+        "vs_none": -0.0689,
+        "above_floor": true,
+        "cosine": 0.9961,
+        "gt_mse": 0.01828,
+        "bf16_optouts": 1,
+        "minutes": 148
+      }
+    ],
+    "smoothquant_awq_bit_identical": true,
+    "smoothquant_folded": [],
+    "awq_folded": [],
+    "patch_incremental_improvement": 0.0511,
+    "patch_incremental_above_floor": false,
+    "canonical_composite_result_status": "historical 200-frame reference result inferred from candidate equivalence; canonical export separately verified on eight frames"
+  },
+  "dit_separate_harness": {
+    "commit": "3baa5d6",
+    "checkpoint_key_repair_remapped": 395,
+    "rows": [
+      {
+        "experiment": "A_s0",
+        "episodes": [
+          136,
+          363,
+          380,
+          464,
+          474
+        ],
+        "mode": "ref_conv",
+        "frames": 200,
+        "rel_l2": 0.1475,
+        "continuous": 0.1021,
+        "gripper_sign_pct": 99.31,
+        "cosine": 0.9891,
+        "bf16_gt_mse": 0.01639,
+        "gt_mse": 0.0168,
+        "minutes": 426
+      },
+      {
+        "experiment": "A_s1",
+        "episodes": [
+          34,
+          65,
+          89,
+          142,
+          295
+        ],
+        "mode": "ref_conv",
+        "frames": 200,
+        "rel_l2": 0.1797,
+        "continuous": 0.1226,
+        "gripper_sign_pct": 98.91,
+        "cosine": 0.9838,
+        "bf16_gt_mse": 0.02682,
+        "gt_mse": 0.03205,
+        "minutes": 424
+      },
+      {
+        "experiment": "A_s2",
+        "episodes": [
+          74,
+          291,
+          352,
+          425,
+          578
+        ],
+        "mode": "ref_conv",
+        "frames": 200,
+        "rel_l2": 0.2031,
+        "continuous": 0.1411,
+        "gripper_sign_pct": 98.66,
+        "cosine": 0.9792,
+        "bf16_gt_mse": 0.0207,
+        "gt_mse": 0.02104,
+        "minutes": 426
+      },
+      {
+        "experiment": "B1_conv_only",
+        "mode": "ref_conv",
+        "frames": 200,
+        "rel_l2": 0.1427,
+        "continuous": 0.0826,
+        "gripper_sign_pct": 99.31,
+        "cosine": 0.9898,
+        "bf16_gt_mse": 0.01639,
+        "gt_mse": 0.01831,
+        "minutes": 24
+      },
+      {
+        "experiment": "B2_no_conv",
+        "mode": "ref_conv",
+        "frames": 200,
+        "rel_l2": 0.1348,
+        "continuous": 0.085,
+        "gripper_sign_pct": 99.41,
+        "cosine": 0.9909,
+        "bf16_gt_mse": 0.01639,
+        "gt_mse": 0.01572,
+        "minutes": 424
+      },
+      {
+        "experiment": "B3_IPT_dit_heads",
+        "frames": 32,
+        "modes": [
+          "ref_conv",
+          "reference_hw"
+        ],
+        "rel_l2": [
+          0.1224,
+          0.1586
+        ],
+        "continuous": [
+          0.0434,
+          0.0604
+        ],
+        "gripper_sign_pct": [
+          99.41,
+          99.02
+        ],
+        "cosine": [
+          0.9925,
+          0.9873
+        ],
+        "bf16_gt_mse": 0.016,
+        "gt_mse": [
+          0.0197,
+          0.0198
+        ],
+        "minutes": 523,
+        "derived_paired_rel_l2_increase": 0.0362
+      },
+      {
+        "experiment": "B4_SA_dit_heads",
+        "frames": 14,
+        "modes": [
+          "ref_conv",
+          "reference_hw"
+        ],
+        "rel_l2": [
+          0.1609,
+          0.2853
+        ],
+        "continuous": [
+          0.069,
+          0.1693
+        ],
+        "gripper_sign_pct": [
+          99.11,
+          97.32
+        ],
+        "cosine": [
+          0.987,
+          0.9585
+        ],
+        "bf16_gt_mse": 0.0248,
+        "gt_mse": [
+          0.0304,
+          0.0438
+        ],
+        "minutes": 659,
+        "derived_paired_rel_l2_increase": 0.1244
+      }
+    ],
+    "setA": {
+      "rel_l2_mean": 0.1768,
+      "rel_l2_std": 0.0279,
+      "rel_l2_2sigma": 0.0559,
+      "continuous_mean": 0.1219,
+      "continuous_std": 0.0195,
+      "continuous_2sigma": 0.039,
+      "gripper_sign_pct_mean": 98.96,
+      "gripper_sign_pct_std": 0.33,
+      "gripper_sign_pct_2sigma": 0.66
+    },
+    "worst_local_rel_rmse": {
+      "ipt": [
+        {
+          "layer": "blocks.3.attn.qk_pv",
+          "value": 0.048
+        },
+        {
+          "layer": "blocks.5.mlp.0",
+          "value": 0.037
+        },
+        {
+          "layer": "blocks.1.attn.out_proj",
+          "value": 0.036
+        },
+        {
+          "layer": "input_proj",
+          "value": 0.036
+        }
+      ],
+      "sa_adaln_all_six_range": [
+        0.178,
+        0.202
+      ],
+      "sa_worst_adaln_block": 5,
+      "sa_next_layer": {
+        "layer": "blocks.0.mlp.2",
+        "value": 0.057
+      }
+    },
+    "conv_dominance_claim_holds": false,
+    "sa_adaln_issue_holds": true,
+    "ipt_sa_output_comparison": "unequal frame subsets; use within-job paired increases"
+  },
+  "exports": {
+    "commit": "a30779b",
+    "count": 12,
+    "all_roundtrip_bit_identical": true,
+    "all_manifest_sha256_checks_reported_ok": true,
+    "all_bf16_optouts": 0,
+    "roundtrip_sample_sizes": {
+      "tinyllama_windows": 2,
+      "smolvla_frames": 8,
+      "multitask_dit_frames": 8,
+      "pi0_observations": 32
+    },
+    "pi0_calibration_note": "from-export uses export n-obs because calibration follows evaluation observations",
+    "full_manifest_hashes_available_here": false,
+    "original_full_hashes_path": "results/l40s-run-5.3/exports_summary.json",
+    "historical_dit_exports_match_new_canonical_recipe": false,
+    "rows": [
+      {
+        "model": "tinyllama",
+        "recipe": "atlas_v1",
+        "size_mib": 1176,
+        "sites": 176,
+        "skipped": 1,
+        "manifest_sha256_prefix": "2251a5c12c4acd4c"
+      },
+      {
+        "model": "tinyllama",
+        "recipe": "atlas_v1_awq",
+        "size_mib": 1176,
+        "sites": 176,
+        "skipped": 1,
+        "manifest_sha256_prefix": "f119d777aca6b37f"
+      },
+      {
+        "model": "tinyllama",
+        "recipe": "atlas_v1_static",
+        "size_mib": 1174.5,
+        "sites": 176,
+        "skipped": 1,
+        "manifest_sha256_prefix": "9da10555d25bfc03"
+      },
+      {
+        "model": "smolvla",
+        "recipe": "atlas_v1",
+        "size_mib": 477.3,
+        "sites": 317,
+        "skipped": 0,
+        "manifest_sha256_prefix": "fae66f572702d0cb"
+      },
+      {
+        "model": "smolvla",
+        "recipe": "atlas_v1_awq",
+        "size_mib": 477.3,
+        "sites": 317,
+        "skipped": 0,
+        "manifest_sha256_prefix": "d34116e56b0608f7"
+      },
+      {
+        "model": "smolvla",
+        "recipe": "atlas_v1_static",
+        "size_mib": 475.9,
+        "sites": 317,
+        "skipped": 0,
+        "manifest_sha256_prefix": "a292c0d7da57cc9b"
+      },
+      {
+        "model": "multitask_dit",
+        "recipe": "atlas_v1",
+        "size_mib": 264,
+        "sites": 204,
+        "skipped": 0,
+        "manifest_sha256_prefix": "457d394daa2b336b"
+      },
+      {
+        "model": "multitask_dit",
+        "recipe": "atlas_v1_awq",
+        "size_mib": 264,
+        "sites": 204,
+        "skipped": 0,
+        "manifest_sha256_prefix": "6315d1f61111b66f"
+      },
+      {
+        "model": "multitask_dit",
+        "recipe": "atlas_v1_static",
+        "size_mib": 263.3,
+        "sites": 204,
+        "skipped": 0,
+        "manifest_sha256_prefix": "539670ac0fd24240"
+      },
+      {
+        "model": "pi0",
+        "recipe": "atlas_v1",
+        "size_mib": 4099.7,
+        "sites": 484,
+        "skipped": 2,
+        "manifest_sha256_prefix": "b6990f2b6908aff2"
+      },
+      {
+        "model": "pi0",
+        "recipe": "atlas_v1_awq",
+        "size_mib": 4099.7,
+        "sites": 484,
+        "skipped": 2,
+        "manifest_sha256_prefix": "f3f765c662bf789f"
+      },
+      {
+        "model": "pi0",
+        "recipe": "atlas_v1_static",
+        "size_mib": 4095.1,
+        "sites": 484,
+        "skipped": 2,
+        "manifest_sha256_prefix": "09c516f2172a732c"
+      }
+    ]
+  },
+  "reported_tests": [
+    {
+      "tag": "5",
+      "suite": "full",
+      "passed": 446,
+      "failed": 0,
+      "skipped": 22
+    },
+    {
+      "tag": "5.1",
+      "suite": "GPTQ files",
+      "passed": 26,
+      "failed": 0,
+      "skipped": 0
+    },
+    {
+      "tag": "5.2",
+      "suite": "at-v1.2 full",
+      "passed": 489,
+      "failed": 0,
+      "skipped": 23
+    },
+    {
+      "tag": "5.2",
+      "suite": "multitask-dit-quant",
+      "passed": 143,
+      "failed": 0,
+      "skipped": 0
+    },
+    {
+      "tag": "5.2",
+      "suite": "Pi0 environment",
+      "passed": 99,
+      "failed": 0,
+      "skipped": 3
+    },
+    {
+      "tag": "5.3",
+      "suite": "GPTQ files",
+      "passed": 28,
+      "failed": 0,
+      "skipped": 0
+    }
+  ],
+  "successful_run_flags": {
+    "repeats_identical": true,
+    "untouched_layers": 0,
+    "nonfinite_values": 0,
+    "chip_crosscheck_mismatches": 0,
+    "all_cuda_tests_ran_and_passed_reported": true
+  },
+  "superseded_failures": [
+    "6 Pi0 recipe smokes out of memory at run 5",
+    "Pi0 AWQ full job Cholesky failure at run 5.1",
+    "DiT smoothing and patch jobs refused at run 5",
+    "all DiT measurements before checkpoint key repair"
+  ],
+  "hardware_rulings_pending": [
+    "runtime vs static activation scales",
+    "per-row exponent derivation",
+    "MXU scale granularity and MX32",
+    "BF16 fallback placement and FP8x3",
+    "vadd rn RTL support",
+    "exponent range 448 vs 240 conflict",
+    "SA accumulation precision",
+    "off-chip memory capacity and bandwidth"
+  ],
+  "canonical_release_verification": {
+    "record": "release_verification.json",
+    "code_commit": "5ff028ee58b28606873278236a379dcc09339b82",
+    "export_gate": "passed",
+    "manifest_sha256": "5cbb07ef1e892af7bd5acb56accd8b9e94c1bcc8bded1e8ce05e1454ed59b629",
+    "frames": 8,
+    "byte_identical_tensors": 96,
+    "total_sites": 204,
+    "quantized_sites": 203,
+    "bf16_optouts": 1,
+    "skipped_sites": 0,
+    "tests_passed": 75,
+    "tests_failed": 0,
+    "main_environment_skipped": 5,
+    "skipped_cases_passed_in_pi0_environment": true
+  }
+}

@@ -104,9 +104,11 @@ At 200 frames from episodes 136/363/380/464/474, BF16 GT MSE was 0.01822.
 The 2σ threshold is 0.0559 rel L2, from repaired multitask-dit-quant Set A
 (`3baa5d6`), a separate harness; it is an empirical comparison threshold, not a paired
 significance test. SQ folded nothing and AWQ recorded `awq_folded: []`, making their
-unexcluded outputs bit identical. Applying the measured patch exception to AWQ is NEW;
-the canonical DiT combination still needs a full checkpoint evaluation, fresh export and
-round trip. No canonical DiT chip result is available.
+unexcluded outputs bit identical. Applying the measured patch exception to AWQ is NEW.
+The canonical full-checkpoint export at `5ff028ee58b28606873278236a379dcc09339b82`
+passed an eight-frame round trip: all 96 captured tensors were byte-identical, action
+statistics matched, and outputs were finite and deterministic. This verifies export replay;
+it does not add a new 200-frame accuracy measurement. No canonical DiT chip result is available.
 
 The other harness found Set A rel L2 0.1768 ± 0.0279. Conv only (0.1427) and no conv
 (0.1348) do not support the old conv-dominance claim. SA still concentrates error in all
@@ -123,6 +125,15 @@ SmolVLA 477.3/475.9 MiB, DiT 264.0/263.3 MiB, Pi0 4099.7/4095.1 MiB
 They retain historical labels and must not be relabeled as the new canonical DiT export.
 Pi0 export checks used 32 observations and the export's own `--n-obs`, because calibration
 follows evaluated observations. Release exports must use new directories and cite the release tag.
+
+The canonical DiT release export has 204 total sites: 179 quantized Linear, 24 quantized
+attention, one BF16 Conv2d and zero skipped sites. Its manifest SHA256 is
+`5cbb07ef1e892af7bd5acb56accd8b9e94c1bcc8bded1e8ce05e1454ed59b629`.
+The final GPU release checks report 75 passed, zero failures and five main-environment
+skips whose cases passed in the Pi0 environment. Both compilation checks passed.
+See the [release contents](release/RELEASE_CONTENTS.md), [complete results](release/RESULTS_SUMMARY.md)
+and [verification record](release/release_verification.json). The existing `atlas-v1.0`
+tag remains at the verified code commit; its earlier annotation is a historical status snapshot.
 
 ## Historical run-4 component evidence (TinyLlama)
 

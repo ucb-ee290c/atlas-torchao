@@ -18,6 +18,10 @@ patch exception), `atlas_v1_static` (fallback), `atlas_v1_awq` (historical AWQ a
 exception), and `atlas_v1_sq` (the historical smoothing recipe)
 ([atlas_v1.md](atlas_v1.md), NEW).
 
+The [verified release records](release/README.md) retain results, export verification,
+the presentation and the shared-document replacement. The code tag remains pinned at
+the GPU-verified commit; graph export and compiler integration are separate work.
+
 ## Hook API (`src/algos/base.py`)
 
 Subclass `algos.base.Algo`, override only the hooks you need, and set `ALGO = YourClass` in the

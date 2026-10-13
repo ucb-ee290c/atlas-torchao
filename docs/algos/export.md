@@ -69,8 +69,9 @@ the tests also checks the policy. It is meant to become the m2m adapter's policy
     `multi_task_dit` keeps the exact CLIP patch embedding Conv2d in BF16. Its top-level
     `bf16_opt_out` row has `match: exact`; the loader excludes only that site, preserving
     similarly named siblings. Historical exports without `match` retain substring replay.
-    Full-model release export/round-trip validation is pending; all run-5.3 DiT exports
-    had zero BF16 opt-outs.
+    The canonical full-checkpoint release export passed an eight-frame, 96-tensor
+    byte-identical round trip at `5ff028e`; all historical run-5.3 DiT exports had zero
+    BF16 opt-outs. See the [verification record](release/release_verification.json).
   - **`--skip` layers**: status `skipped`.
 - **`runtime`**:
   - `chip_options`: the recipe's chip defaults, such as `chip_vadd rn` on residual sites, plus any
@@ -150,8 +151,14 @@ The loader works in six steps:
 - **Pi0.** A tiny random `PI0Pytorch` (`tests/pi0_tiny.py`), with `atlas_v1`. Needs the atlas-pi0
   environment and openpi.
 
-Not covered: no tiny constructor exists for the Multi-Task DiT. Its export path is the same
-`eval_policy.py` code as SmolVLA's.
+Full-checkpoint Multi-Task DiT release verification used `eval_policy.py`: eight frames,
+96 byte-identical captured tensors, exact action statistics, deterministic repeats, finite
+outputs and matching payload hashes. Its 204 total policy sites comprise 203 quantized
+sites and one exact BF16 Conv2d exception. There is no tiny constructor for this model;
+this full-checkpoint verification is separate from the small-model unit tests.
+
+The bundle does not contain a serialized FX graph, `ExportedProgram`, ONNX model, MLIR
+module or device binary. Graph capture and compiler lowering are separate work.
 
 ## Relation to the m2m adapter
 

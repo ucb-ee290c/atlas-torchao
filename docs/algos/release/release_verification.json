@@ -1,0 +1,171 @@
+{
+  "schema": "atlas_torchao.release_verification_record.v1",
+  "evidence": {
+    "kind": "user_reported_gpu_release_verification_and_local_test_logs",
+    "reported_date": "2026-10-12",
+    "gpu_raw_artifacts_available_locally": false,
+    "gpu_hashes_independently_recomputed_locally": false
+  },
+  "release": {
+    "tag": "atlas-v1.0",
+    "code_commit": "5ff028ee58b28606873278236a379dcc09339b82",
+    "code_unchanged_during_gpu_verification": true,
+    "export_verification_gate": "passed",
+    "tag_annotation": "historical snapshot before final GPU verification; unchanged",
+    "publication": "on hold; no republication authorized"
+  },
+  "gpu_paths": {
+    "source": "/scratch/lsh/atlas-fp8/release-check-pgu1ehd7/source",
+    "export": "/scratch/lsh/atlas-fp8/exports/release-check/dit-bx20fgr0/multitask_dit/default",
+    "results": "/scratch/lsh/atlas-fp8/results/release-check/dit-gm22y2tp",
+    "report": "/scratch/lsh/atlas-fp8/results/release-check/dit-gm22y2tp/release_verification.json"
+  },
+  "export": {
+    "files": [
+      "model.safetensors",
+      "policy.json",
+      "manifest.json"
+    ],
+    "format": "uint8 E4M3 weight codes, int32 power-of-two exponents, remaining native-dtype state, JSON execution policy and integrity/provenance manifest",
+    "manifest_sha256": "5cbb07ef1e892af7bd5acb56accd8b9e94c1bcc8bded1e8ce05e1454ed59b629",
+    "size_bytes": 277366330,
+    "all_payload_hashes_match_reported": true,
+    "contains_serialized_fx_graph": false
+  },
+  "site_census": {
+    "total": 204,
+    "quantized": 203,
+    "quantized_linear": 179,
+    "quantized_attention": 24,
+    "bf16_conv2d": 1,
+    "skipped": 0,
+    "bf16_exception": {
+      "site": "observation_encoder.vision_encoder.model.vision_model.embeddings.patch_embedding",
+      "match": "exact",
+      "marked_new": true
+    }
+  },
+  "recipe": {
+    "weight_algorithm": [
+      "AWQ",
+      "GPTQ"
+    ],
+    "weights": "channel",
+    "activations": "token",
+    "scale_rule": "nc",
+    "residual_add": "rn"
+  },
+  "checkpoint": {
+    "keys_remapped": 395,
+    "unresolved_missing_keys": 0,
+    "unexpected_keys": 0,
+    "checkpoint_fingerprint_matches_run_5_3": true,
+    "calibration_fingerprint_matches_run_5_3": true
+  },
+  "round_trip": {
+    "frames": 8,
+    "captured_tensors": 96,
+    "byte_identical_tensors": 96,
+    "action_statistics_exact": true,
+    "outputs_finite": true,
+    "repeats_deterministic": true,
+    "comparison": "from-export replay versus fresh in-memory quantization at the pinned commit"
+  },
+  "gpu_tests": [
+    {
+      "suite": "main release",
+      "passed": 55,
+      "failed_or_errors": 0,
+      "skipped": 5
+    },
+    {
+      "suite": "patched Pi0 environment",
+      "passed": 6,
+      "failed_or_errors": 0,
+      "skipped": 0
+    },
+    {
+      "suite": "additional CUDA/compilation",
+      "passed": 14,
+      "failed_or_errors": 0,
+      "skipped": 0
+    }
+  ],
+  "gpu_test_summary": {
+    "passed_invocations": 75,
+    "failed_or_errors": 0,
+    "main_environment_skip_reason": "OpenPI unavailable",
+    "main_environment_skipped_cases_passed_in_pi0_environment": true,
+    "compilation_checks_passed": 2,
+    "all_requested_checks_passed_reported": true
+  },
+  "local_tests": [
+    {
+      "suite": "full release",
+      "passed": 484,
+      "failed": 0,
+      "skipped": 44,
+      "log": "pytest-full.log"
+    },
+    {
+      "suite": "supplemental release regressions",
+      "passed": 6,
+      "failed": 0,
+      "skipped": 0,
+      "log": "pytest-release-regressions.log"
+    },
+    {
+      "suite": "static chip export",
+      "passed": 3,
+      "failed": 0,
+      "skipped": 0,
+      "log": "pytest-static-chip.log"
+    }
+  ],
+  "local_skip_categories": {
+    "cuda_only": 20,
+    "openpi_dir_required": 14,
+    "patched_pi0_transformers_required": 8,
+    "opt_in_compile": 2
+  },
+  "qualifications": [
+    "Test suites overlap; summed counts are not unique campaign tests.",
+    "Final GPU checks cover requested release paths, not a one-for-one rerun of all 44 local skips.",
+    "The eight-frame round trip does not add a new 200-frame DiT accuracy measurement.",
+    "Historical 200-frame patch accuracy was measured on the SmoothQuant candidate; unpatched AWQ and SmoothQuant candidates were bit-identical.",
+    "DiT chip accuracy remains unmeasured.",
+    "FX graph export, compiler lowering, hardware execution, performance and closed-loop task success are outside this verification."
+  ],
+  "retention": "GPU source checkout, exports and logs retained unchanged",
+  "local_test_log_archive": {
+    "root": "/scratch2/lorenhung/merlin-wt-tracka/out/artifacts/handoff/atlas-fp8/atlas_v1/release",
+    "files": {
+      "pytest-full.log": "9f71455705fdf306a9a61f8ba4d43aac47c359118c3e9932536a236b07c3d7b3",
+      "pytest-release-regressions.log": "9c5c79197bd11a8744f0e5a2d2dc3b3b2fe47067569c09a87bf88e262ae54886",
+      "pytest-static-chip.log": "f846b4e658cc348cff308e80c24655d5c83a2fae84efd79eff12325a2e1df391"
+    },
+    "digest_algorithm": "sha256"
+  },
+  "release_closure_checks": {
+    "source_and_tests_unchanged_from_gpu_verified_commit": true,
+    "existing_tag_unchanged": true,
+    "release_json_and_census_consistent": true,
+    "retained_local_log_hashes_match": true,
+    "artifact_and_tracked_records_identical": true,
+    "presentation_four_slide_structure_valid": true,
+    "local_document_links_resolve": true,
+    "diff_whitespace_check_passed": true,
+    "targeted_regressions": {
+      "passed": 4,
+      "failed": 0,
+      "skipped": 0,
+      "warnings": 2,
+      "warning_reason": "existing pytest timeout and timeout_method options without the timeout plugin",
+      "tests": [
+        "tests/test_export.py::test_canonical_dit_bf16_exception_round_trip (ref_conv, reference_hw, chip)",
+        "tests/test_export.py::test_recipe_specs_match_the_registry"
+      ]
+    },
+    "presentation_browser_render_checked": false
+  }
+}
