@@ -1,0 +1,24 @@
+...........................                                              [100%]
+=============================== warnings summary ===============================
+tests/test_fx_export.py: 14 warnings
+  /scratch/lsh/atlas-fp8/.venv/lib/python3.12/site-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+tests/test_fx_export.py::test_canonical_llama_export_replay_capture_and_fresh_process[True]
+  /scratch/lsh/atlas-fp8/.venv/lib/python3.12/site-packages/torch/_dynamo/output_graph.py:2052: UserWarning: While compiling, we found certain side effects happened in the model.forward. Here are the list of potential sources you can double check: ["G['__import_transformers_dot_utils_dot_output_capturing']._active_collector"]
+    warnings.warn(
+
+tests/test_fx_export.py::test_canonical_llama_export_replay_capture_and_fresh_process[True]
+  /scratch/lsh/atlas-fp8/.venv/lib/python3.12/site-packages/torch/export/pt2_archive/_package.py:790: UserWarning: The given buffer is not writable, and PyTorch does not support non-writable tensors. This means you can write to the underlying (supposedly non-writable) buffer using the tensor. You may want to copy the buffer to protect its data or make it writable before converting it to a tensor. This type of warning will be suppressed for the rest of this program. (Triggered internally at /pytorch/torch/csrc/utils/tensor_new.cpp:1586.)
+    tensor = torch.frombuffer(
+
+tests/test_fx_export.py::test_disconnected_code_or_scale_is_refused[False-weight_codes]
+tests/test_fx_export.py::test_disconnected_code_or_scale_is_refused[False-weight_scale_exp]
+tests/test_fx_export.py::test_disconnected_code_or_scale_is_refused[True-weight_codes]
+tests/test_fx_export.py::test_disconnected_code_or_scale_is_refused[True-weight_scale_exp]
+tests/test_fx_export.py::test_consumed_float_placeholder_is_refused
+  /scratch/lsh/atlas-fp8/.venv/lib/python3.12/site-packages/torch/_dynamo/output_graph.py:2052: UserWarning: While compiling, we found certain side effects happened in the model.forward. Here are the list of potential sources you can double check: ["L['self']._modules['_export_root']._modules['0'].algo._seen", "L['self']._modules['_export_root']._modules['0'].algo.stats['activation']"]
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+27 passed, 21 warnings in 109.68s (0:01:49)

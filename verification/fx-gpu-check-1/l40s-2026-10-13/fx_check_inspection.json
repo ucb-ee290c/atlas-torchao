@@ -1,0 +1,117 @@
+{
+  "status": "passed",
+  "commit": "2d4b187a74bd82b81ddc9541bee164d0775614f1",
+  "source": "/scratch/lsh/atlas-fp8/results/fx-check/tinyllama-52ur30o5/source",
+  "source_export": "/scratch/lsh/atlas-fp8/exports/atlas_v1/tinyllama/atlas_v1_awq",
+  "results": "/scratch/lsh/atlas-fp8/results/fx-check/tinyllama-52ur30o5",
+  "fx": "/scratch/lsh/atlas-fp8/results/fx-check/tinyllama-52ur30o5/fx",
+  "torch": "2.11.0+cu128",
+  "gpu": "NVIDIA L40S",
+  "cuda_visible_devices": "1",
+  "physical_gpu_uuid": "GPU-6a6a9d5a-07da-01f7-4acb-594afc813213",
+  "tests": {
+    "passed": 27,
+    "failed": 0,
+    "errors": 0,
+    "skipped": 0,
+    "warnings": 21
+  },
+  "weight_sites_verified": 154,
+  "buffers": {
+    "total": 308,
+    "uint8_codes": 154,
+    "int32_exponents": 154,
+    "bound_to_contractions": true
+  },
+  "dynamic_input_value_dependent_amax_exponent_nc": true,
+  "unused_float_weights_metadata_only_after_reload": true,
+  "fresh_process_original_model_imports": [],
+  "all_outputs_finite": true,
+  "logit_fixtures": [
+    {
+      "name": "case_0.output_0",
+      "shape": [
+        1,
+        8,
+        32000
+      ],
+      "dtype": "torch.bfloat16"
+    },
+    {
+      "name": "case_1.output_0",
+      "shape": [
+        1,
+        8,
+        32000
+      ],
+      "dtype": "torch.bfloat16"
+    }
+  ],
+  "all_eager_captured_saved_outputs_byte_identical": true,
+  "payload_hashes_verified": 8,
+  "payloads": {
+    "model.pt2": {
+      "sha256": "6069797615df99558979856e1b1d411c7a9a35fe834a445d08c3642adf8f8966",
+      "bytes": 1411544700
+    },
+    "fixtures.safetensors": {
+      "sha256": "9e87e0a24264446e748ba33a949194be07b7792efb6469143923f339f6fde7dc",
+      "bytes": 1024448
+    },
+    "parity.json": {
+      "sha256": "f197c544339703bcd54cdb40b654a79dc5c231af69234e0d001eea6910aa9af4",
+      "bytes": 432
+    },
+    "buffer_inventory.json": {
+      "sha256": "6f9d80c4f3f1654ce453fc830adee26a81aa7ba83b2d4ccad6b8b41c7b4f1791",
+      "bytes": 66589
+    },
+    "graph_inspection.json": {
+      "sha256": "e691b3d2e1bbdad19ac627fbd31fdbbae7b234ac0893c7ad4a38f6eebe53dda2",
+      "bytes": 78889
+    },
+    "policy.json": {
+      "sha256": "6504bfbe7255eca1636ff448c7e6740abf8fd1720407bf935036f19a562e580c",
+      "bytes": 203462
+    },
+    "graph.txt": {
+      "sha256": "a81a14d10fc03beb10c02bcf269d36e843c1e13a24af0c3c34cf382bac1135b9",
+      "bytes": 5988106
+    },
+    "graph_signature.txt": {
+      "sha256": "cfc7593eb977d4d90655c29dc06bf333390c9d9710bfc6cca8e2e55bdefc8b61",
+      "bytes": 102315
+    }
+  },
+  "fx_manifest_sha256": "bdfa7020d15c99a228d5ff1600026b0203b8d4416ecfbe1ccf093a1f775cebe3",
+  "source_export_manifest_sha256": "f119d777aca6b37fa9618a5fe0edc4c198bbb9375bf11b76baeae66728d83c0c",
+  "original_export_recipe": "atlas_v1_awq",
+  "functional_attention_sites": 22,
+  "functional_attention_structural_binding": "not certified; covered by boundary output parity",
+  "chip_rn_policy": "retained as source policy metadata; ref_conv capture does not execute the chip-only rn sequence",
+  "warnings": {
+    "starter.log": [],
+    "pytest-fx-export.log": [
+      "/scratch/lsh/atlas-fp8/.venv/lib/python3.12/site-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.",
+      "/scratch/lsh/atlas-fp8/.venv/lib/python3.12/site-packages/torch/_dynamo/output_graph.py:2052: UserWarning: While compiling, we found certain side effects happened in the model.forward. Here are the list of potential sources you can double check: [\"G['__import_transformers_dot_utils_dot_output_capturing']._active_collector\"]",
+      "/scratch/lsh/atlas-fp8/.venv/lib/python3.12/site-packages/torch/export/pt2_archive/_package.py:790: UserWarning: The given buffer is not writable, and PyTorch does not support non-writable tensors. This means you can write to the underlying (supposedly non-writable) buffer using the tensor. You may want to copy the buffer to protect its data or make it writable before converting it to a tensor. This type of warning will be suppressed for the rest of this program. (Triggered internally at /pytorch/torch/csrc/utils/tensor_new.cpp:1586.)",
+      "/scratch/lsh/atlas-fp8/.venv/lib/python3.12/site-packages/torch/_dynamo/output_graph.py:2052: UserWarning: While compiling, we found certain side effects happened in the model.forward. Here are the list of potential sources you can double check: [\"L['self']._modules['_export_root']._modules['0'].algo._seen\", \"L['self']._modules['_export_root']._modules['0'].algo.stats['activation']\"]"
+    ],
+    "capture.log": [
+      "Failed to load /scratch/lsh/atlas-fp8/.venv/lib/python3.12/site-packages/torchao/_C_cutlass_90a.abi3.so: Could not load this library: /scratch/lsh/atlas-fp8/.venv/lib/python3.12/site-packages/torchao/_C_cutlass_90a.abi3.so",
+      "Failed to load /scratch/lsh/atlas-fp8/.venv/lib/python3.12/site-packages/torchao/_C_mxfp8.cpython-310-x86_64-linux-gnu.so: Could not load this library: /scratch/lsh/atlas-fp8/.venv/lib/python3.12/site-packages/torchao/_C_mxfp8.cpython-310-x86_64-linux-gnu.so",
+      "/scratch/lsh/atlas-fp8/.venv/lib/python3.12/site-packages/torch/_dynamo/output_graph.py:2052: UserWarning: While compiling, we found certain side effects happened in the model.forward. Here are the list of potential sources you can double check: [\"G['__import_transformers_dot_utils_dot_output_capturing']._active_collector\"]",
+      "/scratch/lsh/atlas-fp8/.venv/lib/python3.12/site-packages/torch/export/pt2_archive/_package.py:790: UserWarning: The given buffer is not writable, and PyTorch does not support non-writable tensors. This means you can write to the underlying (supposedly non-writable) buffer using the tensor. You may want to copy the buffer to protect its data or make it writable before converting it to a tensor. This type of warning will be suppressed for the rest of this program. (Triggered internally at /pytorch/torch/csrc/utils/tensor_new.cpp:1586.)",
+      "W1013 15:16:18.906000 3875785 torch/export/pt2_archive/_package.py:795] Cannot call torch.frombuffer() on empty bytes. Creating a tensor with zeros as workaround."
+    ],
+    "fx/fresh_process.log": [
+      "/scratch/lsh/atlas-fp8/.venv/lib/python3.12/site-packages/torch/export/pt2_archive/_package.py:790: UserWarning: The given buffer is not writable, and PyTorch does not support non-writable tensors. This means you can write to the underlying (supposedly non-writable) buffer using the tensor. You may want to copy the buffer to protect its data or make it writable before converting it to a tensor. This type of warning will be suppressed for the rest of this program. (Triggered internally at /pytorch/torch/csrc/utils/tensor_new.cpp:1586.)",
+      "W1013 15:17:33.091000 3882597 torch/export/pt2_archive/_package.py:795] Cannot call torch.frombuffer() on empty bytes. Creating a tensor with zeros as workaround."
+    ],
+    "standalone-reload.log": [
+      "/scratch/lsh/atlas-fp8/.venv/lib/python3.12/site-packages/torch/export/pt2_archive/_package.py:790: UserWarning: The given buffer is not writable, and PyTorch does not support non-writable tensors. This means you can write to the underlying (supposedly non-writable) buffer using the tensor. You may want to copy the buffer to protect its data or make it writable before converting it to a tensor. This type of warning will be suppressed for the rest of this program. (Triggered internally at /pytorch/torch/csrc/utils/tensor_new.cpp:1586.)",
+      "W1013 15:19:00.071000 3883871 torch/export/pt2_archive/_package.py:795] Cannot call torch.frombuffer() on empty bytes. Creating a tensor with zeros as workaround."
+    ]
+  },
+  "source_clean_after_verification": true
+}

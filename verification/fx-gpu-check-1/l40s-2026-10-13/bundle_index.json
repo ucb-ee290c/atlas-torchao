@@ -1,0 +1,110 @@
+{
+  "schema": "verification_report_bundle.v1",
+  "verified_code_commit": "2d4b187a74bd82b81ddc9541bee164d0775614f1",
+  "source_results": "/scratch/lsh/atlas-fp8/results/fx-check/tinyllama-52ur30o5",
+  "published_path": "verification/fx-gpu-check-1/l40s-2026-10-13",
+  "report_tag": "fx-gpu-check-1-l40s-results-2026-10-13",
+  "original_recipe": "atlas_v1_awq",
+  "scope": "Full-checkpoint TinyLlama reference-emulation FX capture and reload verification",
+  "tests": {
+    "passed": 27,
+    "failed": 0,
+    "skipped": 0
+  },
+  "files": {
+    "fx_check_inspection.json": {
+      "bytes": 7732,
+      "sha256": "27d85747da8c4464aa93001df9b79e2f25d22fe298732fd5807e4e7d27e45a23"
+    },
+    "gpu_fx_summary.json": {
+      "bytes": 1341,
+      "sha256": "8638e9447b7e7e09f667366a9f7bac8d00efba3e44fe221cfca5e7bd0993772b"
+    },
+    "preflight.json": {
+      "bytes": 1740,
+      "sha256": "385c5f1c2976641f9505aa4fa18b021da7615112140e26889626f77224f5e163"
+    },
+    "starter.status.json": {
+      "bytes": 174,
+      "sha256": "25e59ab8950edb9a43c86a70e40a2c45bb07877d2dd9e6b48ca6c9fff63dc45e"
+    },
+    "launch_environment.json": {
+      "bytes": 832,
+      "sha256": "fbc8d23dd9a66a0d05d7bbc6069b7281e1f609aff1cb813e13c96abbb3631dbd"
+    },
+    "pytest-fx-export.log": {
+      "bytes": 2475,
+      "sha256": "a446cbca8d273ed8da6527af41399e238cc328f0fba4020f4d574d5ad43ca008"
+    },
+    "capture.log": {
+      "bytes": 29728,
+      "sha256": "bb73b1f9673b6bea149a8f4f8c5235012873ceeecf801909b47b92528898e568"
+    },
+    "standalone-reload.log": {
+      "bytes": 936,
+      "sha256": "d576a54b4e3700fee8922ae1598d49266f8f97cd24db590d5740c05c9e1bc05a"
+    },
+    "starter.log": {
+      "bytes": 3896,
+      "sha256": "4ed855575e4b6fd29b63a0f7fbed61365ea13b40686cd3703165b59ee7e53bff"
+    },
+    "launch_driver.log": {
+      "bytes": 15,
+      "sha256": "c8f8e84d361468017fbd1aeccc6eb97a82566a71d904fcfbc394e87cc3bd013d"
+    },
+    "fx/buffer_inventory.json": {
+      "bytes": 66589,
+      "sha256": "6f9d80c4f3f1654ce453fc830adee26a81aa7ba83b2d4ccad6b8b41c7b4f1791"
+    },
+    "fx/fixtures.safetensors": {
+      "bytes": 1024448,
+      "sha256": "9e87e0a24264446e748ba33a949194be07b7792efb6469143923f339f6fde7dc"
+    },
+    "fx/fresh_process.log": {
+      "bytes": 936,
+      "sha256": "6f5071ce3010880d65df70d0d39585fc200f1f31f6be8bc87b480931aa433aa3"
+    },
+    "fx/fresh_process_verification.json": {
+      "bytes": 203,
+      "sha256": "3581302e285142a34a552a387bdd8d5805561d44506f71c0d82efd835d8409e0"
+    },
+    "fx/fx_manifest.json": {
+      "bytes": 28268,
+      "sha256": "bdfa7020d15c99a228d5ff1600026b0203b8d4416ecfbe1ccf093a1f775cebe3"
+    },
+    "fx/graph.txt": {
+      "bytes": 5988106,
+      "sha256": "a81a14d10fc03beb10c02bcf269d36e843c1e13a24af0c3c34cf382bac1135b9"
+    },
+    "fx/graph_inspection.json": {
+      "bytes": 78889,
+      "sha256": "e691b3d2e1bbdad19ac627fbd31fdbbae7b234ac0893c7ad4a38f6eebe53dda2"
+    },
+    "fx/graph_signature.txt": {
+      "bytes": 102315,
+      "sha256": "cfc7593eb977d4d90655c29dc06bf333390c9d9710bfc6cca8e2e55bdefc8b61"
+    },
+    "fx/parity.json": {
+      "bytes": 432,
+      "sha256": "f197c544339703bcd54cdb40b654a79dc5c231af69234e0d001eea6910aa9af4"
+    },
+    "fx/policy.json": {
+      "bytes": 203462,
+      "sha256": "6504bfbe7255eca1636ff448c7e6740abf8fd1720407bf935036f19a562e580c"
+    },
+    "fx/verification.json": {
+      "bytes": 28170,
+      "sha256": "b5d59bd2f40690f306b0eb0c16d69ab898ce83d4d8dca0dfc9b21f2c7f346f01"
+    }
+  },
+  "model_pt2": {
+    "included": false,
+    "workspace_path": "/scratch/lsh/atlas-fp8/results/fx-check/tinyllama-52ur30o5/fx/model.pt2",
+    "bytes": 1411544700,
+    "sha256": "6069797615df99558979856e1b1d411c7a9a35fe834a445d08c3642adf8f8966"
+  },
+  "functional_attention_structural_binding": "22 sites not structurally certified; covered by boundary output parity",
+  "chip_rn": "Original policy retained as metadata; not executed by the ref_conv graph",
+  "native_fp8_mlir_verified": false,
+  "hardware_compatibility_verified": false
+}

@@ -1,0 +1,11 @@
+/scratch/lsh/atlas-fp8/.venv/lib/python3.12/site-packages/torch/export/pt2_archive/_package.py:790: UserWarning: The given buffer is not writable, and PyTorch does not support non-writable tensors. This means you can write to the underlying (supposedly non-writable) buffer using the tensor. You may want to copy the buffer to protect its data or make it writable before converting it to a tensor. This type of warning will be suppressed for the rest of this program. (Triggered internally at /pytorch/torch/csrc/utils/tensor_new.cpp:1586.)
+  tensor = torch.frombuffer(
+W1013 15:19:00.071000 3883871 torch/export/pt2_archive/_package.py:795] Cannot call torch.frombuffer() on empty bytes. Creating a tensor with zeros as workaround.
+{
+  "status": "passed",
+  "cases": 2,
+  "all_outputs_byte_identical": true,
+  "code_scale_bytes_preserved": true,
+  "unused_float_weights_not_materialized": true,
+  "model_replay_modules_imported": []
+}

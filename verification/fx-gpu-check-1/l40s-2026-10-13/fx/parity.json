@@ -1,0 +1,22 @@
+{
+  "cases": [
+    {
+      "inputs": [
+        "case_0.input_0"
+      ],
+      "outputs": [
+        "case_0.output_0"
+      ],
+      "output_spec": "[1, {\"type\": null, \"context\": null, \"children_spec\": []}]"
+    },
+    {
+      "inputs": [
+        "case_1.input_0"
+      ],
+      "outputs": [
+        "case_1.output_0"
+      ],
+      "output_spec": "[1, {\"type\": null, \"context\": null, \"children_spec\": []}]"
+    }
+  ]
+}

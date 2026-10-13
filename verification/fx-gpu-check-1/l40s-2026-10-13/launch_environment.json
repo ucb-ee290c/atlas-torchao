@@ -1,0 +1,16 @@
+{
+  "FX_ROOT": "/scratch/lsh/atlas-fp8",
+  "FX_BASE": "/scratch/lsh/atlas-fp8/release-check-pgu1ehd7/source",
+  "FX_RUN": "/scratch/lsh/atlas-fp8/results/fx-check/tinyllama-52ur30o5",
+  "FX_EXPORT": "/scratch/lsh/atlas-fp8/exports/atlas_v1/tinyllama/atlas_v1_awq",
+  "FX_MODEL": "/scratch/lsh/atlas-fp8/hf_cache/hub/models--TinyLlama--TinyLlama-1.1B-Chat-v1.0/snapshots/fe8a4ea1ffedaf415f4da2f062534de366a451e6",
+  "FX_PY": "/scratch/lsh/atlas-fp8/.venv/bin/python",
+  "FX_COMMIT": "2d4b187a74bd82b81ddc9541bee164d0775614f1",
+  "FX_EXPECTED_MANIFEST_SHA256": "f119d777aca6b37fa9618a5fe0edc4c198bbb9375bf11b76baeae66728d83c0c",
+  "CUDA_VISIBLE_DEVICES": "1",
+  "HF_HOME": "/scratch/lsh/atlas-fp8/hf_cache",
+  "HF_HUB_OFFLINE": "1",
+  "VIRTUAL_ENV": "/scratch/lsh/atlas-fp8/.venv",
+  "OMP_NUM_THREADS": "2",
+  "MKL_NUM_THREADS": "2"
+}

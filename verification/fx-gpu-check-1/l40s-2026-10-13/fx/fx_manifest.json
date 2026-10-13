@@ -1,0 +1,704 @@
+{
+  "schema": "atlas_torchao.fx_bundle.v1",
+  "torch": "2.11.0+cu128",
+  "device": "cuda:0",
+  "provenance": {
+    "export_dir": "/scratch/lsh/atlas-fp8/exports/atlas_v1/tinyllama/atlas_v1_awq",
+    "export_manifest_sha256": "f119d777aca6b37fa9618a5fe0edc4c198bbb9375bf11b76baeae66728d83c0c",
+    "export_provenance": {
+      "atlas_torchao_commit": "a30779befee466e6026f85da2e9cc06cda303425",
+      "atlas_torchao_branch": "HEAD",
+      "atlas_torchao_dirty": true,
+      "versions": {
+        "torch": "2.11.0+cu128",
+        "python": "3.12.3",
+        "torchao": "0.18.0",
+        "transformers": "5.5.4",
+        "safetensors": "0.8.0",
+        "lerobot": "0.6.1",
+        "numpy": "2.2.6"
+      },
+      "host": "firesim2",
+      "device": "cuda",
+      "gpu": "NVIDIA L40S",
+      "argv": [
+        "src/eval.py",
+        "--model",
+        "/scratch/lsh/atlas-fp8/hf_cache/hub/models--TinyLlama--TinyLlama-1.1B-Chat-v1.0/snapshots/fe8a4ea1ffedaf415f4da2f062534de366a451e6",
+        "--modes",
+        "ref_conv",
+        "--algo",
+        "atlas_v1_awq",
+        "--export-dir",
+        "/scratch/lsh/atlas-fp8/exports/atlas_v1/tinyllama/atlas_v1_awq",
+        "--export-only",
+        "--out",
+        "/scratch/lsh/atlas-fp8/exports/atlas_v1/tinyllama/atlas_v1_awq.run.json"
+      ]
+    },
+    "export_recipe": {
+      "algo": "atlas_v1_awq",
+      "expanded": "gptq_awq:method=awq_gptq,actorder=true+granularity:w=channel,a=token,rule=nc",
+      "stack": [
+        {
+          "name": "gptq_awq",
+          "params": {
+            "method": "awq_gptq",
+            "actorder": true
+          }
+        },
+        {
+          "name": "granularity",
+          "params": {
+            "w": "channel",
+            "a": "token",
+            "rule": "nc"
+          }
+        }
+      ],
+      "recipe": {
+        "name": "atlas_v1_awq",
+        "spec": "gptq_awq:method=awq_gptq,actorder=true+granularity:w=channel,a=token,rule=nc",
+        "expanded": "gptq_awq:method=awq_gptq,actorder=true+granularity:w=channel,a=token,rule=nc",
+        "chip_defaults": {
+          "chip_vadd": "rn",
+          "chip_vadd_sites": "residual"
+        },
+        "activation_scales": "dynamic per token (run-time amax on chip)",
+        "doc": "docs/algos/atlas_v1.md"
+      },
+      "algorithm_record": {
+        "name": "stack",
+        "spec": "atlas_v1_awq",
+        "order": [
+          "gptq_awq",
+          "granularity"
+        ],
+        "params": {
+          "gptq_awq": {
+            "method": "awq_gptq",
+            "actorder": true
+          },
+          "granularity": {
+            "w": "channel",
+            "a": "token",
+            "rule": "nc"
+          }
+        },
+        "calibration": {
+          "gptq_awq": {
+            "source": "Salesforce/wikitext wikitext-2-raw-v1 train",
+            "n_samples": 16,
+            "seed": 1234,
+            "seqlen": 2048,
+            "tokenizer_fast": false,
+            "window_starts": [
+              1848566,
+              490106,
+              31421,
+              380186,
+              2442039,
+              146490,
+              2816741,
+              352062,
+              412811,
+              1487449,
+              993252,
+              73098,
+              129243,
+              66439,
+              1451602,
+              2719234
+            ],
+            "result": {
+              "linears_with_hessian": 89,
+              "shared_inputs": 66,
+              "hessians": "cpu",
+              "rank_deficient_hessians": [],
+              "foldable_groups": [
+                "model.layers.0.input_layernorm",
+                "model.layers.0.mlp.up_proj->down_proj",
+                "model.layers.0.post_attention_layernorm",
+                "model.layers.1.input_layernorm",
+                "model.layers.1.mlp.up_proj->down_proj",
+                "model.layers.1.post_attention_layernorm",
+                "model.layers.10.input_layernorm",
+                "model.layers.10.mlp.up_proj->down_proj",
+                "model.layers.10.post_attention_layernorm",
+                "model.layers.11.input_layernorm",
+                "model.layers.11.mlp.up_proj->down_proj",
+                "model.layers.11.post_attention_layernorm",
+                "model.layers.12.input_layernorm",
+                "model.layers.12.mlp.up_proj->down_proj",
+                "model.layers.12.post_attention_layernorm",
+                "model.layers.13.input_layernorm",
+                "model.layers.13.mlp.up_proj->down_proj",
+                "model.layers.13.post_attention_layernorm",
+                "model.layers.14.input_layernorm",
+                "model.layers.14.mlp.up_proj->down_proj",
+                "model.layers.14.post_attention_layernorm",
+                "model.layers.15.input_layernorm",
+                "model.layers.15.mlp.up_proj->down_proj",
+                "model.layers.15.post_attention_layernorm",
+                "model.layers.16.input_layernorm",
+                "model.layers.16.mlp.up_proj->down_proj",
+                "model.layers.16.post_attention_layernorm",
+                "model.layers.17.input_layernorm",
+                "model.layers.17.mlp.up_proj->down_proj",
+                "model.layers.17.post_attention_layernorm",
+                "model.layers.18.input_layernorm",
+                "model.layers.18.mlp.up_proj->down_proj",
+                "model.layers.18.post_attention_layernorm",
+                "model.layers.19.input_layernorm",
+                "model.layers.19.mlp.up_proj->down_proj",
+                "model.layers.19.post_attention_layernorm",
+                "model.layers.2.input_layernorm",
+                "model.layers.2.mlp.up_proj->down_proj",
+                "model.layers.2.post_attention_layernorm",
+                "model.layers.20.input_layernorm",
+                "model.layers.20.mlp.up_proj->down_proj",
+                "model.layers.20.post_attention_layernorm",
+                "model.layers.21.input_layernorm",
+                "model.layers.21.mlp.up_proj->down_proj",
+                "model.layers.21.post_attention_layernorm",
+                "model.layers.3.input_layernorm",
+                "model.layers.3.mlp.up_proj->down_proj",
+                "model.layers.3.post_attention_layernorm",
+                "model.layers.4.input_layernorm",
+                "model.layers.4.mlp.up_proj->down_proj",
+                "model.layers.4.post_attention_layernorm",
+                "model.layers.5.input_layernorm",
+                "model.layers.5.mlp.up_proj->down_proj",
+                "model.layers.5.post_attention_layernorm",
+                "model.layers.6.input_layernorm",
+                "model.layers.6.mlp.up_proj->down_proj",
+                "model.layers.6.post_attention_layernorm",
+                "model.layers.7.input_layernorm",
+                "model.layers.7.mlp.up_proj->down_proj",
+                "model.layers.7.post_attention_layernorm",
+                "model.layers.8.input_layernorm",
+                "model.layers.8.mlp.up_proj->down_proj",
+                "model.layers.8.post_attention_layernorm",
+                "model.layers.9.input_layernorm",
+                "model.layers.9.mlp.up_proj->down_proj",
+                "model.layers.9.post_attention_layernorm"
+              ],
+              "refused_groups": {}
+            }
+          }
+        },
+        "members": [
+          {
+            "name": "gptq_awq",
+            "params": {
+              "method": "awq_gptq",
+              "actorder": true
+            },
+            "calibration": {
+              "source": "Salesforce/wikitext wikitext-2-raw-v1 train",
+              "n_samples": 16,
+              "seed": 1234,
+              "seqlen": 2048,
+              "tokenizer_fast": false,
+              "window_starts": [
+                1848566,
+                490106,
+                31421,
+                380186,
+                2442039,
+                146490,
+                2816741,
+                352062,
+                412811,
+                1487449,
+                993252,
+                73098,
+                129243,
+                66439,
+                1451602,
+                2719234
+              ],
+              "result": {
+                "linears_with_hessian": 89,
+                "shared_inputs": 66,
+                "hessians": "cpu",
+                "rank_deficient_hessians": [],
+                "foldable_groups": [
+                  "model.layers.0.input_layernorm",
+                  "model.layers.0.mlp.up_proj->down_proj",
+                  "model.layers.0.post_attention_layernorm",
+                  "model.layers.1.input_layernorm",
+                  "model.layers.1.mlp.up_proj->down_proj",
+                  "model.layers.1.post_attention_layernorm",
+                  "model.layers.10.input_layernorm",
+                  "model.layers.10.mlp.up_proj->down_proj",
+                  "model.layers.10.post_attention_layernorm",
+                  "model.layers.11.input_layernorm",
+                  "model.layers.11.mlp.up_proj->down_proj",
+                  "model.layers.11.post_attention_layernorm",
+                  "model.layers.12.input_layernorm",
+                  "model.layers.12.mlp.up_proj->down_proj",
+                  "model.layers.12.post_attention_layernorm",
+                  "model.layers.13.input_layernorm",
+                  "model.layers.13.mlp.up_proj->down_proj",
+                  "model.layers.13.post_attention_layernorm",
+                  "model.layers.14.input_layernorm",
+                  "model.layers.14.mlp.up_proj->down_proj",
+                  "model.layers.14.post_attention_layernorm",
+                  "model.layers.15.input_layernorm",
+                  "model.layers.15.mlp.up_proj->down_proj",
+                  "model.layers.15.post_attention_layernorm",
+                  "model.layers.16.input_layernorm",
+                  "model.layers.16.mlp.up_proj->down_proj",
+                  "model.layers.16.post_attention_layernorm",
+                  "model.layers.17.input_layernorm",
+                  "model.layers.17.mlp.up_proj->down_proj",
+                  "model.layers.17.post_attention_layernorm",
+                  "model.layers.18.input_layernorm",
+                  "model.layers.18.mlp.up_proj->down_proj",
+                  "model.layers.18.post_attention_layernorm",
+                  "model.layers.19.input_layernorm",
+                  "model.layers.19.mlp.up_proj->down_proj",
+                  "model.layers.19.post_attention_layernorm",
+                  "model.layers.2.input_layernorm",
+                  "model.layers.2.mlp.up_proj->down_proj",
+                  "model.layers.2.post_attention_layernorm",
+                  "model.layers.20.input_layernorm",
+                  "model.layers.20.mlp.up_proj->down_proj",
+                  "model.layers.20.post_attention_layernorm",
+                  "model.layers.21.input_layernorm",
+                  "model.layers.21.mlp.up_proj->down_proj",
+                  "model.layers.21.post_attention_layernorm",
+                  "model.layers.3.input_layernorm",
+                  "model.layers.3.mlp.up_proj->down_proj",
+                  "model.layers.3.post_attention_layernorm",
+                  "model.layers.4.input_layernorm",
+                  "model.layers.4.mlp.up_proj->down_proj",
+                  "model.layers.4.post_attention_layernorm",
+                  "model.layers.5.input_layernorm",
+                  "model.layers.5.mlp.up_proj->down_proj",
+                  "model.layers.5.post_attention_layernorm",
+                  "model.layers.6.input_layernorm",
+                  "model.layers.6.mlp.up_proj->down_proj",
+                  "model.layers.6.post_attention_layernorm",
+                  "model.layers.7.input_layernorm",
+                  "model.layers.7.mlp.up_proj->down_proj",
+                  "model.layers.7.post_attention_layernorm",
+                  "model.layers.8.input_layernorm",
+                  "model.layers.8.mlp.up_proj->down_proj",
+                  "model.layers.8.post_attention_layernorm",
+                  "model.layers.9.input_layernorm",
+                  "model.layers.9.mlp.up_proj->down_proj",
+                  "model.layers.9.post_attention_layernorm"
+                ],
+                "refused_groups": {}
+              }
+            },
+            "weights": {
+              "gptq+awq": 132,
+              "gptq": 22
+            },
+            "damp_raised": {},
+            "stage": "transform"
+          },
+          {
+            "name": "granularity",
+            "params": {
+              "w": "channel",
+              "a": "token",
+              "rule": "nc"
+            },
+            "calibration": null,
+            "numerics": {
+              "scale_rule": "NEW nc: ceil(log2(amax/448))",
+              "departs_from_reference_rule": true,
+              "note": "rule=nc departs from the reference author's scale rule floor(log2(amax/256)) (pi0-quant hw_float_ops.py:31,38-57): the exponent is raised by one where the block maximum would clip (amax > 448*2^s), i.e. ceil(log2(amax/448)). NEW; evidence: CPU screening in docs/algos/granularity.md (finer granularity clips more maxima under the reference rule).",
+              "per_block_on_mxu_models": "not defined (hardware ruling H3); framework steps only"
+            },
+            "stage": "scale"
+          }
+        ],
+        "delegations": [
+          {
+            "hook": "weight_scale",
+            "grid_from": [
+              "granularity"
+            ],
+            "pinned_by": "gptq_awq",
+            "rule": "NEW: the pinning member quantizes onto the chooser's grid and its pinned Scale is used (docs/algos/stacking.md)"
+          }
+        ],
+        "rules": "NEW (docs/algos/stacking.md): fixed order transforms -> scale choices -> exclusions; one Scale per (layer, kind) or StackConflict",
+        "granularity": {
+          "weight": {
+            "linear:per_channel": 154
+          },
+          "activation": {},
+          "online_transforms": {}
+        },
+        "recipe": {
+          "name": "atlas_v1_awq",
+          "spec": "gptq_awq:method=awq_gptq,actorder=true+granularity:w=channel,a=token,rule=nc",
+          "expanded": "gptq_awq:method=awq_gptq,actorder=true+granularity:w=channel,a=token,rule=nc",
+          "chip_defaults": {
+            "chip_vadd": "rn",
+            "chip_vadd_sites": "residual"
+          },
+          "activation_scales": "dynamic per token (run-time amax on chip)",
+          "doc": "docs/algos/atlas_v1.md",
+          "chip_options_applied": {}
+        },
+        "applied": true,
+        "bf16_opt_out": [],
+        "prepare": {
+          "gptq_awq": {
+            "method": "awq_gptq",
+            "awq_folded": [
+              {
+                "group": "model.layers.0.input_layernorm",
+                "alpha": 0.25
+              },
+              {
+                "group": "model.layers.0.post_attention_layernorm",
+                "alpha": 0.7
+              },
+              {
+                "group": "model.layers.1.input_layernorm",
+                "alpha": 0.4
+              },
+              {
+                "group": "model.layers.1.post_attention_layernorm",
+                "alpha": 0.1
+              },
+              {
+                "group": "model.layers.10.input_layernorm",
+                "alpha": 0.25
+              },
+              {
+                "group": "model.layers.10.post_attention_layernorm",
+                "alpha": 0.55
+              },
+              {
+                "group": "model.layers.11.input_layernorm",
+                "alpha": 0.15
+              },
+              {
+                "group": "model.layers.11.post_attention_layernorm",
+                "alpha": 0.9
+              },
+              {
+                "group": "model.layers.12.input_layernorm",
+                "alpha": 0.0
+              },
+              {
+                "group": "model.layers.12.post_attention_layernorm",
+                "alpha": 0.6
+              },
+              {
+                "group": "model.layers.13.input_layernorm",
+                "alpha": 0.3
+              },
+              {
+                "group": "model.layers.13.post_attention_layernorm",
+                "alpha": 0.35
+              },
+              {
+                "group": "model.layers.14.input_layernorm",
+                "alpha": 0.8
+              },
+              {
+                "group": "model.layers.14.post_attention_layernorm",
+                "alpha": 0.7
+              },
+              {
+                "group": "model.layers.15.input_layernorm",
+                "alpha": 0.7
+              },
+              {
+                "group": "model.layers.15.post_attention_layernorm",
+                "alpha": 0.65
+              },
+              {
+                "group": "model.layers.16.input_layernorm",
+                "alpha": 0.2
+              },
+              {
+                "group": "model.layers.16.post_attention_layernorm",
+                "alpha": 0.85
+              },
+              {
+                "group": "model.layers.17.input_layernorm",
+                "alpha": 0.1
+              },
+              {
+                "group": "model.layers.17.post_attention_layernorm",
+                "alpha": 0.8
+              },
+              {
+                "group": "model.layers.18.input_layernorm",
+                "alpha": 0.45
+              },
+              {
+                "group": "model.layers.18.post_attention_layernorm",
+                "alpha": 0.75
+              },
+              {
+                "group": "model.layers.19.input_layernorm",
+                "alpha": 0.25
+              },
+              {
+                "group": "model.layers.19.post_attention_layernorm",
+                "alpha": 0.9
+              },
+              {
+                "group": "model.layers.2.input_layernorm",
+                "alpha": 0.4
+              },
+              {
+                "group": "model.layers.2.post_attention_layernorm",
+                "alpha": 0.1
+              },
+              {
+                "group": "model.layers.20.input_layernorm",
+                "alpha": 0.25
+              },
+              {
+                "group": "model.layers.20.post_attention_layernorm",
+                "alpha": 0.85
+              },
+              {
+                "group": "model.layers.21.input_layernorm",
+                "alpha": 0.55
+              },
+              {
+                "group": "model.layers.21.post_attention_layernorm",
+                "alpha": 0.6
+              },
+              {
+                "group": "model.layers.3.input_layernorm",
+                "alpha": 0.8
+              },
+              {
+                "group": "model.layers.3.post_attention_layernorm",
+                "alpha": 0.35
+              },
+              {
+                "group": "model.layers.4.input_layernorm",
+                "alpha": 0.4
+              },
+              {
+                "group": "model.layers.4.post_attention_layernorm",
+                "alpha": 0.4
+              },
+              {
+                "group": "model.layers.5.input_layernorm",
+                "alpha": 0.1
+              },
+              {
+                "group": "model.layers.5.post_attention_layernorm",
+                "alpha": 0.95
+              },
+              {
+                "group": "model.layers.6.input_layernorm",
+                "alpha": 0.0
+              },
+              {
+                "group": "model.layers.6.post_attention_layernorm",
+                "alpha": 0.55
+              },
+              {
+                "group": "model.layers.7.input_layernorm",
+                "alpha": 0.75
+              },
+              {
+                "group": "model.layers.7.post_attention_layernorm",
+                "alpha": 0.15
+              },
+              {
+                "group": "model.layers.8.input_layernorm",
+                "alpha": 0.6
+              },
+              {
+                "group": "model.layers.8.post_attention_layernorm",
+                "alpha": 0.35
+              },
+              {
+                "group": "model.layers.9.input_layernorm",
+                "alpha": 0.7
+              },
+              {
+                "group": "model.layers.9.post_attention_layernorm",
+                "alpha": 0.1
+              },
+              {
+                "group": "model.layers.0.mlp.up_proj->down_proj",
+                "alpha": 0.7
+              },
+              {
+                "group": "model.layers.1.mlp.up_proj->down_proj",
+                "alpha": 0.45
+              },
+              {
+                "group": "model.layers.10.mlp.up_proj->down_proj",
+                "alpha": 0.85
+              },
+              {
+                "group": "model.layers.11.mlp.up_proj->down_proj",
+                "alpha": 0.3
+              },
+              {
+                "group": "model.layers.12.mlp.up_proj->down_proj",
+                "alpha": 0.8
+              },
+              {
+                "group": "model.layers.13.mlp.up_proj->down_proj",
+                "alpha": 0.35
+              },
+              {
+                "group": "model.layers.14.mlp.up_proj->down_proj",
+                "alpha": 0.85
+              },
+              {
+                "group": "model.layers.15.mlp.up_proj->down_proj",
+                "alpha": 0.55
+              },
+              {
+                "group": "model.layers.16.mlp.up_proj->down_proj",
+                "alpha": 0.6
+              },
+              {
+                "group": "model.layers.17.mlp.up_proj->down_proj",
+                "alpha": 0.4
+              },
+              {
+                "group": "model.layers.18.mlp.up_proj->down_proj",
+                "alpha": 0.4
+              },
+              {
+                "group": "model.layers.19.mlp.up_proj->down_proj",
+                "alpha": 0.85
+              },
+              {
+                "group": "model.layers.2.mlp.up_proj->down_proj",
+                "alpha": 0.45
+              },
+              {
+                "group": "model.layers.20.mlp.up_proj->down_proj",
+                "alpha": 0.05
+              },
+              {
+                "group": "model.layers.21.mlp.up_proj->down_proj",
+                "alpha": 0.0
+              },
+              {
+                "group": "model.layers.3.mlp.up_proj->down_proj",
+                "alpha": 0.55
+              },
+              {
+                "group": "model.layers.4.mlp.up_proj->down_proj",
+                "alpha": 0.95
+              },
+              {
+                "group": "model.layers.5.mlp.up_proj->down_proj",
+                "alpha": 0.6
+              },
+              {
+                "group": "model.layers.6.mlp.up_proj->down_proj",
+                "alpha": 0.45
+              },
+              {
+                "group": "model.layers.7.mlp.up_proj->down_proj",
+                "alpha": 0.2
+              },
+              {
+                "group": "model.layers.8.mlp.up_proj->down_proj",
+                "alpha": 0.95
+              },
+              {
+                "group": "model.layers.9.mlp.up_proj->down_proj",
+                "alpha": 0.4
+              }
+            ],
+            "awq_unscaled": {
+              "model.layers.0.self_attn.o_proj": "unscaled: producer is attention; under GQA v_proj has fewer output rows than o_proj has inputs",
+              "model.layers.1.self_attn.o_proj": "unscaled: producer is attention; under GQA v_proj has fewer output rows than o_proj has inputs",
+              "model.layers.2.self_attn.o_proj": "unscaled: producer is attention; under GQA v_proj has fewer output rows than o_proj has inputs",
+              "model.layers.3.self_attn.o_proj": "unscaled: producer is attention; under GQA v_proj has fewer output rows than o_proj has inputs",
+              "model.layers.4.self_attn.o_proj": "unscaled: producer is attention; under GQA v_proj has fewer output rows than o_proj has inputs",
+              "model.layers.5.self_attn.o_proj": "unscaled: producer is attention; under GQA v_proj has fewer output rows than o_proj has inputs",
+              "model.layers.6.self_attn.o_proj": "unscaled: producer is attention; under GQA v_proj has fewer output rows than o_proj has inputs",
+              "model.layers.7.self_attn.o_proj": "unscaled: producer is attention; under GQA v_proj has fewer output rows than o_proj has inputs",
+              "model.layers.8.self_attn.o_proj": "unscaled: producer is attention; under GQA v_proj has fewer output rows than o_proj has inputs",
+              "model.layers.9.self_attn.o_proj": "unscaled: producer is attention; under GQA v_proj has fewer output rows than o_proj has inputs",
+              "model.layers.10.self_attn.o_proj": "unscaled: producer is attention; under GQA v_proj has fewer output rows than o_proj has inputs",
+              "model.layers.11.self_attn.o_proj": "unscaled: producer is attention; under GQA v_proj has fewer output rows than o_proj has inputs",
+              "model.layers.12.self_attn.o_proj": "unscaled: producer is attention; under GQA v_proj has fewer output rows than o_proj has inputs",
+              "model.layers.13.self_attn.o_proj": "unscaled: producer is attention; under GQA v_proj has fewer output rows than o_proj has inputs",
+              "model.layers.14.self_attn.o_proj": "unscaled: producer is attention; under GQA v_proj has fewer output rows than o_proj has inputs",
+              "model.layers.15.self_attn.o_proj": "unscaled: producer is attention; under GQA v_proj has fewer output rows than o_proj has inputs",
+              "model.layers.16.self_attn.o_proj": "unscaled: producer is attention; under GQA v_proj has fewer output rows than o_proj has inputs",
+              "model.layers.17.self_attn.o_proj": "unscaled: producer is attention; under GQA v_proj has fewer output rows than o_proj has inputs",
+              "model.layers.18.self_attn.o_proj": "unscaled: producer is attention; under GQA v_proj has fewer output rows than o_proj has inputs",
+              "model.layers.19.self_attn.o_proj": "unscaled: producer is attention; under GQA v_proj has fewer output rows than o_proj has inputs",
+              "model.layers.20.self_attn.o_proj": "unscaled: producer is attention; under GQA v_proj has fewer output rows than o_proj has inputs",
+              "model.layers.21.self_attn.o_proj": "unscaled: producer is attention; under GQA v_proj has fewer output rows than o_proj has inputs"
+            }
+          },
+          "granularity": null
+        },
+        "module_hooks": [
+          "transform_weight",
+          "weight_scale",
+          "act_scale"
+        ],
+        "module_hooks_applied": true
+      }
+    },
+    "architecture_locator": "/scratch/lsh/atlas-fp8/hf_cache/hub/models--TinyLlama--TinyLlama-1.1B-Chat-v1.0/snapshots/fe8a4ea1ffedaf415f4da2f062534de366a451e6",
+    "config_sha256": "5337e9617d6d229a1634989ea3dd2e222008cb9eb9ac5abe09b2131e77a4fc89",
+    "capture_source": {
+      "fx_export_py": {
+        "sha256": "7f6ffcd838fa6f8d9ad1c9cf69c0d2ec3709c2ba0132da20b980874ee1085d6b",
+        "bytes": 23082
+      },
+      "commit": "2d4b187a74bd82b81ddc9541bee164d0775614f1",
+      "dirty": ""
+    },
+    "seed": 0,
+    "seqlen": 8
+  },
+  "files": {
+    "model.pt2": {
+      "sha256": "6069797615df99558979856e1b1d411c7a9a35fe834a445d08c3642adf8f8966",
+      "bytes": 1411544700
+    },
+    "fixtures.safetensors": {
+      "sha256": "9e87e0a24264446e748ba33a949194be07b7792efb6469143923f339f6fde7dc",
+      "bytes": 1024448
+    },
+    "parity.json": {
+      "sha256": "f197c544339703bcd54cdb40b654a79dc5c231af69234e0d001eea6910aa9af4",
+      "bytes": 432
+    },
+    "buffer_inventory.json": {
+      "sha256": "6f9d80c4f3f1654ce453fc830adee26a81aa7ba83b2d4ccad6b8b41c7b4f1791",
+      "bytes": 66589
+    },
+    "graph_inspection.json": {
+      "sha256": "e691b3d2e1bbdad19ac627fbd31fdbbae7b234ac0893c7ad4a38f6eebe53dda2",
+      "bytes": 78889
+    },
+    "policy.json": {
+      "sha256": "6504bfbe7255eca1636ff448c7e6740abf8fd1720407bf935036f19a562e580c",
+      "bytes": 203462
+    },
+    "graph.txt": {
+      "sha256": "a81a14d10fc03beb10c02bcf269d36e843c1e13a24af0c3c34cf382bac1135b9",
+      "bytes": 5988106
+    },
+    "graph_signature.txt": {
+      "sha256": "cfc7593eb977d4d90655c29dc06bf333390c9d9710bfc6cca8e2e55bdefc8b61",
+      "bytes": 102315
+    }
+  }
+}

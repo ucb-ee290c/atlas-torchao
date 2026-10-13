@@ -1,0 +1,8 @@
+{
+  "status": "passed",
+  "cases": 2,
+  "all_outputs_byte_identical": true,
+  "code_scale_bytes_preserved": true,
+  "unused_float_weights_not_materialized": true,
+  "model_replay_modules_imported": []
+}

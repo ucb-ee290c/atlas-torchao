@@ -1,0 +1,87 @@
+Cloning into '/scratch/lsh/atlas-fp8/results/fx-check/tinyllama-52ur30o5/source/third_party/pi0-quant'...
+done.
+Cloning into '/scratch/lsh/atlas-fp8/results/fx-check/tinyllama-52ur30o5/source/third_party/smolVLA-quant'...
+done.
+Submodule path 'third_party/pi0-quant': checked out '8bc0f6a6cb3faa237eb20b2354a0c8bc7afa524e'
+Submodule path 'third_party/smolVLA-quant': checked out '337363277c347927c45121a40c8ed049d72cff82'
+{
+  "commit": "2d4b187a74bd82b81ddc9541bee164d0775614f1",
+  "source_export": "/scratch/lsh/atlas-fp8/exports/atlas_v1/tinyllama/atlas_v1_awq",
+  "source_manifest_sha256": "f119d777aca6b37fa9618a5fe0edc4c198bbb9375bf11b76baeae66728d83c0c",
+  "source_policy_sha256": "6504bfbe7255eca1636ff448c7e6740abf8fd1720407bf935036f19a562e580c",
+  "original_export_recipe": "atlas_v1_awq",
+  "source_export_provenance": {
+    "atlas_torchao_commit": "a30779befee466e6026f85da2e9cc06cda303425",
+    "atlas_torchao_branch": "HEAD",
+    "atlas_torchao_dirty": true,
+    "versions": {
+      "torch": "2.11.0+cu128",
+      "python": "3.12.3",
+      "torchao": "0.18.0",
+      "transformers": "5.5.4",
+      "safetensors": "0.8.0",
+      "lerobot": "0.6.1",
+      "numpy": "2.2.6"
+    },
+    "host": "firesim2",
+    "device": "cuda",
+    "gpu": "NVIDIA L40S",
+    "argv": [
+      "src/eval.py",
+      "--model",
+      "/scratch/lsh/atlas-fp8/hf_cache/hub/models--TinyLlama--TinyLlama-1.1B-Chat-v1.0/snapshots/fe8a4ea1ffedaf415f4da2f062534de366a451e6",
+      "--modes",
+      "ref_conv",
+      "--algo",
+      "atlas_v1_awq",
+      "--export-dir",
+      "/scratch/lsh/atlas-fp8/exports/atlas_v1/tinyllama/atlas_v1_awq",
+      "--export-only",
+      "--out",
+      "/scratch/lsh/atlas-fp8/exports/atlas_v1/tinyllama/atlas_v1_awq.run.json"
+    ]
+  },
+  "model_config_directory": "/scratch/lsh/atlas-fp8/hf_cache/hub/models--TinyLlama--TinyLlama-1.1B-Chat-v1.0/snapshots/fe8a4ea1ffedaf415f4da2f062534de366a451e6",
+  "torch": "2.11.0+cu128",
+  "gpu": "NVIDIA L40S",
+  "cuda_visible_devices": "1",
+  "free_total_gpu_bytes": [
+    44438650880,
+    47665709056
+  ],
+  "scope": "full TinyLlama logits; ref_conv framework emulation, not native FP8 or chip execution"
+}
+FX_GPU_CHECK_STARTED
+  commit=2d4b187a74bd82b81ddc9541bee164d0775614f1
+  source=/scratch/lsh/atlas-fp8/results/fx-check/tinyllama-52ur30o5/source
+  source_export=/scratch/lsh/atlas-fp8/exports/atlas_v1/tinyllama/atlas_v1_awq
+  results=/scratch/lsh/atlas-fp8/results/fx-check/tinyllama-52ur30o5
+  fx=/scratch/lsh/atlas-fp8/results/fx-check/tinyllama-52ur30o5/fx
+  pid=3874177
+FX_GPU_CHECK_DONE
+{
+  "status": "passed",
+  "commit": "2d4b187a74bd82b81ddc9541bee164d0775614f1",
+  "source": "/scratch/lsh/atlas-fp8/results/fx-check/tinyllama-52ur30o5/source",
+  "source_export": "/scratch/lsh/atlas-fp8/exports/atlas_v1/tinyllama/atlas_v1_awq",
+  "results": "/scratch/lsh/atlas-fp8/results/fx-check/tinyllama-52ur30o5",
+  "fx": "/scratch/lsh/atlas-fp8/results/fx-check/tinyllama-52ur30o5/fx",
+  "model_pt2_sha256": "6069797615df99558979856e1b1d411c7a9a35fe834a445d08c3642adf8f8966",
+  "model_pt2_bytes": 1411544700,
+  "fx_manifest_sha256": "bdfa7020d15c99a228d5ff1600026b0203b8d4416ecfbe1ccf093a1f775cebe3",
+  "weight_sites_verified": 154,
+  "code_scale_buffers": 308,
+  "functional_attention_sites": 22,
+  "functional_attention_structural_binding": "not certified",
+  "input_cases": 2,
+  "batch": 1,
+  "sequence_length": 8,
+  "strict_capture": true,
+  "eager_captured_saved_outputs_byte_identical": true,
+  "fresh_process_without_original_model_code": true,
+  "native_fp8_mlir_verified": false,
+  "hardware_compatibility_verified": false,
+  "source_export_manifest_sha256": "f119d777aca6b37fa9618a5fe0edc4c198bbb9375bf11b76baeae66728d83c0c",
+  "pytest_log": "/scratch/lsh/atlas-fp8/results/fx-check/tinyllama-52ur30o5/pytest-fx-export.log",
+  "scope": "full-checkpoint TinyLlama logits reference-emulation FX; no new accuracy benchmark"
+}

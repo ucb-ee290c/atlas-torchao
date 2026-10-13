@@ -1,0 +1,2805 @@
+{
+  "weight_site_bindings": [
+    {
+      "site": "model.layers.0.self_attn.q_proj",
+      "module": "model.model.layers.0.self_attn.q_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.0.self_attn.q_proj.weight_codes",
+      "scale_buffer": "model.model.layers.0.self_attn.q_proj.weight_scale_exp",
+      "contractions": [
+        "linear"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear",
+          "frexp": [
+            "frexp"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.0.self_attn.k_proj",
+      "module": "model.model.layers.0.self_attn.k_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.0.self_attn.k_proj.weight_codes",
+      "scale_buffer": "model.model.layers.0.self_attn.k_proj.weight_scale_exp",
+      "contractions": [
+        "linear_1"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_1",
+          "frexp": [
+            "frexp_1"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.0.self_attn.v_proj",
+      "module": "model.model.layers.0.self_attn.v_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.0.self_attn.v_proj.weight_codes",
+      "scale_buffer": "model.model.layers.0.self_attn.v_proj.weight_scale_exp",
+      "contractions": [
+        "linear_2"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_2",
+          "frexp": [
+            "frexp_2"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.0.self_attn.o_proj",
+      "module": "model.model.layers.0.self_attn.o_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.0.self_attn.o_proj.weight_codes",
+      "scale_buffer": "model.model.layers.0.self_attn.o_proj.weight_scale_exp",
+      "contractions": [
+        "linear_3"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_3",
+          "frexp": [
+            "frexp_7"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.0.mlp.gate_proj",
+      "module": "model.model.layers.0.mlp.gate_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.0.mlp.gate_proj.weight_codes",
+      "scale_buffer": "model.model.layers.0.mlp.gate_proj.weight_scale_exp",
+      "contractions": [
+        "linear_4"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_4",
+          "frexp": [
+            "frexp_8"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.0.mlp.up_proj",
+      "module": "model.model.layers.0.mlp.up_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.0.mlp.up_proj.weight_codes",
+      "scale_buffer": "model.model.layers.0.mlp.up_proj.weight_scale_exp",
+      "contractions": [
+        "linear_5"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_5",
+          "frexp": [
+            "frexp_9"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.0.mlp.down_proj",
+      "module": "model.model.layers.0.mlp.down_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.0.mlp.down_proj.weight_codes",
+      "scale_buffer": "model.model.layers.0.mlp.down_proj.weight_scale_exp",
+      "contractions": [
+        "linear_6"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_6",
+          "frexp": [
+            "frexp_10"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.1.self_attn.q_proj",
+      "module": "model.model.layers.1.self_attn.q_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.1.self_attn.q_proj.weight_codes",
+      "scale_buffer": "model.model.layers.1.self_attn.q_proj.weight_scale_exp",
+      "contractions": [
+        "linear_7"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_7",
+          "frexp": [
+            "frexp_11"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.1.self_attn.k_proj",
+      "module": "model.model.layers.1.self_attn.k_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.1.self_attn.k_proj.weight_codes",
+      "scale_buffer": "model.model.layers.1.self_attn.k_proj.weight_scale_exp",
+      "contractions": [
+        "linear_8"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_8",
+          "frexp": [
+            "frexp_12"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.1.self_attn.v_proj",
+      "module": "model.model.layers.1.self_attn.v_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.1.self_attn.v_proj.weight_codes",
+      "scale_buffer": "model.model.layers.1.self_attn.v_proj.weight_scale_exp",
+      "contractions": [
+        "linear_9"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_9",
+          "frexp": [
+            "frexp_13"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.1.self_attn.o_proj",
+      "module": "model.model.layers.1.self_attn.o_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.1.self_attn.o_proj.weight_codes",
+      "scale_buffer": "model.model.layers.1.self_attn.o_proj.weight_scale_exp",
+      "contractions": [
+        "linear_10"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_10",
+          "frexp": [
+            "frexp_18"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.1.mlp.gate_proj",
+      "module": "model.model.layers.1.mlp.gate_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.1.mlp.gate_proj.weight_codes",
+      "scale_buffer": "model.model.layers.1.mlp.gate_proj.weight_scale_exp",
+      "contractions": [
+        "linear_11"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_11",
+          "frexp": [
+            "frexp_19"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.1.mlp.up_proj",
+      "module": "model.model.layers.1.mlp.up_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.1.mlp.up_proj.weight_codes",
+      "scale_buffer": "model.model.layers.1.mlp.up_proj.weight_scale_exp",
+      "contractions": [
+        "linear_12"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_12",
+          "frexp": [
+            "frexp_20"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.1.mlp.down_proj",
+      "module": "model.model.layers.1.mlp.down_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.1.mlp.down_proj.weight_codes",
+      "scale_buffer": "model.model.layers.1.mlp.down_proj.weight_scale_exp",
+      "contractions": [
+        "linear_13"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_13",
+          "frexp": [
+            "frexp_21"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.2.self_attn.q_proj",
+      "module": "model.model.layers.2.self_attn.q_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.2.self_attn.q_proj.weight_codes",
+      "scale_buffer": "model.model.layers.2.self_attn.q_proj.weight_scale_exp",
+      "contractions": [
+        "linear_14"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_14",
+          "frexp": [
+            "frexp_22"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.2.self_attn.k_proj",
+      "module": "model.model.layers.2.self_attn.k_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.2.self_attn.k_proj.weight_codes",
+      "scale_buffer": "model.model.layers.2.self_attn.k_proj.weight_scale_exp",
+      "contractions": [
+        "linear_15"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_15",
+          "frexp": [
+            "frexp_23"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.2.self_attn.v_proj",
+      "module": "model.model.layers.2.self_attn.v_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.2.self_attn.v_proj.weight_codes",
+      "scale_buffer": "model.model.layers.2.self_attn.v_proj.weight_scale_exp",
+      "contractions": [
+        "linear_16"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_16",
+          "frexp": [
+            "frexp_24"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.2.self_attn.o_proj",
+      "module": "model.model.layers.2.self_attn.o_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.2.self_attn.o_proj.weight_codes",
+      "scale_buffer": "model.model.layers.2.self_attn.o_proj.weight_scale_exp",
+      "contractions": [
+        "linear_17"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_17",
+          "frexp": [
+            "frexp_29"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.2.mlp.gate_proj",
+      "module": "model.model.layers.2.mlp.gate_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.2.mlp.gate_proj.weight_codes",
+      "scale_buffer": "model.model.layers.2.mlp.gate_proj.weight_scale_exp",
+      "contractions": [
+        "linear_18"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_18",
+          "frexp": [
+            "frexp_30"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.2.mlp.up_proj",
+      "module": "model.model.layers.2.mlp.up_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.2.mlp.up_proj.weight_codes",
+      "scale_buffer": "model.model.layers.2.mlp.up_proj.weight_scale_exp",
+      "contractions": [
+        "linear_19"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_19",
+          "frexp": [
+            "frexp_31"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.2.mlp.down_proj",
+      "module": "model.model.layers.2.mlp.down_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.2.mlp.down_proj.weight_codes",
+      "scale_buffer": "model.model.layers.2.mlp.down_proj.weight_scale_exp",
+      "contractions": [
+        "linear_20"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_20",
+          "frexp": [
+            "frexp_32"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.3.self_attn.q_proj",
+      "module": "model.model.layers.3.self_attn.q_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.3.self_attn.q_proj.weight_codes",
+      "scale_buffer": "model.model.layers.3.self_attn.q_proj.weight_scale_exp",
+      "contractions": [
+        "linear_21"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_21",
+          "frexp": [
+            "frexp_33"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.3.self_attn.k_proj",
+      "module": "model.model.layers.3.self_attn.k_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.3.self_attn.k_proj.weight_codes",
+      "scale_buffer": "model.model.layers.3.self_attn.k_proj.weight_scale_exp",
+      "contractions": [
+        "linear_22"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_22",
+          "frexp": [
+            "frexp_34"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.3.self_attn.v_proj",
+      "module": "model.model.layers.3.self_attn.v_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.3.self_attn.v_proj.weight_codes",
+      "scale_buffer": "model.model.layers.3.self_attn.v_proj.weight_scale_exp",
+      "contractions": [
+        "linear_23"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_23",
+          "frexp": [
+            "frexp_35"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.3.self_attn.o_proj",
+      "module": "model.model.layers.3.self_attn.o_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.3.self_attn.o_proj.weight_codes",
+      "scale_buffer": "model.model.layers.3.self_attn.o_proj.weight_scale_exp",
+      "contractions": [
+        "linear_24"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_24",
+          "frexp": [
+            "frexp_40"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.3.mlp.gate_proj",
+      "module": "model.model.layers.3.mlp.gate_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.3.mlp.gate_proj.weight_codes",
+      "scale_buffer": "model.model.layers.3.mlp.gate_proj.weight_scale_exp",
+      "contractions": [
+        "linear_25"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_25",
+          "frexp": [
+            "frexp_41"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.3.mlp.up_proj",
+      "module": "model.model.layers.3.mlp.up_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.3.mlp.up_proj.weight_codes",
+      "scale_buffer": "model.model.layers.3.mlp.up_proj.weight_scale_exp",
+      "contractions": [
+        "linear_26"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_26",
+          "frexp": [
+            "frexp_42"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.3.mlp.down_proj",
+      "module": "model.model.layers.3.mlp.down_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.3.mlp.down_proj.weight_codes",
+      "scale_buffer": "model.model.layers.3.mlp.down_proj.weight_scale_exp",
+      "contractions": [
+        "linear_27"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_27",
+          "frexp": [
+            "frexp_43"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.4.self_attn.q_proj",
+      "module": "model.model.layers.4.self_attn.q_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.4.self_attn.q_proj.weight_codes",
+      "scale_buffer": "model.model.layers.4.self_attn.q_proj.weight_scale_exp",
+      "contractions": [
+        "linear_28"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_28",
+          "frexp": [
+            "frexp_44"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.4.self_attn.k_proj",
+      "module": "model.model.layers.4.self_attn.k_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.4.self_attn.k_proj.weight_codes",
+      "scale_buffer": "model.model.layers.4.self_attn.k_proj.weight_scale_exp",
+      "contractions": [
+        "linear_29"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_29",
+          "frexp": [
+            "frexp_45"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.4.self_attn.v_proj",
+      "module": "model.model.layers.4.self_attn.v_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.4.self_attn.v_proj.weight_codes",
+      "scale_buffer": "model.model.layers.4.self_attn.v_proj.weight_scale_exp",
+      "contractions": [
+        "linear_30"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_30",
+          "frexp": [
+            "frexp_46"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.4.self_attn.o_proj",
+      "module": "model.model.layers.4.self_attn.o_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.4.self_attn.o_proj.weight_codes",
+      "scale_buffer": "model.model.layers.4.self_attn.o_proj.weight_scale_exp",
+      "contractions": [
+        "linear_31"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_31",
+          "frexp": [
+            "frexp_51"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.4.mlp.gate_proj",
+      "module": "model.model.layers.4.mlp.gate_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.4.mlp.gate_proj.weight_codes",
+      "scale_buffer": "model.model.layers.4.mlp.gate_proj.weight_scale_exp",
+      "contractions": [
+        "linear_32"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_32",
+          "frexp": [
+            "frexp_52"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.4.mlp.up_proj",
+      "module": "model.model.layers.4.mlp.up_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.4.mlp.up_proj.weight_codes",
+      "scale_buffer": "model.model.layers.4.mlp.up_proj.weight_scale_exp",
+      "contractions": [
+        "linear_33"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_33",
+          "frexp": [
+            "frexp_53"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.4.mlp.down_proj",
+      "module": "model.model.layers.4.mlp.down_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.4.mlp.down_proj.weight_codes",
+      "scale_buffer": "model.model.layers.4.mlp.down_proj.weight_scale_exp",
+      "contractions": [
+        "linear_34"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_34",
+          "frexp": [
+            "frexp_54"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.5.self_attn.q_proj",
+      "module": "model.model.layers.5.self_attn.q_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.5.self_attn.q_proj.weight_codes",
+      "scale_buffer": "model.model.layers.5.self_attn.q_proj.weight_scale_exp",
+      "contractions": [
+        "linear_35"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_35",
+          "frexp": [
+            "frexp_55"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.5.self_attn.k_proj",
+      "module": "model.model.layers.5.self_attn.k_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.5.self_attn.k_proj.weight_codes",
+      "scale_buffer": "model.model.layers.5.self_attn.k_proj.weight_scale_exp",
+      "contractions": [
+        "linear_36"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_36",
+          "frexp": [
+            "frexp_56"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.5.self_attn.v_proj",
+      "module": "model.model.layers.5.self_attn.v_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.5.self_attn.v_proj.weight_codes",
+      "scale_buffer": "model.model.layers.5.self_attn.v_proj.weight_scale_exp",
+      "contractions": [
+        "linear_37"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_37",
+          "frexp": [
+            "frexp_57"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.5.self_attn.o_proj",
+      "module": "model.model.layers.5.self_attn.o_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.5.self_attn.o_proj.weight_codes",
+      "scale_buffer": "model.model.layers.5.self_attn.o_proj.weight_scale_exp",
+      "contractions": [
+        "linear_38"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_38",
+          "frexp": [
+            "frexp_62"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.5.mlp.gate_proj",
+      "module": "model.model.layers.5.mlp.gate_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.5.mlp.gate_proj.weight_codes",
+      "scale_buffer": "model.model.layers.5.mlp.gate_proj.weight_scale_exp",
+      "contractions": [
+        "linear_39"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_39",
+          "frexp": [
+            "frexp_63"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.5.mlp.up_proj",
+      "module": "model.model.layers.5.mlp.up_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.5.mlp.up_proj.weight_codes",
+      "scale_buffer": "model.model.layers.5.mlp.up_proj.weight_scale_exp",
+      "contractions": [
+        "linear_40"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_40",
+          "frexp": [
+            "frexp_64"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.5.mlp.down_proj",
+      "module": "model.model.layers.5.mlp.down_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.5.mlp.down_proj.weight_codes",
+      "scale_buffer": "model.model.layers.5.mlp.down_proj.weight_scale_exp",
+      "contractions": [
+        "linear_41"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_41",
+          "frexp": [
+            "frexp_65"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.6.self_attn.q_proj",
+      "module": "model.model.layers.6.self_attn.q_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.6.self_attn.q_proj.weight_codes",
+      "scale_buffer": "model.model.layers.6.self_attn.q_proj.weight_scale_exp",
+      "contractions": [
+        "linear_42"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_42",
+          "frexp": [
+            "frexp_66"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.6.self_attn.k_proj",
+      "module": "model.model.layers.6.self_attn.k_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.6.self_attn.k_proj.weight_codes",
+      "scale_buffer": "model.model.layers.6.self_attn.k_proj.weight_scale_exp",
+      "contractions": [
+        "linear_43"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_43",
+          "frexp": [
+            "frexp_67"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.6.self_attn.v_proj",
+      "module": "model.model.layers.6.self_attn.v_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.6.self_attn.v_proj.weight_codes",
+      "scale_buffer": "model.model.layers.6.self_attn.v_proj.weight_scale_exp",
+      "contractions": [
+        "linear_44"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_44",
+          "frexp": [
+            "frexp_68"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.6.self_attn.o_proj",
+      "module": "model.model.layers.6.self_attn.o_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.6.self_attn.o_proj.weight_codes",
+      "scale_buffer": "model.model.layers.6.self_attn.o_proj.weight_scale_exp",
+      "contractions": [
+        "linear_45"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_45",
+          "frexp": [
+            "frexp_73"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.6.mlp.gate_proj",
+      "module": "model.model.layers.6.mlp.gate_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.6.mlp.gate_proj.weight_codes",
+      "scale_buffer": "model.model.layers.6.mlp.gate_proj.weight_scale_exp",
+      "contractions": [
+        "linear_46"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_46",
+          "frexp": [
+            "frexp_74"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.6.mlp.up_proj",
+      "module": "model.model.layers.6.mlp.up_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.6.mlp.up_proj.weight_codes",
+      "scale_buffer": "model.model.layers.6.mlp.up_proj.weight_scale_exp",
+      "contractions": [
+        "linear_47"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_47",
+          "frexp": [
+            "frexp_75"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.6.mlp.down_proj",
+      "module": "model.model.layers.6.mlp.down_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.6.mlp.down_proj.weight_codes",
+      "scale_buffer": "model.model.layers.6.mlp.down_proj.weight_scale_exp",
+      "contractions": [
+        "linear_48"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_48",
+          "frexp": [
+            "frexp_76"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.7.self_attn.q_proj",
+      "module": "model.model.layers.7.self_attn.q_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.7.self_attn.q_proj.weight_codes",
+      "scale_buffer": "model.model.layers.7.self_attn.q_proj.weight_scale_exp",
+      "contractions": [
+        "linear_49"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_49",
+          "frexp": [
+            "frexp_77"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.7.self_attn.k_proj",
+      "module": "model.model.layers.7.self_attn.k_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.7.self_attn.k_proj.weight_codes",
+      "scale_buffer": "model.model.layers.7.self_attn.k_proj.weight_scale_exp",
+      "contractions": [
+        "linear_50"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_50",
+          "frexp": [
+            "frexp_78"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.7.self_attn.v_proj",
+      "module": "model.model.layers.7.self_attn.v_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.7.self_attn.v_proj.weight_codes",
+      "scale_buffer": "model.model.layers.7.self_attn.v_proj.weight_scale_exp",
+      "contractions": [
+        "linear_51"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_51",
+          "frexp": [
+            "frexp_79"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.7.self_attn.o_proj",
+      "module": "model.model.layers.7.self_attn.o_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.7.self_attn.o_proj.weight_codes",
+      "scale_buffer": "model.model.layers.7.self_attn.o_proj.weight_scale_exp",
+      "contractions": [
+        "linear_52"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_52",
+          "frexp": [
+            "frexp_84"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.7.mlp.gate_proj",
+      "module": "model.model.layers.7.mlp.gate_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.7.mlp.gate_proj.weight_codes",
+      "scale_buffer": "model.model.layers.7.mlp.gate_proj.weight_scale_exp",
+      "contractions": [
+        "linear_53"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_53",
+          "frexp": [
+            "frexp_85"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.7.mlp.up_proj",
+      "module": "model.model.layers.7.mlp.up_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.7.mlp.up_proj.weight_codes",
+      "scale_buffer": "model.model.layers.7.mlp.up_proj.weight_scale_exp",
+      "contractions": [
+        "linear_54"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_54",
+          "frexp": [
+            "frexp_86"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.7.mlp.down_proj",
+      "module": "model.model.layers.7.mlp.down_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.7.mlp.down_proj.weight_codes",
+      "scale_buffer": "model.model.layers.7.mlp.down_proj.weight_scale_exp",
+      "contractions": [
+        "linear_55"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_55",
+          "frexp": [
+            "frexp_87"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.8.self_attn.q_proj",
+      "module": "model.model.layers.8.self_attn.q_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.8.self_attn.q_proj.weight_codes",
+      "scale_buffer": "model.model.layers.8.self_attn.q_proj.weight_scale_exp",
+      "contractions": [
+        "linear_56"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_56",
+          "frexp": [
+            "frexp_88"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.8.self_attn.k_proj",
+      "module": "model.model.layers.8.self_attn.k_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.8.self_attn.k_proj.weight_codes",
+      "scale_buffer": "model.model.layers.8.self_attn.k_proj.weight_scale_exp",
+      "contractions": [
+        "linear_57"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_57",
+          "frexp": [
+            "frexp_89"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.8.self_attn.v_proj",
+      "module": "model.model.layers.8.self_attn.v_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.8.self_attn.v_proj.weight_codes",
+      "scale_buffer": "model.model.layers.8.self_attn.v_proj.weight_scale_exp",
+      "contractions": [
+        "linear_58"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_58",
+          "frexp": [
+            "frexp_90"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.8.self_attn.o_proj",
+      "module": "model.model.layers.8.self_attn.o_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.8.self_attn.o_proj.weight_codes",
+      "scale_buffer": "model.model.layers.8.self_attn.o_proj.weight_scale_exp",
+      "contractions": [
+        "linear_59"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_59",
+          "frexp": [
+            "frexp_95"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.8.mlp.gate_proj",
+      "module": "model.model.layers.8.mlp.gate_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.8.mlp.gate_proj.weight_codes",
+      "scale_buffer": "model.model.layers.8.mlp.gate_proj.weight_scale_exp",
+      "contractions": [
+        "linear_60"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_60",
+          "frexp": [
+            "frexp_96"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.8.mlp.up_proj",
+      "module": "model.model.layers.8.mlp.up_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.8.mlp.up_proj.weight_codes",
+      "scale_buffer": "model.model.layers.8.mlp.up_proj.weight_scale_exp",
+      "contractions": [
+        "linear_61"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_61",
+          "frexp": [
+            "frexp_97"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.8.mlp.down_proj",
+      "module": "model.model.layers.8.mlp.down_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.8.mlp.down_proj.weight_codes",
+      "scale_buffer": "model.model.layers.8.mlp.down_proj.weight_scale_exp",
+      "contractions": [
+        "linear_62"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_62",
+          "frexp": [
+            "frexp_98"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.9.self_attn.q_proj",
+      "module": "model.model.layers.9.self_attn.q_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.9.self_attn.q_proj.weight_codes",
+      "scale_buffer": "model.model.layers.9.self_attn.q_proj.weight_scale_exp",
+      "contractions": [
+        "linear_63"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_63",
+          "frexp": [
+            "frexp_99"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.9.self_attn.k_proj",
+      "module": "model.model.layers.9.self_attn.k_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.9.self_attn.k_proj.weight_codes",
+      "scale_buffer": "model.model.layers.9.self_attn.k_proj.weight_scale_exp",
+      "contractions": [
+        "linear_64"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_64",
+          "frexp": [
+            "frexp_100"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.9.self_attn.v_proj",
+      "module": "model.model.layers.9.self_attn.v_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.9.self_attn.v_proj.weight_codes",
+      "scale_buffer": "model.model.layers.9.self_attn.v_proj.weight_scale_exp",
+      "contractions": [
+        "linear_65"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_65",
+          "frexp": [
+            "frexp_101"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.9.self_attn.o_proj",
+      "module": "model.model.layers.9.self_attn.o_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.9.self_attn.o_proj.weight_codes",
+      "scale_buffer": "model.model.layers.9.self_attn.o_proj.weight_scale_exp",
+      "contractions": [
+        "linear_66"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_66",
+          "frexp": [
+            "frexp_106"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.9.mlp.gate_proj",
+      "module": "model.model.layers.9.mlp.gate_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.9.mlp.gate_proj.weight_codes",
+      "scale_buffer": "model.model.layers.9.mlp.gate_proj.weight_scale_exp",
+      "contractions": [
+        "linear_67"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_67",
+          "frexp": [
+            "frexp_107"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.9.mlp.up_proj",
+      "module": "model.model.layers.9.mlp.up_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.9.mlp.up_proj.weight_codes",
+      "scale_buffer": "model.model.layers.9.mlp.up_proj.weight_scale_exp",
+      "contractions": [
+        "linear_68"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_68",
+          "frexp": [
+            "frexp_108"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.9.mlp.down_proj",
+      "module": "model.model.layers.9.mlp.down_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.9.mlp.down_proj.weight_codes",
+      "scale_buffer": "model.model.layers.9.mlp.down_proj.weight_scale_exp",
+      "contractions": [
+        "linear_69"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_69",
+          "frexp": [
+            "frexp_109"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.10.self_attn.q_proj",
+      "module": "model.model.layers.10.self_attn.q_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.10.self_attn.q_proj.weight_codes",
+      "scale_buffer": "model.model.layers.10.self_attn.q_proj.weight_scale_exp",
+      "contractions": [
+        "linear_70"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_70",
+          "frexp": [
+            "frexp_110"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.10.self_attn.k_proj",
+      "module": "model.model.layers.10.self_attn.k_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.10.self_attn.k_proj.weight_codes",
+      "scale_buffer": "model.model.layers.10.self_attn.k_proj.weight_scale_exp",
+      "contractions": [
+        "linear_71"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_71",
+          "frexp": [
+            "frexp_111"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.10.self_attn.v_proj",
+      "module": "model.model.layers.10.self_attn.v_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.10.self_attn.v_proj.weight_codes",
+      "scale_buffer": "model.model.layers.10.self_attn.v_proj.weight_scale_exp",
+      "contractions": [
+        "linear_72"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_72",
+          "frexp": [
+            "frexp_112"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.10.self_attn.o_proj",
+      "module": "model.model.layers.10.self_attn.o_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.10.self_attn.o_proj.weight_codes",
+      "scale_buffer": "model.model.layers.10.self_attn.o_proj.weight_scale_exp",
+      "contractions": [
+        "linear_73"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_73",
+          "frexp": [
+            "frexp_117"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.10.mlp.gate_proj",
+      "module": "model.model.layers.10.mlp.gate_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.10.mlp.gate_proj.weight_codes",
+      "scale_buffer": "model.model.layers.10.mlp.gate_proj.weight_scale_exp",
+      "contractions": [
+        "linear_74"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_74",
+          "frexp": [
+            "frexp_118"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.10.mlp.up_proj",
+      "module": "model.model.layers.10.mlp.up_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.10.mlp.up_proj.weight_codes",
+      "scale_buffer": "model.model.layers.10.mlp.up_proj.weight_scale_exp",
+      "contractions": [
+        "linear_75"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_75",
+          "frexp": [
+            "frexp_119"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.10.mlp.down_proj",
+      "module": "model.model.layers.10.mlp.down_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.10.mlp.down_proj.weight_codes",
+      "scale_buffer": "model.model.layers.10.mlp.down_proj.weight_scale_exp",
+      "contractions": [
+        "linear_76"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_76",
+          "frexp": [
+            "frexp_120"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.11.self_attn.q_proj",
+      "module": "model.model.layers.11.self_attn.q_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.11.self_attn.q_proj.weight_codes",
+      "scale_buffer": "model.model.layers.11.self_attn.q_proj.weight_scale_exp",
+      "contractions": [
+        "linear_77"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_77",
+          "frexp": [
+            "frexp_121"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.11.self_attn.k_proj",
+      "module": "model.model.layers.11.self_attn.k_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.11.self_attn.k_proj.weight_codes",
+      "scale_buffer": "model.model.layers.11.self_attn.k_proj.weight_scale_exp",
+      "contractions": [
+        "linear_78"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_78",
+          "frexp": [
+            "frexp_122"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.11.self_attn.v_proj",
+      "module": "model.model.layers.11.self_attn.v_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.11.self_attn.v_proj.weight_codes",
+      "scale_buffer": "model.model.layers.11.self_attn.v_proj.weight_scale_exp",
+      "contractions": [
+        "linear_79"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_79",
+          "frexp": [
+            "frexp_123"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.11.self_attn.o_proj",
+      "module": "model.model.layers.11.self_attn.o_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.11.self_attn.o_proj.weight_codes",
+      "scale_buffer": "model.model.layers.11.self_attn.o_proj.weight_scale_exp",
+      "contractions": [
+        "linear_80"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_80",
+          "frexp": [
+            "frexp_128"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.11.mlp.gate_proj",
+      "module": "model.model.layers.11.mlp.gate_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.11.mlp.gate_proj.weight_codes",
+      "scale_buffer": "model.model.layers.11.mlp.gate_proj.weight_scale_exp",
+      "contractions": [
+        "linear_81"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_81",
+          "frexp": [
+            "frexp_129"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.11.mlp.up_proj",
+      "module": "model.model.layers.11.mlp.up_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.11.mlp.up_proj.weight_codes",
+      "scale_buffer": "model.model.layers.11.mlp.up_proj.weight_scale_exp",
+      "contractions": [
+        "linear_82"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_82",
+          "frexp": [
+            "frexp_130"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.11.mlp.down_proj",
+      "module": "model.model.layers.11.mlp.down_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.11.mlp.down_proj.weight_codes",
+      "scale_buffer": "model.model.layers.11.mlp.down_proj.weight_scale_exp",
+      "contractions": [
+        "linear_83"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_83",
+          "frexp": [
+            "frexp_131"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.12.self_attn.q_proj",
+      "module": "model.model.layers.12.self_attn.q_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.12.self_attn.q_proj.weight_codes",
+      "scale_buffer": "model.model.layers.12.self_attn.q_proj.weight_scale_exp",
+      "contractions": [
+        "linear_84"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_84",
+          "frexp": [
+            "frexp_132"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.12.self_attn.k_proj",
+      "module": "model.model.layers.12.self_attn.k_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.12.self_attn.k_proj.weight_codes",
+      "scale_buffer": "model.model.layers.12.self_attn.k_proj.weight_scale_exp",
+      "contractions": [
+        "linear_85"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_85",
+          "frexp": [
+            "frexp_133"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.12.self_attn.v_proj",
+      "module": "model.model.layers.12.self_attn.v_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.12.self_attn.v_proj.weight_codes",
+      "scale_buffer": "model.model.layers.12.self_attn.v_proj.weight_scale_exp",
+      "contractions": [
+        "linear_86"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_86",
+          "frexp": [
+            "frexp_134"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.12.self_attn.o_proj",
+      "module": "model.model.layers.12.self_attn.o_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.12.self_attn.o_proj.weight_codes",
+      "scale_buffer": "model.model.layers.12.self_attn.o_proj.weight_scale_exp",
+      "contractions": [
+        "linear_87"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_87",
+          "frexp": [
+            "frexp_139"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.12.mlp.gate_proj",
+      "module": "model.model.layers.12.mlp.gate_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.12.mlp.gate_proj.weight_codes",
+      "scale_buffer": "model.model.layers.12.mlp.gate_proj.weight_scale_exp",
+      "contractions": [
+        "linear_88"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_88",
+          "frexp": [
+            "frexp_140"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.12.mlp.up_proj",
+      "module": "model.model.layers.12.mlp.up_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.12.mlp.up_proj.weight_codes",
+      "scale_buffer": "model.model.layers.12.mlp.up_proj.weight_scale_exp",
+      "contractions": [
+        "linear_89"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_89",
+          "frexp": [
+            "frexp_141"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.12.mlp.down_proj",
+      "module": "model.model.layers.12.mlp.down_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.12.mlp.down_proj.weight_codes",
+      "scale_buffer": "model.model.layers.12.mlp.down_proj.weight_scale_exp",
+      "contractions": [
+        "linear_90"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_90",
+          "frexp": [
+            "frexp_142"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.13.self_attn.q_proj",
+      "module": "model.model.layers.13.self_attn.q_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.13.self_attn.q_proj.weight_codes",
+      "scale_buffer": "model.model.layers.13.self_attn.q_proj.weight_scale_exp",
+      "contractions": [
+        "linear_91"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_91",
+          "frexp": [
+            "frexp_143"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.13.self_attn.k_proj",
+      "module": "model.model.layers.13.self_attn.k_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.13.self_attn.k_proj.weight_codes",
+      "scale_buffer": "model.model.layers.13.self_attn.k_proj.weight_scale_exp",
+      "contractions": [
+        "linear_92"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_92",
+          "frexp": [
+            "frexp_144"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.13.self_attn.v_proj",
+      "module": "model.model.layers.13.self_attn.v_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.13.self_attn.v_proj.weight_codes",
+      "scale_buffer": "model.model.layers.13.self_attn.v_proj.weight_scale_exp",
+      "contractions": [
+        "linear_93"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_93",
+          "frexp": [
+            "frexp_145"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.13.self_attn.o_proj",
+      "module": "model.model.layers.13.self_attn.o_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.13.self_attn.o_proj.weight_codes",
+      "scale_buffer": "model.model.layers.13.self_attn.o_proj.weight_scale_exp",
+      "contractions": [
+        "linear_94"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_94",
+          "frexp": [
+            "frexp_150"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.13.mlp.gate_proj",
+      "module": "model.model.layers.13.mlp.gate_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.13.mlp.gate_proj.weight_codes",
+      "scale_buffer": "model.model.layers.13.mlp.gate_proj.weight_scale_exp",
+      "contractions": [
+        "linear_95"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_95",
+          "frexp": [
+            "frexp_151"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.13.mlp.up_proj",
+      "module": "model.model.layers.13.mlp.up_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.13.mlp.up_proj.weight_codes",
+      "scale_buffer": "model.model.layers.13.mlp.up_proj.weight_scale_exp",
+      "contractions": [
+        "linear_96"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_96",
+          "frexp": [
+            "frexp_152"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.13.mlp.down_proj",
+      "module": "model.model.layers.13.mlp.down_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.13.mlp.down_proj.weight_codes",
+      "scale_buffer": "model.model.layers.13.mlp.down_proj.weight_scale_exp",
+      "contractions": [
+        "linear_97"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_97",
+          "frexp": [
+            "frexp_153"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.14.self_attn.q_proj",
+      "module": "model.model.layers.14.self_attn.q_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.14.self_attn.q_proj.weight_codes",
+      "scale_buffer": "model.model.layers.14.self_attn.q_proj.weight_scale_exp",
+      "contractions": [
+        "linear_98"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_98",
+          "frexp": [
+            "frexp_154"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.14.self_attn.k_proj",
+      "module": "model.model.layers.14.self_attn.k_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.14.self_attn.k_proj.weight_codes",
+      "scale_buffer": "model.model.layers.14.self_attn.k_proj.weight_scale_exp",
+      "contractions": [
+        "linear_99"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_99",
+          "frexp": [
+            "frexp_155"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.14.self_attn.v_proj",
+      "module": "model.model.layers.14.self_attn.v_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.14.self_attn.v_proj.weight_codes",
+      "scale_buffer": "model.model.layers.14.self_attn.v_proj.weight_scale_exp",
+      "contractions": [
+        "linear_100"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_100",
+          "frexp": [
+            "frexp_156"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.14.self_attn.o_proj",
+      "module": "model.model.layers.14.self_attn.o_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.14.self_attn.o_proj.weight_codes",
+      "scale_buffer": "model.model.layers.14.self_attn.o_proj.weight_scale_exp",
+      "contractions": [
+        "linear_101"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_101",
+          "frexp": [
+            "frexp_161"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.14.mlp.gate_proj",
+      "module": "model.model.layers.14.mlp.gate_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.14.mlp.gate_proj.weight_codes",
+      "scale_buffer": "model.model.layers.14.mlp.gate_proj.weight_scale_exp",
+      "contractions": [
+        "linear_102"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_102",
+          "frexp": [
+            "frexp_162"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.14.mlp.up_proj",
+      "module": "model.model.layers.14.mlp.up_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.14.mlp.up_proj.weight_codes",
+      "scale_buffer": "model.model.layers.14.mlp.up_proj.weight_scale_exp",
+      "contractions": [
+        "linear_103"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_103",
+          "frexp": [
+            "frexp_163"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.14.mlp.down_proj",
+      "module": "model.model.layers.14.mlp.down_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.14.mlp.down_proj.weight_codes",
+      "scale_buffer": "model.model.layers.14.mlp.down_proj.weight_scale_exp",
+      "contractions": [
+        "linear_104"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_104",
+          "frexp": [
+            "frexp_164"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.15.self_attn.q_proj",
+      "module": "model.model.layers.15.self_attn.q_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.15.self_attn.q_proj.weight_codes",
+      "scale_buffer": "model.model.layers.15.self_attn.q_proj.weight_scale_exp",
+      "contractions": [
+        "linear_105"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_105",
+          "frexp": [
+            "frexp_165"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.15.self_attn.k_proj",
+      "module": "model.model.layers.15.self_attn.k_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.15.self_attn.k_proj.weight_codes",
+      "scale_buffer": "model.model.layers.15.self_attn.k_proj.weight_scale_exp",
+      "contractions": [
+        "linear_106"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_106",
+          "frexp": [
+            "frexp_166"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.15.self_attn.v_proj",
+      "module": "model.model.layers.15.self_attn.v_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.15.self_attn.v_proj.weight_codes",
+      "scale_buffer": "model.model.layers.15.self_attn.v_proj.weight_scale_exp",
+      "contractions": [
+        "linear_107"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_107",
+          "frexp": [
+            "frexp_167"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.15.self_attn.o_proj",
+      "module": "model.model.layers.15.self_attn.o_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.15.self_attn.o_proj.weight_codes",
+      "scale_buffer": "model.model.layers.15.self_attn.o_proj.weight_scale_exp",
+      "contractions": [
+        "linear_108"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_108",
+          "frexp": [
+            "frexp_172"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.15.mlp.gate_proj",
+      "module": "model.model.layers.15.mlp.gate_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.15.mlp.gate_proj.weight_codes",
+      "scale_buffer": "model.model.layers.15.mlp.gate_proj.weight_scale_exp",
+      "contractions": [
+        "linear_109"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_109",
+          "frexp": [
+            "frexp_173"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.15.mlp.up_proj",
+      "module": "model.model.layers.15.mlp.up_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.15.mlp.up_proj.weight_codes",
+      "scale_buffer": "model.model.layers.15.mlp.up_proj.weight_scale_exp",
+      "contractions": [
+        "linear_110"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_110",
+          "frexp": [
+            "frexp_174"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.15.mlp.down_proj",
+      "module": "model.model.layers.15.mlp.down_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.15.mlp.down_proj.weight_codes",
+      "scale_buffer": "model.model.layers.15.mlp.down_proj.weight_scale_exp",
+      "contractions": [
+        "linear_111"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_111",
+          "frexp": [
+            "frexp_175"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.16.self_attn.q_proj",
+      "module": "model.model.layers.16.self_attn.q_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.16.self_attn.q_proj.weight_codes",
+      "scale_buffer": "model.model.layers.16.self_attn.q_proj.weight_scale_exp",
+      "contractions": [
+        "linear_112"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_112",
+          "frexp": [
+            "frexp_176"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.16.self_attn.k_proj",
+      "module": "model.model.layers.16.self_attn.k_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.16.self_attn.k_proj.weight_codes",
+      "scale_buffer": "model.model.layers.16.self_attn.k_proj.weight_scale_exp",
+      "contractions": [
+        "linear_113"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_113",
+          "frexp": [
+            "frexp_177"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.16.self_attn.v_proj",
+      "module": "model.model.layers.16.self_attn.v_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.16.self_attn.v_proj.weight_codes",
+      "scale_buffer": "model.model.layers.16.self_attn.v_proj.weight_scale_exp",
+      "contractions": [
+        "linear_114"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_114",
+          "frexp": [
+            "frexp_178"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.16.self_attn.o_proj",
+      "module": "model.model.layers.16.self_attn.o_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.16.self_attn.o_proj.weight_codes",
+      "scale_buffer": "model.model.layers.16.self_attn.o_proj.weight_scale_exp",
+      "contractions": [
+        "linear_115"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_115",
+          "frexp": [
+            "frexp_183"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.16.mlp.gate_proj",
+      "module": "model.model.layers.16.mlp.gate_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.16.mlp.gate_proj.weight_codes",
+      "scale_buffer": "model.model.layers.16.mlp.gate_proj.weight_scale_exp",
+      "contractions": [
+        "linear_116"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_116",
+          "frexp": [
+            "frexp_184"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.16.mlp.up_proj",
+      "module": "model.model.layers.16.mlp.up_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.16.mlp.up_proj.weight_codes",
+      "scale_buffer": "model.model.layers.16.mlp.up_proj.weight_scale_exp",
+      "contractions": [
+        "linear_117"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_117",
+          "frexp": [
+            "frexp_185"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.16.mlp.down_proj",
+      "module": "model.model.layers.16.mlp.down_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.16.mlp.down_proj.weight_codes",
+      "scale_buffer": "model.model.layers.16.mlp.down_proj.weight_scale_exp",
+      "contractions": [
+        "linear_118"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_118",
+          "frexp": [
+            "frexp_186"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.17.self_attn.q_proj",
+      "module": "model.model.layers.17.self_attn.q_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.17.self_attn.q_proj.weight_codes",
+      "scale_buffer": "model.model.layers.17.self_attn.q_proj.weight_scale_exp",
+      "contractions": [
+        "linear_119"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_119",
+          "frexp": [
+            "frexp_187"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.17.self_attn.k_proj",
+      "module": "model.model.layers.17.self_attn.k_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.17.self_attn.k_proj.weight_codes",
+      "scale_buffer": "model.model.layers.17.self_attn.k_proj.weight_scale_exp",
+      "contractions": [
+        "linear_120"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_120",
+          "frexp": [
+            "frexp_188"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.17.self_attn.v_proj",
+      "module": "model.model.layers.17.self_attn.v_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.17.self_attn.v_proj.weight_codes",
+      "scale_buffer": "model.model.layers.17.self_attn.v_proj.weight_scale_exp",
+      "contractions": [
+        "linear_121"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_121",
+          "frexp": [
+            "frexp_189"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.17.self_attn.o_proj",
+      "module": "model.model.layers.17.self_attn.o_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.17.self_attn.o_proj.weight_codes",
+      "scale_buffer": "model.model.layers.17.self_attn.o_proj.weight_scale_exp",
+      "contractions": [
+        "linear_122"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_122",
+          "frexp": [
+            "frexp_194"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.17.mlp.gate_proj",
+      "module": "model.model.layers.17.mlp.gate_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.17.mlp.gate_proj.weight_codes",
+      "scale_buffer": "model.model.layers.17.mlp.gate_proj.weight_scale_exp",
+      "contractions": [
+        "linear_123"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_123",
+          "frexp": [
+            "frexp_195"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.17.mlp.up_proj",
+      "module": "model.model.layers.17.mlp.up_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.17.mlp.up_proj.weight_codes",
+      "scale_buffer": "model.model.layers.17.mlp.up_proj.weight_scale_exp",
+      "contractions": [
+        "linear_124"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_124",
+          "frexp": [
+            "frexp_196"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.17.mlp.down_proj",
+      "module": "model.model.layers.17.mlp.down_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.17.mlp.down_proj.weight_codes",
+      "scale_buffer": "model.model.layers.17.mlp.down_proj.weight_scale_exp",
+      "contractions": [
+        "linear_125"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_125",
+          "frexp": [
+            "frexp_197"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.18.self_attn.q_proj",
+      "module": "model.model.layers.18.self_attn.q_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.18.self_attn.q_proj.weight_codes",
+      "scale_buffer": "model.model.layers.18.self_attn.q_proj.weight_scale_exp",
+      "contractions": [
+        "linear_126"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_126",
+          "frexp": [
+            "frexp_198"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.18.self_attn.k_proj",
+      "module": "model.model.layers.18.self_attn.k_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.18.self_attn.k_proj.weight_codes",
+      "scale_buffer": "model.model.layers.18.self_attn.k_proj.weight_scale_exp",
+      "contractions": [
+        "linear_127"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_127",
+          "frexp": [
+            "frexp_199"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.18.self_attn.v_proj",
+      "module": "model.model.layers.18.self_attn.v_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.18.self_attn.v_proj.weight_codes",
+      "scale_buffer": "model.model.layers.18.self_attn.v_proj.weight_scale_exp",
+      "contractions": [
+        "linear_128"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_128",
+          "frexp": [
+            "frexp_200"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.18.self_attn.o_proj",
+      "module": "model.model.layers.18.self_attn.o_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.18.self_attn.o_proj.weight_codes",
+      "scale_buffer": "model.model.layers.18.self_attn.o_proj.weight_scale_exp",
+      "contractions": [
+        "linear_129"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_129",
+          "frexp": [
+            "frexp_205"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.18.mlp.gate_proj",
+      "module": "model.model.layers.18.mlp.gate_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.18.mlp.gate_proj.weight_codes",
+      "scale_buffer": "model.model.layers.18.mlp.gate_proj.weight_scale_exp",
+      "contractions": [
+        "linear_130"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_130",
+          "frexp": [
+            "frexp_206"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.18.mlp.up_proj",
+      "module": "model.model.layers.18.mlp.up_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.18.mlp.up_proj.weight_codes",
+      "scale_buffer": "model.model.layers.18.mlp.up_proj.weight_scale_exp",
+      "contractions": [
+        "linear_131"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_131",
+          "frexp": [
+            "frexp_207"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.18.mlp.down_proj",
+      "module": "model.model.layers.18.mlp.down_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.18.mlp.down_proj.weight_codes",
+      "scale_buffer": "model.model.layers.18.mlp.down_proj.weight_scale_exp",
+      "contractions": [
+        "linear_132"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_132",
+          "frexp": [
+            "frexp_208"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.19.self_attn.q_proj",
+      "module": "model.model.layers.19.self_attn.q_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.19.self_attn.q_proj.weight_codes",
+      "scale_buffer": "model.model.layers.19.self_attn.q_proj.weight_scale_exp",
+      "contractions": [
+        "linear_133"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_133",
+          "frexp": [
+            "frexp_209"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.19.self_attn.k_proj",
+      "module": "model.model.layers.19.self_attn.k_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.19.self_attn.k_proj.weight_codes",
+      "scale_buffer": "model.model.layers.19.self_attn.k_proj.weight_scale_exp",
+      "contractions": [
+        "linear_134"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_134",
+          "frexp": [
+            "frexp_210"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.19.self_attn.v_proj",
+      "module": "model.model.layers.19.self_attn.v_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.19.self_attn.v_proj.weight_codes",
+      "scale_buffer": "model.model.layers.19.self_attn.v_proj.weight_scale_exp",
+      "contractions": [
+        "linear_135"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_135",
+          "frexp": [
+            "frexp_211"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.19.self_attn.o_proj",
+      "module": "model.model.layers.19.self_attn.o_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.19.self_attn.o_proj.weight_codes",
+      "scale_buffer": "model.model.layers.19.self_attn.o_proj.weight_scale_exp",
+      "contractions": [
+        "linear_136"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_136",
+          "frexp": [
+            "frexp_216"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.19.mlp.gate_proj",
+      "module": "model.model.layers.19.mlp.gate_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.19.mlp.gate_proj.weight_codes",
+      "scale_buffer": "model.model.layers.19.mlp.gate_proj.weight_scale_exp",
+      "contractions": [
+        "linear_137"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_137",
+          "frexp": [
+            "frexp_217"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.19.mlp.up_proj",
+      "module": "model.model.layers.19.mlp.up_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.19.mlp.up_proj.weight_codes",
+      "scale_buffer": "model.model.layers.19.mlp.up_proj.weight_scale_exp",
+      "contractions": [
+        "linear_138"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_138",
+          "frexp": [
+            "frexp_218"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.19.mlp.down_proj",
+      "module": "model.model.layers.19.mlp.down_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.19.mlp.down_proj.weight_codes",
+      "scale_buffer": "model.model.layers.19.mlp.down_proj.weight_scale_exp",
+      "contractions": [
+        "linear_139"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_139",
+          "frexp": [
+            "frexp_219"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.20.self_attn.q_proj",
+      "module": "model.model.layers.20.self_attn.q_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.20.self_attn.q_proj.weight_codes",
+      "scale_buffer": "model.model.layers.20.self_attn.q_proj.weight_scale_exp",
+      "contractions": [
+        "linear_140"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_140",
+          "frexp": [
+            "frexp_220"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.20.self_attn.k_proj",
+      "module": "model.model.layers.20.self_attn.k_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.20.self_attn.k_proj.weight_codes",
+      "scale_buffer": "model.model.layers.20.self_attn.k_proj.weight_scale_exp",
+      "contractions": [
+        "linear_141"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_141",
+          "frexp": [
+            "frexp_221"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.20.self_attn.v_proj",
+      "module": "model.model.layers.20.self_attn.v_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.20.self_attn.v_proj.weight_codes",
+      "scale_buffer": "model.model.layers.20.self_attn.v_proj.weight_scale_exp",
+      "contractions": [
+        "linear_142"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_142",
+          "frexp": [
+            "frexp_222"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.20.self_attn.o_proj",
+      "module": "model.model.layers.20.self_attn.o_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.20.self_attn.o_proj.weight_codes",
+      "scale_buffer": "model.model.layers.20.self_attn.o_proj.weight_scale_exp",
+      "contractions": [
+        "linear_143"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_143",
+          "frexp": [
+            "frexp_227"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.20.mlp.gate_proj",
+      "module": "model.model.layers.20.mlp.gate_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.20.mlp.gate_proj.weight_codes",
+      "scale_buffer": "model.model.layers.20.mlp.gate_proj.weight_scale_exp",
+      "contractions": [
+        "linear_144"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_144",
+          "frexp": [
+            "frexp_228"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.20.mlp.up_proj",
+      "module": "model.model.layers.20.mlp.up_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.20.mlp.up_proj.weight_codes",
+      "scale_buffer": "model.model.layers.20.mlp.up_proj.weight_scale_exp",
+      "contractions": [
+        "linear_145"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_145",
+          "frexp": [
+            "frexp_229"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.20.mlp.down_proj",
+      "module": "model.model.layers.20.mlp.down_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.20.mlp.down_proj.weight_codes",
+      "scale_buffer": "model.model.layers.20.mlp.down_proj.weight_scale_exp",
+      "contractions": [
+        "linear_146"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_146",
+          "frexp": [
+            "frexp_230"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.21.self_attn.q_proj",
+      "module": "model.model.layers.21.self_attn.q_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.21.self_attn.q_proj.weight_codes",
+      "scale_buffer": "model.model.layers.21.self_attn.q_proj.weight_scale_exp",
+      "contractions": [
+        "linear_147"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_147",
+          "frexp": [
+            "frexp_231"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.21.self_attn.k_proj",
+      "module": "model.model.layers.21.self_attn.k_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.21.self_attn.k_proj.weight_codes",
+      "scale_buffer": "model.model.layers.21.self_attn.k_proj.weight_scale_exp",
+      "contractions": [
+        "linear_148"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_148",
+          "frexp": [
+            "frexp_232"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.21.self_attn.v_proj",
+      "module": "model.model.layers.21.self_attn.v_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.21.self_attn.v_proj.weight_codes",
+      "scale_buffer": "model.model.layers.21.self_attn.v_proj.weight_scale_exp",
+      "contractions": [
+        "linear_149"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_149",
+          "frexp": [
+            "frexp_233"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.21.self_attn.o_proj",
+      "module": "model.model.layers.21.self_attn.o_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.21.self_attn.o_proj.weight_codes",
+      "scale_buffer": "model.model.layers.21.self_attn.o_proj.weight_scale_exp",
+      "contractions": [
+        "linear_150"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_150",
+          "frexp": [
+            "frexp_238"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.21.mlp.gate_proj",
+      "module": "model.model.layers.21.mlp.gate_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.21.mlp.gate_proj.weight_codes",
+      "scale_buffer": "model.model.layers.21.mlp.gate_proj.weight_scale_exp",
+      "contractions": [
+        "linear_151"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_151",
+          "frexp": [
+            "frexp_239"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.21.mlp.up_proj",
+      "module": "model.model.layers.21.mlp.up_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.21.mlp.up_proj.weight_codes",
+      "scale_buffer": "model.model.layers.21.mlp.up_proj.weight_scale_exp",
+      "contractions": [
+        "linear_152"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_152",
+          "frexp": [
+            "frexp_240"
+          ]
+        }
+      ]
+    },
+    {
+      "site": "model.layers.21.mlp.down_proj",
+      "module": "model.model.layers.21.mlp.down_proj",
+      "kind": "linear",
+      "code_buffer": "model.model.layers.21.mlp.down_proj.weight_codes",
+      "scale_buffer": "model.model.layers.21.mlp.down_proj.weight_scale_exp",
+      "contractions": [
+        "linear_153"
+      ],
+      "dynamic_scale_witnesses": [
+        {
+          "contraction": "linear_153",
+          "frexp": [
+            "frexp_241"
+          ]
+        }
+      ]
+    }
+  ],
+  "weight_sites_verified": 154,
+  "functional_attention_sites": [
+    "model.layers.0.self_attn",
+    "model.layers.1.self_attn",
+    "model.layers.10.self_attn",
+    "model.layers.11.self_attn",
+    "model.layers.12.self_attn",
+    "model.layers.13.self_attn",
+    "model.layers.14.self_attn",
+    "model.layers.15.self_attn",
+    "model.layers.16.self_attn",
+    "model.layers.17.self_attn",
+    "model.layers.18.self_attn",
+    "model.layers.19.self_attn",
+    "model.layers.2.self_attn",
+    "model.layers.20.self_attn",
+    "model.layers.21.self_attn",
+    "model.layers.3.self_attn",
+    "model.layers.4.self_attn",
+    "model.layers.5.self_attn",
+    "model.layers.6.self_attn",
+    "model.layers.7.self_attn",
+    "model.layers.8.self_attn",
+    "model.layers.9.self_attn"
+  ],
+  "functional_attention_structural_binding": "not certified; covered by boundary output parity",
+  "unused_parameters": [],
+  "unused_quantized_weight_storage": "meta placeholders; no serialized float weight payload",
+  "scope": "reference-emulation FX; not native-FP8 MLIR or hardware compatibility"
+}
