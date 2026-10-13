@@ -22,6 +22,9 @@ The [verified release records](release/README.md) retain results, export verific
 the presentation and the shared-document replacement. The code tag remains pinned at
 the GPU-verified commit; graph export and compiler integration are separate work.
 
+[FX graph export](fx-export.md) adds a separate checked `ExportedProgram` for reference
+replay. It does not alter the existing three-file quantized export or the release tag.
+
 ## Hook API (`src/algos/base.py`)
 
 Subclass `algos.base.Algo`, override only the hooks you need, and set `ALGO = YourClass` in the
