@@ -41,6 +41,36 @@ def write_new(path, value):
         stream.write("\n")
 
 
+def verify_export_pin(export_dir, expected_sha256):
+    """Metadata/payload integrity only; never load tensors, fit or run a model."""
+    def full_hash(value):
+        return isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
+    if not full_hash(expected_sha256):
+        raise ValueError("export pin must be a full lowercase SHA256")
+    root = Path(export_dir)
+    data = (root / "manifest.json").read_bytes()
+    actual = hashlib.sha256(data).hexdigest()
+    if actual != expected_sha256:
+        raise ValueError("export manifest differs from the independently supplied artifact pin")
+    manifest = json.loads(data)
+    files = manifest.get("files", {})
+    if not {"policy.json", "model.safetensors"} <= files.keys():
+        raise ValueError("export must declare policy and model payload hashes")
+    verified = {}
+    for name, row in files.items():
+        if Path(name).name != name or name in (".", "..") or not full_hash(row.get("sha256")):
+            raise ValueError("export payload must have a local basename and full SHA256")
+        path = root / name
+        if digest(path) != row["sha256"]:
+            raise ValueError("export payload digest differs: " + name)
+        if "bytes" in row and (type(row["bytes"]) is not int or path.stat().st_size != row["bytes"]):
+            raise ValueError("export payload size differs: " + name)
+        verified[name] = {"sha256": row["sha256"], "bytes": path.stat().st_size}
+    return {"schema": SCHEMA, "manifest_sha256": actual, "payloads": verified,
+            "model_forward_executed": False, "fitting_executed": False,
+            "scope": "pinned file integrity; recipe/model compatibility and calibration checked before recording"}
+
+
 def validate_export_config(exported, config_path, policy_id):
     """Names may alias; exact configuration and later weight hashes establish identity."""
     model = exported.get("model") or {}
@@ -373,6 +403,8 @@ def record(args):
     base, cfg = ep.load_policy(str(model_root), args.device, torch.bfloat16)
     candidate, _, exported = load_quantized.load_quantized(None, args.export_dir, args.device,
         build=lambda: ep.load_policy(str(model_root), args.device, torch.bfloat16)[0], mode="ref_conv")
+    if exported != manifest["export"]["manifest"]:
+        raise ValueError("loaded export manifest differs from frozen preflight provenance")
     checkpoint = __import__("quant_export").checkpoint_record(str(model_root))
     validate_checkpoint_weights(checkpoint, exported)
     if sites:
@@ -704,6 +736,10 @@ def analyze(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
+    pin = commands.add_parser("verify-export-pin", help="verify manifest pin and payloads without tensor loading")
+    pin.add_argument("--export-dir", required=True)
+    pin.add_argument("--expected-sha256", required=True)
+    pin.add_argument("--out")
     pre = commands.add_parser("preflight")
     for name in ("model-config", "dataset-root", "policy-id", "dataset-id", "out"):
         pre.add_argument("--" + name, required=True)
@@ -731,7 +767,12 @@ def main():
     ana.add_argument("--physical", action="store_true")
     args = parser.parse_args()
     try:
-        result = {"preflight": preflight, "record": record, "analyze": analyze}[args.command](args)
+        if args.command == "verify-export-pin":
+            result = verify_export_pin(args.export_dir, args.expected_sha256)
+            if args.out:
+                write_new(args.out, result)
+        else:
+            result = {"preflight": preflight, "record": record, "analyze": analyze}[args.command](args)
     except (ValueError, FileExistsError, FileNotFoundError) as error:
         parser.error(str(error))
     if result is not None:

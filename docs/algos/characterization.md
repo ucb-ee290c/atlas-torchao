@@ -10,6 +10,14 @@ success are not established by this adapter.
 
 Run `scripts/run_characterization_pilot.sh --preflight-only` with absolute
 `MODEL_CONFIG`, `DATASET_ROOT`, `EXPORT_DIR`, `PILOT_DIR` and `PILOT_PYTHON` settings.
+Set `PILOT_EXPECTED_COMMIT` to the full pinned source commit and `EXPORT_MANIFEST_SHA256` to
+the independently retained export manifest SHA256. Use a clean detached checkout.
+The starter verifies manifest/payload hashes without loading tensors before preflight,
+requires the frozen 100-chunk, ten-episode native 50-by-6 contract, and retains unique
+phase logs. Run `--record-only` to reuse that frozen preflight, then automatic analysis
+and the latest CSV/SVG report. `--report-only` handles a completed recording without
+re-running inference, provided summary/report destinations are absent. Failed/partial
+record directories are retained; retrying inference requires a new pilot, not overwrite.
 The directory must be new. Preflight freezes ten episodes and ten temporally stratified
 frames each, source metadata/parquet hashes, native shape, normalization, seeds and
 provisional existing-export calibration exclusions. It does not load weights or videos.
@@ -101,8 +109,6 @@ in the surrounding workspace. Update it at decisions, checks, failures and hando
 using short entries linked to detailed evidence. Remote GPU work should retain its own
 short run journal and relay events/results for inclusion in the working journal.
 
-The next compiler integration is a versioned replay adapter and exact saved-program
-intake into Merlin, followed by quantization-aware reference MLIR. Preserve code bytes,
-signed exponents, dynamic scales, attention bindings and explicit residual-domain guards.
-Native lowering and hardware qualification require separate target legality and execution
-evidence. Neither offline RMSE nor the meeting's 0.1/0.4 suggestions are acceptance gates.
+Next, complete the frozen GPU recording and inspect native action/layer distributions.
+Clean timing and controller-compatible closed-loop evaluation remain separate studies.
+Neither offline RMSE nor the meeting's 0.1/0.4 suggestions are acceptance gates.
