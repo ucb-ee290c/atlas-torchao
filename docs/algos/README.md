@@ -25,6 +25,9 @@ the GPU-verified commit; graph export and compiler integration are separate work
 [FX graph export](fx-export.md) adds a separate checked `ExportedProgram` for reference
 replay. It does not alter the existing three-file quantized export or the release tag.
 
+[Native action characterization](characterization.md) records paired existing-export
+outputs and bounded layer diagnostics without defining acceptance thresholds.
+
 ## Hook API (`src/algos/base.py`)
 
 Subclass `algos.base.Algo`, override only the hooks you need, and set `ALGO = YourClass` in the
