@@ -502,13 +502,21 @@ def statistics(values):
 
     x = np.asarray(values, dtype=np.float64).reshape(-1)
     if not x.size:
-        return {"count": 0, "bias": None, "rmse": None, "mae": None, "std": None,
+        return {"count": 0, "bias": None, "rmse": None, "mae": None, "std": None, "variance": None,
                 "max_abs": None, "absolute_quantiles": None}
     if not np.isfinite(x).all():
         raise ValueError("non-finite measurement")
-    return {"count": int(x.size), "bias": float(x.mean()), "rmse": float(np.sqrt(np.mean(x * x))),
-            "mae": float(np.abs(x).mean()), "std": float(x.std()), "max_abs": float(np.abs(x).max()),
-            "absolute_quantiles": {str(q): float(np.quantile(np.abs(x), q)) for q in (.5, .9, .95, .99)}}
+    try:
+        with np.errstate(over="raise", invalid="raise"):
+            result = {"count": int(x.size), "bias": float(x.mean()), "rmse": float(np.sqrt(np.mean(x * x))),
+                      "mae": float(np.abs(x).mean()), "std": float(x.std()), "variance": float(x.var()),
+                      "max_abs": float(np.abs(x).max()),
+                      "absolute_quantiles": {str(q): float(np.quantile(np.abs(x), q)) for q in (.5, .9, .95, .99)}}
+    except FloatingPointError as error:
+        raise ValueError("non-finite derived measurement (numeric overflow)") from error
+    if not all(np.isfinite(value) for key, value in result.items() if key not in ("absolute_quantiles", "count")):
+        raise ValueError("non-finite derived measurement")
+    return result
 
 
 def summarize(error, mask):
@@ -523,7 +531,8 @@ def summarize(error, mask):
             "per_horizon_component": [[statistics(error[:, t, k][mask[:, t]]) for k in range(d)] for t in range(h)]}
 
 
-def analyze_records(records, contract, *, physical=False):
+def validated_arrays(records, contract, *, physical=False):
+    """Validate native axes and finite values once for analysis and chart sources."""
     import numpy as np
 
     if physical and (not contract.get("physical_controller_mapping_validated")
@@ -532,8 +541,16 @@ def analyze_records(records, contract, *, physical=False):
     if not records:
         raise ValueError("no action records")
     h, d = contract["returned_horizon"], contract["dimension"]
-    if len(contract["channels"]) != d:
+    if type(h) is not int or type(d) is not int or h <= 0 or d <= 0:
+        raise ValueError("native horizon and dimension must be positive integers")
+    channels = contract["channels"]
+    if (not isinstance(channels, list) or len(channels) != d
+            or any(not isinstance(x, str) or not x.strip() for x in channels)
+            or len(set(channels)) != d):
         raise ValueError("channel names differ from native dimension")
+    units = contract.get("units", ["unknown"] * d)
+    if not isinstance(units, list) or len(units) != d or any(not isinstance(x, str) or not x.strip() for x in units):
+        raise ValueError("native component units must match dimension")
     ids = [(row["episode_id"], row["frame_index"], row["sampler_seed"]) for row in records]
     if len(set(ids)) != len(ids):
         raise ValueError("duplicate observation/seed records")
@@ -545,50 +562,135 @@ def analyze_records(records, contract, *, physical=False):
     mask = np.asarray([row["valid_target_mask"] for row in records])
     if mask.dtype != np.bool_ or mask.shape != (len(records), h):
         raise ValueError("valid-target mask must be boolean [chunks,horizon]")
+    return arrays, mask
+
+
+def measurement_errors(arrays, mask):
+    """Return each numerical comparison with its exact full/valid denominator."""
+    import numpy as np
+
+    full = np.ones_like(mask)
+    measurements = {}
+    for space in ("model", "dataset"):
+        diff = arrays["candidate_" + space] - arrays["bf16_" + space]
+        measurements[space + "_full_generated_fidelity"] = (diff, full)
+        measurements[space + "_valid_target_fidelity"] = (diff, mask)
+    for name in ("bf16", "candidate"):
+        measurements[name + "_valid_target_error"] = (arrays[name + "_dataset"] - arrays["target"], mask)
+    return measurements
+
+
+def descriptive_distribution(values):
+    """Distribution of nonnegative chunk RMSE, not error bias or RMS-of-RMSE."""
+    import numpy as np
+
+    summary = statistics(values)
+    return {"count": summary["count"], "mean": summary["bias"], "std": summary["std"],
+            "variance": summary["variance"], "min": float(np.min(values)) if len(values) else None,
+            "max": summary["max_abs"], "quantiles": summary["absolute_quantiles"],
+            "variance_denominator": "population (ddof=0); descriptive, not a confidence interval"}
+
+
+def chunk_components(error, mask):
+    """Per-chunk component RMSE and its descriptive between-chunk distribution."""
+    values = [[statistics(chunk[:, k][valid])["rmse"] for k in range(error.shape[2])]
+              for chunk, valid in zip(error, mask)]
+    return {"rmse": values, "valid_steps": [int(x.sum()) for x in mask],
+            "per_component_rmse_distribution": [
+                descriptive_distribution([row[k] for row in values if row[k] is not None])
+                for k in range(error.shape[2])],
+            "distribution_scope": "one value per chunk, descriptive; overlapping chunks are not independent"}
+
+
+def analyze_records(records, contract, *, physical=False):
+    import numpy as np
+
+    arrays, mask = validated_arrays(records, contract, physical=physical)
     full = np.ones_like(mask)
     out = {"schema": SCHEMA, "contract": contract, "chunks": len(records),
            "episode_clusters": len({row["episode_id"] for row in records}),
            "uncertainty": "descriptive only; no scalar-step independence or confidence interval claimed",
+           "pooled_scope": "native-coordinate aggregate; components may have incomparable units; not physical RMSE",
+           "task_grouping": {"missing_task_id_chunks": sum(row.get("task_id") is None for row in records),
+                             "missing_id_label": "unknown (null), never inferred from action values",
+                             "scope": "recorded task IDs; names/duplicate human labels do not establish task success"},
            "valid_target_steps": int(mask.sum()), "generated_steps": int(full.sum())}
-    for space in ("model", "dataset"):
-        diff = arrays["candidate_" + space] - arrays["bf16_" + space]
-        out[space + "_full_generated_fidelity"] = summarize(diff, full)
-        out[space + "_valid_target_fidelity"] = summarize(diff, mask)
-    for name in ("bf16", "candidate"):
-        out[name + "_valid_target_error"] = summarize(arrays[name + "_dataset"] - arrays["target"], mask)
+    measurements = measurement_errors(arrays, mask)
+    chunk_ids = [{key: row.get(key) for key in ("task_id", "episode_id", "frame_index", "sampler_seed")}
+                 for row in records]
+    out["per_chunk_components"] = {"observation_ids": chunk_ids, "measurements": {}}
+    for name, (error, valid) in measurements.items():
+        out[name] = summarize(error, valid)
+        out["per_chunk_components"]["measurements"][name] = chunk_components(error, valid)
+    out["groups"] = {"tasks": [], "episodes": []}
+    for axis, keys in (("tasks", ("task_id",)), ("episodes", ("task_id", "episode_id"))):
+        groups = {}
+        for index, row in enumerate(records):
+            identity = tuple(row.get(key) for key in keys)
+            groups.setdefault(identity, []).append(index)
+        for identity, indices in groups.items():
+            group = {**dict(zip(keys, identity)), "chunks": len(indices),
+                     "episode_clusters": len({records[i]["episode_id"] for i in indices}),
+                     "generated_steps": int(full[indices].sum()), "valid_target_steps": int(mask[indices].sum()),
+                     "measurements": {}}
+            for name, (error, valid) in measurements.items():
+                group["measurements"][name] = {**summarize(error[indices], valid[indices]),
+                    "per_chunk_components": chunk_components(error[indices], valid[indices])}
+            out["groups"][axis].append(group)
     return out
 
 
-def analyze(args):
-    root = Path(args.record_dir)
-    complete = json.loads((root / "completion.json").read_text())
-    if not complete.get("complete") or digest(root / "actions.jsonl") != complete["actions_sha256"]:
+def load_verified_recording(record_dir):
+    """Read the same hash/identity-verified recording for analysis and reporting.
+
+    This proves internal evidence binding, not authenticity of supplied completion files.
+    No source dataset, model or GPU imports are required for offline use.
+    """
+    root = Path(record_dir)
+    completion_bytes = (root / "completion.json").read_bytes()
+    complete = json.loads(completion_bytes)
+    action_bytes = (root / "actions.jsonl").read_bytes()
+    if complete.get("complete") is not True or hashlib.sha256(action_bytes).hexdigest() != complete["actions_sha256"]:
         raise ValueError("recording incomplete or action payload digest differs")
-    if digest(root / "header.json") != complete["header_sha256"]:
+    header_bytes = (root / "header.json").read_bytes()
+    if hashlib.sha256(header_bytes).hexdigest() != complete["header_sha256"]:
         raise ValueError("record header fingerprint differs")
     for filename, expected_hash in complete.get("layer_trace", {}).get("files_sha256", {}).items():
+        if Path(filename).name != filename or filename in (".", ".."):
+            raise ValueError("layer trace filename must be a recording-local basename")
         if digest(root / filename) != expected_hash:
             raise ValueError("layer trace payload fingerprint differs: " + filename)
-    header = json.loads((root / "header.json").read_text())
+    header = json.loads(header_bytes)
+    manifest = header["input_manifest"]
+    if ("content_sha256" in manifest and canonical_digest(
+            {key: value for key, value in manifest.items() if key != "content_sha256"}) != manifest["content_sha256"]):
+        raise ValueError("embedded input manifest content digest differs")
     if (complete.get("calibration_data_sha256_verified") is not True
             or header.get("calibration_verification", {}).get("data_sha256_verified") is not True):
         raise ValueError("exact calibration data digest verification is required")
-    if digest(root / "calibration_verification.json") != complete.get("calibration_verification_sha256"):
+    verification_bytes = (root / "calibration_verification.json").read_bytes()
+    if hashlib.sha256(verification_bytes).hexdigest() != complete.get("calibration_verification_sha256"):
         raise ValueError("calibration verification fingerprint differs")
-    verification = json.loads((root / "calibration_verification.json").read_text())
+    verification = json.loads(verification_bytes)
     expected_calibration_digest = header["input_manifest"]["calibration"]["record"]["data_sha256"]
     if (verification != header["calibration_verification"]
             or verification.get("actual_data_sha256") != expected_calibration_digest
             or verification.get("expected_data_sha256") != expected_calibration_digest):
         raise ValueError("calibration digest proof differs from original export provenance")
-    with (root / "actions.jsonl").open() as stream:
-        rows = [json.loads(line) for line in stream]
-    if len(rows) != complete["chunks"]:
+    rows = [json.loads(line) for line in action_bytes.splitlines()]
+    if type(complete["chunks"]) is not int or len(rows) != complete["chunks"]:
         raise ValueError("recorded chunk count differs from completion marker")
     expected = header["input_manifest"]["observations"]
     keys = ("episode_id", "frame_index", "source_index", "sampler_seed", "task_id")
     if [tuple(row[key] for key in keys) for row in rows] != [tuple(row[key] for key in keys) for row in expected]:
         raise ValueError("recorded observation IDs differ from frozen manifest")
+    validated_arrays(rows, header["input_manifest"]["action_contract"])
+    complete["verified_completion_sha256"] = hashlib.sha256(completion_bytes).hexdigest()
+    return rows, header, complete, verification
+
+
+def analyze(args):
+    rows, header, complete, verification = load_verified_recording(args.record_dir)
     result = analyze_records(rows, header["input_manifest"]["action_contract"], physical=args.physical)
     result["provenance"] = {"header_sha256": complete["header_sha256"],
                             "actions_sha256": complete["actions_sha256"],

@@ -33,6 +33,52 @@ deviation and quantiles use explicit native component/horizon axes and separate
 full-generated versus valid-target denominators. No bootstrap interval or acceptance
 threshold is implied by those descriptive statistics.
 
+## Offline report draft
+
+After a recording completes, create a new, separate report directory using the installed
+wheel (or add `PYTHONPATH=src` when running from this source checkout):
+
+```sh
+python -m characterize_report --record-dir /absolute/completed-recording \
+    --out-dir /absolute/new-report-directory
+```
+
+This command shares the analyzer's completion/header/action/calibration and frozen-ID
+checks. It also checks the embedded manifest's canonical content digest when present.
+It does not accept an unbound summary as input, load a model, fit, or rerun inference.
+The header's original manifest-file byte hash is retained as provenance; the original
+manifest bytes are not independently available in the recording. Payload hashes prove
+internal binding, not authenticity of supplied completion files. Partial/failed reports
+are retained and never marked complete; existing output directories are refused.
+
+`summary.json` contains aggregate, task-ID and task/episode-group descriptive metrics:
+signed bias, RMSE, MAE, population standard deviation/variance, maximum absolute error
+and absolute-error quantiles, including each horizon/component. `per_chunk_rmse.csv`
+contains one RMSE per chunk/component/comparison, with exact full/valid step counts;
+`chunk_rmse_distributions.csv` reports their mean, population variance, standard deviation
+and quantiles. These are distributions of chunk RMSE, not signed error bias or a
+confidence interval. `metrics.csv` flattens aggregate/group component/horizon statistics.
+Variance is in squared numerical units; RMSE, standard deviation and quantiles are in
+the original numerical units. Pooled native-coordinate RMSE may mix incomparable
+component units and must not be read as a physical distance or angle.
+
+For each comparison the draft emits component-RMSE bars, a horizon/component heatmap
+and per-component absolute-error ECDF as dependency-light SVG. `chart_data.csv` contains
+their source values; every SVG and `report_manifest.json` bind its SHA256. ECDF plots
+show at most 256 deterministic ranks per component by default, with the exact empirical
+CDF at each shown value; this is visual subsampling, not an uncertainty estimate.
+An empty valid-target population is missing/gray, never zero error. Labels are escaped
+for XML and spreadsheet formula prefixes are quoted in CSV; raw labels remain in JSON.
+
+Model-space fidelity and postprocessed native dataset-space fidelity remain separate,
+with full-generated and valid-target denominators. Task grouping uses recorded IDs;
+missing IDs remain explicitly unknown, and duplicate human names never merge distinct
+recorded task IDs. The single-task pilot does not establish multi-task or closed-loop success. Overlapping
+chunks are not treated as independent observations. Unknown joint/gripper units remain
+unknown; no XYZ mapping, rotation-angle conversion, Z-axis verdict, bootstrap interval,
+performance result or acceptance cutoff is inferred. This reporting draft has synthetic
+CPU tests, not new measured model results.
+
 ## Optional layer diagnostics
 
 On the `record` command, `--trace-sites` selects exact module FQNs validated on both
