@@ -39,12 +39,20 @@ def _stats(mode, n):
             "QUANTILE10": {"q10": lo, "q90": hi}}[mode]
 
 
-def _pipes(mode="MEAN_STD", stats=None, visual=NormalizationMode.IDENTITY):
+def _cfg(mode="MEAN_STD", visual=NormalizationMode.IDENTITY):
+    """The policy config the processors are checked against."""
+    m = NormalizationMode(mode)
+    return SimpleNamespace(input_features={STATE: FEATURES[STATE], IMAGE: FEATURES[IMAGE]},
+                           output_features={ACTION: FEATURES[ACTION]},
+                           normalization_mapping={"STATE": m, "ACTION": m, "VISUAL": visual})
+
+
+def _pipes(mode="MEAN_STD", stats=None, visual=NormalizationMode.IDENTITY, features=FEATURES):
     m = NormalizationMode(mode)
     norm_map = {FeatureType.STATE: m, FeatureType.ACTION: m, FeatureType.VISUAL: visual}
     if stats is None:
         stats = {STATE: _stats(mode, 3), ACTION: _stats(mode, 2)}
-    pre = PolicyProcessorPipeline(steps=[NormalizerProcessorStep(features=FEATURES, norm_map=norm_map,
+    pre = PolicyProcessorPipeline(steps=[NormalizerProcessorStep(features=features, norm_map=norm_map,
                                                                  stats=stats)],
                                   to_transition=batch_to_transition, to_output=transition_to_batch)
     post = PolicyProcessorPipeline(steps=[UnnormalizerProcessorStep(features={ACTION: FEATURES[ACTION]},
@@ -70,7 +78,7 @@ def _to_batch(sample, pre):
 def test_missing_key_is_refused_and_identity_ignored():
     # the smolvla_base layout: stats only under a key no feature looks up
     pre, post = _pipes(stats={"so100.buffer.action": {"mean": torch.zeros(2), "std": torch.ones(2)}})
-    g = policy_norm.check(pre, post)
+    g = policy_norm.check(pre, post, _cfg())
     assert not g["ok"]
     assert set(g["pre"]) == {STATE, ACTION} and set(g["post"]) == {ACTION}   # the image is IDENTITY
     text = " ".join(g["problems"])
@@ -82,28 +90,29 @@ def test_missing_key_is_refused_and_identity_ignored():
 
 def test_identity_features_without_stats_pass():
     pre, post = _pipes()          # no image stats at all, image mode IDENTITY
-    g = policy_norm.check(pre, post)
+    g = policy_norm.check(pre, post, _cfg())
     assert g["ok"], g["problems"]
     assert policy_norm.require(g, "checkpoint", False) == policy_norm.VERIFIED
 
 
 def test_normalized_visual_feature_needs_stats():
     pre, post = _pipes(visual=NormalizationMode.MEAN_STD)
-    g = policy_norm.check(pre, post)
+    g = policy_norm.check(pre, post, _cfg(visual=NormalizationMode.MEAN_STD))
     assert not g["ok"] and any(IMAGE in p for p in g["problems"])
 
 
 @pytest.mark.parametrize("mode", ["MIN_MAX", "QUANTILES", "QUANTILE10", "MEAN_STD"])
 def test_modes_pass_with_their_stats(mode):
     pre, post = _pipes(mode)
-    g = policy_norm.check(pre, post)
+    g = policy_norm.check(pre, post, _cfg(mode))
     assert g["ok"], g["problems"]
-    assert all(rec["sha256"] for rec in g["pre"].values())
-    assert policy_norm.combined_sha256(g)
-    probe = policy_norm.probe(pre, post, _sample(), _to_batch, action_shape=(2,))
+    assert all(rec["sha256"] and rec["transform_sha256"] for rec in g["pre"].values())
+    assert policy_norm.combined_sha256(g) and policy_norm.combined_sha256(g, "transform_sha256")
+    probe = policy_norm.probe(pre, post, _sample(), _to_batch, g["required"], action_shape=(2,))
     assert probe["ok"], probe
-    assert probe["observations"][STATE]["changed"]
-    assert probe["action_round_trip"]["identity"] and probe["action_round_trip"]["unnormalize_changed"]
+    assert probe["observations"][STATE]["matches"] and probe["observations"][STATE]["finite"]
+    rt = probe["action_round_trip"]
+    assert rt["identity"] and rt["matches"] and rt["modes"] == [mode]
 
 
 @pytest.mark.parametrize("mode,bad", [("MEAN_STD", {"std": torch.tensor([1.0, 0.0])}),
@@ -117,14 +126,72 @@ def test_degenerate_stats_are_refused(mode, bad):
             del stats[ACTION][k]
         else:
             stats[ACTION][k] = v
-    g = policy_norm.check(*_pipes(mode, stats))
+    g = policy_norm.check(*_pipes(mode, stats), _cfg(mode))
     assert not g["ok"] and all(repr(ACTION) in p for p in g["problems"])
 
 
 def test_wrong_stats_name_for_the_mode_is_refused():
     # MIN_MAX declared, only mean/std stored: lerobot would raise only when data arrives
-    g = policy_norm.check(*_pipes("MIN_MAX", {STATE: _stats("MEAN_STD", 3), ACTION: _stats("MEAN_STD", 2)}))
+    g = policy_norm.check(*_pipes("MIN_MAX", {STATE: _stats("MEAN_STD", 3), ACTION: _stats("MEAN_STD", 2)}),
+                          _cfg("MIN_MAX"))
     assert not g["ok"] and any("lacks ['min', 'max']" in p for p in g["problems"])
+
+
+def test_config_feature_the_processor_omits_is_refused():
+    # the saved normalizer's own features leave the state out; the config declares it MEAN_STD
+    pre, post = _pipes(features={IMAGE: FEATURES[IMAGE], ACTION: FEATURES[ACTION]})
+    g = policy_norm.check(pre, post, _cfg())
+    assert not g["ok"] and g["required"]["pre"] == {STATE: "MEAN_STD", ACTION: "MEAN_STD"}
+    assert any(repr(STATE) in p and "no step covers" in p for p in g["problems"])
+
+
+def test_processor_mode_differing_from_the_config_is_refused():
+    stats = {k: {**_stats("MEAN_STD", n), **_stats("MIN_MAX", n)} for k, n in ((STATE, 3), (ACTION, 2))}
+    g = policy_norm.check(*_pipes("MIN_MAX", stats), _cfg("MEAN_STD"))
+    assert not g["ok"] and any("MIN_MAX in the processor, MEAN_STD in the config" in p for p in g["problems"])
+
+
+def test_required_observation_missing_from_the_frame_fails_the_probe():
+    pre, post = _pipes()
+    g = policy_norm.check(pre, post, _cfg())
+    sample = {k: v for k, v in _sample().items() if k != STATE}
+    probe = policy_norm.probe(pre, post, sample, _to_batch, g["required"], action_shape=(2,))
+    assert not probe["ok"] and probe["observations"][STATE] == {"mode": "MEAN_STD", "present": False,
+                                                                "ok": False}
+
+
+def test_degenerate_range_is_refused_by_the_guard():
+    stats = {STATE: {"min": torch.zeros(3), "max": torch.full((3,), 1e-40)}, ACTION: _stats("MIN_MAX", 2)}
+    g = policy_norm.check(*_pipes("MIN_MAX", stats), _cfg("MIN_MAX"))
+    assert not g["ok"] and any("degenerate range" in p for p in g["problems"])
+
+
+def test_non_finite_normalized_observation_fails_the_probe():
+    # a range the guard accepts (its reciprocal is finite) that still overflows on a real frame
+    stats = {STATE: {"min": torch.zeros(3), "max": torch.full((3,), 1e-37)}, ACTION: _stats("MIN_MAX", 2)}
+    pre, post = _pipes("MIN_MAX", stats)
+    g = policy_norm.check(pre, post, _cfg("MIN_MAX"))
+    assert g["ok"], g["problems"]
+    probe = policy_norm.probe(pre, post, _sample(), _to_batch, g["required"], action_shape=(2,))
+    assert not probe["ok"] and not probe["observations"][STATE]["finite"]
+
+
+def test_identity_transform_passes_the_probe():
+    unit = {"mean": torch.zeros(3), "std": torch.ones(3)}
+    pre, post = _pipes(stats={STATE: unit, ACTION: {"mean": torch.zeros(2), "std": torch.ones(2)}})
+    g = policy_norm.check(pre, post, _cfg())
+    probe = policy_norm.probe(pre, post, _sample(), _to_batch, g["required"], action_shape=(2,))
+    assert g["ok"] and probe["ok"], probe
+
+
+def test_output_that_does_not_follow_the_formula_fails_the_probe():
+    def raw_batch(sample, _pre):   # skips the processors: the state stays raw
+        return {k: v.unsqueeze(0) for k, v in sample.items()}
+
+    pre, post = _pipes()
+    g = policy_norm.check(pre, post, _cfg())
+    probe = policy_norm.probe(pre, post, _sample(), raw_batch, g["required"], action_shape=(2,))
+    assert not probe["ok"] and not probe["observations"][STATE]["matches"]
 
 
 def test_stats_sha256_is_canonical():
@@ -159,7 +226,7 @@ def test_allow_unnormalized_is_recorded(monkeypatch, capsys):
     broken = _pipes(stats={"so100.buffer.action": {"mean": torch.zeros(2), "std": torch.ones(2)}})
     monkeypatch.setattr(ep, "build_processors", lambda *a, **k: broken)
     monkeypatch.setattr(ep, "to_batch", _to_batch)
-    cfg = SimpleNamespace(output_features={ACTION: FEATURES[ACTION]})
+    cfg = _cfg()
     with pytest.raises(policy_norm.NormalizationError):
         ep.setup_normalization(_args(), cfg, {}, [_sample()], [0])
     norm, stats = ep.setup_normalization(_args("--allow-unnormalized"), cfg, {}, [_sample()], [0])
@@ -182,10 +249,11 @@ def test_allow_unnormalized_needs_checkpoint_protocol():
 # Exports
 # ---------------------------------------------------------------------------------------------
 
-def _norm(protocol="dataset", status=policy_norm.VERIFIED, sha="a" * 64):
-    return {"protocol": protocol, "status": status, "stats_sha256": sha,
+def _norm(protocol="dataset", status=policy_norm.VERIFIED, sha="a" * 64, transform="d" * 64):
+    return {"protocol": protocol, "status": status, "stats_sha256": sha, "transform_sha256": transform,
             "stats_source": {"kind": "dataset", "repo_id": "d"},
-            "guard": {"pre": {STATE: {"mode": "MEAN_STD", "sha256": "b" * 64}}, "post": {}}}
+            "guard": {"pre": {STATE: {"mode": "MEAN_STD", "eps": 1e-8, "sha256": "b" * 64,
+                                      "transform_sha256": "e" * 64}}, "post": {}}}
 
 
 def test_export_carries_the_protocol(tmp_path):
@@ -205,6 +273,8 @@ def test_export_carries_the_protocol(tmp_path):
         assert got["protocol"] == "dataset" and got["status"] == "verified"
         assert got["stats_sha256"] == "a" * 64
         assert got["stats_sha256_per_key"]["pre"][STATE] == "b" * 64
+        assert got["record_version"] == 2 and got["transform_sha256"] == "d" * 64
+        assert got["transform"]["pre"][STATE] == {"mode": "MEAN_STD", "eps": 1e-8, "sha256": "e" * 64}
     assert man["normalization"]["protocol"] == "dataset"
     policy_norm.check_export(man, _norm())                     # same protocol and stats: accepted
     with pytest.raises(policy_norm.NormalizationError, match="re-export"):
@@ -217,6 +287,31 @@ def test_pre_protocol_export_counts_as_legacy():
     with pytest.raises(policy_norm.NormalizationError, match="legacy-unverified"):
         policy_norm.check_export({}, _norm())
     policy_norm.check_export({}, _norm("checkpoint", policy_norm.LEGACY, None))
+
+
+def _guarded_norm(mode, stats):
+    g = policy_norm.check(*_pipes(mode, stats), _cfg(mode))
+    assert g["ok"], g["problems"]
+    return {"protocol": "dataset", "status": policy_norm.VERIFIED, "stats_source": None, "guard": g,
+            "stats_sha256": policy_norm.combined_sha256(g),
+            "transform_sha256": policy_norm.combined_sha256(g, "transform_sha256")}
+
+
+def test_export_refuses_a_changed_transform_with_the_same_stats():
+    stats = {k: {**_stats("MEAN_STD", n), **_stats("MIN_MAX", n)} for k, n in ((STATE, 3), (ACTION, 2))}
+    mean_std, min_max = _guarded_norm("MEAN_STD", stats), _guarded_norm("MIN_MAX", stats)
+    assert mean_std["stats_sha256"] == min_max["stats_sha256"]
+    manifest = {"normalization": policy_norm.export_record(mean_std)}
+    policy_norm.check_export(manifest, mean_std)
+    with pytest.raises(policy_norm.NormalizationError, match="transform"):
+        policy_norm.check_export(manifest, min_max)
+
+
+def test_verified_export_without_the_transform_is_refused():
+    v1 = {k: v for k, v in policy_norm.export_record(_norm()).items()
+          if k not in ("record_version", "transform_sha256", "transform")}
+    with pytest.raises(policy_norm.NormalizationError, match="re-export"):
+        policy_norm.check_export({"normalization": v1}, _norm())
 
 
 def test_from_export_mismatch_is_refused_by_the_cli(tmp_path, monkeypatch):
@@ -290,7 +385,7 @@ def test_smolvla_dataset_stats_normalize_state(smolvla_dataset):
     args, cfg, rename, ds, idx, norm, stats = smolvla_dataset
     assert norm["status"] == "verified" and norm["guard"]["ok"]
     assert norm["stats_source"]["repo_id"] == SVLA_DATA
-    assert norm["probe"]["observations"]["observation.state"]["changed"]
+    assert norm["probe"]["observations"]["observation.state"]["matches"]
     pre, _ = ep.build_processors(cfg, args, rename, stats)
     states = torch.cat([ep.to_batch(ds[i], pre)["observation.state"].float() for i in idx])
     raw = torch.stack([ds[i]["observation.state"].float() for i in idx])
@@ -302,7 +397,7 @@ def test_smolvla_dataset_stats_normalize_state(smolvla_dataset):
 @pytest.mark.slow
 def test_smolvla_action_round_trip_is_identity(smolvla_dataset):
     rt = smolvla_dataset[5]["probe"]["action_round_trip"]
-    assert rt["identity"] and rt["unnormalize_changed"] and rt["modes"] == ["MEAN_STD"]
+    assert rt["identity"] and rt["matches"] and rt["modes"] == ["MEAN_STD"]
     assert rt["unnormalized_std"] > 5                      # back in degrees
 
 

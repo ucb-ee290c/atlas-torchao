@@ -563,8 +563,9 @@ def export(model: nn.Module, export_dir, *, mode: str, report: dict, algo, algo_
     by algos.quantize (whose return value is `report`). Returns the manifest.
 
     normalization (NEW; LeRobot policies, src/policy_norm.export_record): the input / output
-    normalization protocol and its stats sha256, written to both files; --from-export refuses an
-    export whose protocol differs from the requested one."""
+    normalization protocol, its stats sha256 and its transform (per-key mode and eps) sha256,
+    written to both files; --from-export refuses an export whose protocol or transform differs
+    from the requested one."""
     from safetensors.torch import save_file
 
     import quant_modes

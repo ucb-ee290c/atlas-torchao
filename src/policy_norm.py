@@ -20,8 +20,11 @@ Protocols (`--norm-stats`):
               the normalizer runs after the rename step.
 
 The guard (`check`, `require`) runs after the processors are built, for every protocol: every
-feature whose normalization mode is not IDENTITY must have finite stats under the exact key the
-step looks up, with a positive std (MEAN_STD) or range (MIN_MAX, QUANTILES, QUANTILE10).
+feature the policy config normalizes (its input / output features under its normalization_mapping,
+NEW: not the processors' own saved features, which can omit one) must be covered by the matching
+step under the same mode, with finite stats under the exact key the step looks up and a positive,
+non-degenerate std (MEAN_STD) or range (MIN_MAX, QUANTILES, QUANTILE10). The probe then checks one
+real frame and one action chunk against the mode's formula and requires finite outputs.
 `--allow-unnormalized` (NEW) skips the refusal to reproduce the historical behaviour for
 comparison; results then say `normalization: legacy-unverified`.
 """
@@ -43,6 +46,8 @@ REQUIRED = {"MEAN_STD": (("mean", "std"), "std"),
             "QUANTILES": (("q01", "q99"), ("q01", "q99")),
             "QUANTILE10": (("q10", "q90"), ("q10", "q90"))}
 ROUND_TRIP_RTOL = 1e-4   # NEW: float32 (x * s + m - m) / (s + 1e-8) stays well inside this
+FORMULA_ULPS = 8         # NEW: probe outputs match the formula to this many ulps of their dtype
+ROLES = (("pre", "NormalizerProcessorStep"), ("post", "UnnormalizerProcessorStep"))
 
 
 class NormalizationError(RuntimeError):
@@ -135,6 +140,28 @@ def normalized_keys(step) -> dict:
     return out
 
 
+def required_keys(cfg) -> dict:
+    """{role: {key: mode}} every normalizer ("pre") and unnormalizer ("post") must cover, from the
+    policy config rather than from the processors' own saved features (NEW).
+
+    The config's feature keys are the policy-side names, i.e. already after the observation rename
+    map, which is what the normalizer looks up since it runs after the rename step."""
+    from lerobot.configs import FeatureType
+    from lerobot.utils.constants import ACTION
+
+    mapping = {getattr(t, "value", t): _mode_name(m) for t, m in cfg.normalization_mapping.items()}
+    pre, post = {}, {}
+    for key, feat in {**cfg.input_features, **cfg.output_features}.items():
+        mode = mapping.get(feat.type.value, "IDENTITY")
+        if mode == "IDENTITY":
+            continue
+        if feat.type == FeatureType.ACTION:
+            pre[ACTION] = post[ACTION] = mode
+        else:
+            pre[key] = mode
+    return {"pre": pre, "post": post}
+
+
 def _float_stats(step) -> dict:
     from lerobot.processor.converters import to_tensor
 
@@ -142,12 +169,25 @@ def _float_stats(step) -> dict:
             for k, sub in (step.stats or {}).items() if isinstance(sub, dict)}
 
 
+def _canonical_stats(stats: dict) -> dict:
+    """Stat names sorted, each as its shape and its float32 values as exact decimal float64."""
+    return {n: {"shape": list(t.shape), "values": [float(x) for x in t.double().flatten()]}
+            for n, t in sorted(stats.items())}
+
+
+def _sha256(obj) -> str:
+    return hashlib.sha256(json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
 def stats_sha256(stats: dict) -> str:
-    """sha256 of one key's stats, canonically serialized: stat names sorted, each as its shape and
-    its float32 values written as exact decimal float64 (NEW)."""
-    canon = {n: {"shape": list(t.shape), "values": [float(x) for x in t.double().flatten()]}
-             for n, t in sorted(stats.items())}
-    return hashlib.sha256(json.dumps(canon, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    """sha256 of one key's stats, canonically serialized (NEW)."""
+    return _sha256(_canonical_stats(stats))
+
+
+def transform_sha256(mode: str, eps: float, stats: dict) -> str:
+    """sha256 of one key's whole transform: the mode, the step's eps and the stats (NEW). lerobot's
+    (un)normalizer has no clipping or other parameter (normalize_processor.py:347-417)."""
+    return _sha256({"mode": mode, "eps": float(eps), "stats": _canonical_stats(stats)})
 
 
 def check_step(step, role) -> tuple[dict, list]:
@@ -155,7 +195,7 @@ def check_step(step, role) -> tuple[dict, list]:
     stats = _float_stats(step)
     keys, problems = {}, []
     for key, mode in sorted(normalized_keys(step).items()):
-        rec = {"mode": mode}
+        rec = {"mode": mode, "eps": float(step.eps)}
         keys[key] = rec
         problem = _check_key(rec, role, key, mode, stats)
         if problem is not None:
@@ -165,10 +205,10 @@ def check_step(step, role) -> tuple[dict, list]:
 
 def _check_key(rec, role, key, mode, stats) -> str | None:
     """The problem with `key`'s stats under `mode`, or None; fills `rec` (missing stat names, or
-    the sha256 and smallest scale of usable stats)."""
-    need, scale = REQUIRED.get(mode, (None, None))
-    if need is None:
+    the stats / transform sha256 and smallest scale of usable stats)."""
+    if mode not in REQUIRED:
         return f"{role}: {key!r} uses unsupported mode {mode}"
+    need = REQUIRED[mode][0]
     sub = stats.get(key)
     if sub is None:
         rec["missing"] = list(need)
@@ -180,22 +220,54 @@ def _check_key(rec, role, key, mode, stats) -> str | None:
     non_finite = [n for n in need if not torch.isfinite(sub[n]).all()]
     if non_finite:
         return f"{role}: {key!r} ({mode}) has non-finite {non_finite}"
-    is_std = isinstance(scale, str)
-    width = sub[scale] if is_std else sub[scale[1]] - sub[scale[0]]
-    if not (width > 0).all():
-        return (f"{role}: {key!r} ({mode}) has a non-positive {'std' if is_std else 'range'} in "
-                f"{int((width <= 0).sum())} of {width.numel()} entries")
+    problem = _scale_problem(role, key, mode, sub, rec["eps"])
+    if problem is not None:
+        return problem
     rec["sha256"] = stats_sha256(sub)
-    rec["min_scale"] = float(width.min())
+    rec["transform_sha256"] = transform_sha256(mode, rec["eps"], sub)
+    rec["min_scale"] = float(_width(mode, sub).min())
     return None
 
 
-def check(preprocess, postprocess) -> dict:
-    """The guard's findings for built pipelines: per role and key, the mode, the stats sha256 and
-    any problem. Every protocol goes through it."""
-    rec, problems = {}, []
-    for role, pipe, cls in (("pre", preprocess, "NormalizerProcessorStep"),
-                            ("post", postprocess, "UnnormalizerProcessorStep")):
+def _width(mode, sub):
+    scale = REQUIRED[mode][1]
+    return sub[scale] if isinstance(scale, str) else sub[scale[1]] - sub[scale[0]]
+
+
+def _scale_problem(role, key, mode, sub, eps) -> str | None:
+    """A non-positive std / range, or one so small its reciprocal overflows float32 (NEW: such a
+    scale passes as positive yet normalizes every input to inf)."""
+    is_std = isinstance(REQUIRED[mode][1], str)
+    what = "std" if is_std else "range"
+    width = _width(mode, sub)
+    if not (width > 0).all():
+        return (f"{role}: {key!r} ({mode}) has a non-positive {what} in "
+                f"{int((width <= 0).sum())} of {width.numel()} entries")
+    denom = width + eps if is_std else width
+    if not torch.isfinite(1.0 / denom).all():
+        return f"{role}: {key!r} ({mode}) has a degenerate {what} (min {float(width.min()):.3g})"
+    return None
+
+
+def _coverage_problems(role, required: dict, covered: dict) -> list:
+    """Each (key, mode) the config requires must be normalized by the step under that mode."""
+    problems = []
+    for key, mode in sorted(required.items()):
+        have = covered.get(key, {}).get("mode")
+        if have is None:
+            problems.append(f"{role}: the config normalizes {key!r} ({mode}) but no step covers it")
+        elif have != mode:
+            problems.append(f"{role}: {key!r} is {have} in the processor, {mode} in the config")
+    return problems
+
+
+
+def check(preprocess, postprocess, cfg) -> dict:
+    """The guard's findings for built pipelines against the policy config `cfg`: per role and key,
+    the mode, eps, stats / transform sha256 and any problem. Every protocol goes through it."""
+    required = required_keys(cfg)
+    rec, problems = {"required": required}, []
+    for (role, cls), pipe in zip(ROLES, (preprocess, postprocess)):
         steps = _steps(pipe, cls)
         if not steps:
             problems.append(f"{role}: the pipeline has no {cls}")
@@ -204,13 +276,16 @@ def check(preprocess, postprocess) -> dict:
             keys, step_problems = check_step(step, role)
             rec[role].update(keys)
             problems += step_problems
+        problems += _coverage_problems(role, required[role], rec[role])
     rec["problems"] = problems
     rec["ok"] = not problems
     return rec
 
 
-def combined_sha256(guard: dict) -> str | None:
-    per = {f"{r}:{k}": v.get("sha256") for r in ("pre", "post") for k, v in sorted(guard.get(r, {}).items())}
+def combined_sha256(guard: dict, field: str = "sha256") -> str | None:
+    """One digest over every role and key's `field` ("sha256": stats only, the historical digest;
+    "transform_sha256": mode, eps and stats, NEW); None when any key lacks it."""
+    per = {f"{r}:{k}": v.get(field) for r, _ in ROLES for k, v in sorted(guard.get(r, {}).items())}
     if not per or any(v is None for v in per.values()):
         return None
     return hashlib.sha256(json.dumps(per, sort_keys=True).encode()).hexdigest()
@@ -241,87 +316,191 @@ def _legacy_warning(problems: list) -> str:
 # The probe
 # ---------------------------------------------------------------------------------------------
 
-def probe(preprocess, postprocess, sample, to_batch, rename_map=None, action_shape=None, seed=0) -> dict:
+def probe(preprocess, postprocess, sample, to_batch, required, rename_map=None, action_shape=None,
+          seed=0) -> dict:
     """Push one real frame through `preprocess` and one action chunk through `postprocess`, then
     back through the preprocessor's normalizer (NEW).
 
-    Each normalized observation must change; the action round trip must be the identity within
-    ROUND_TRIP_RTOL. Returns the record; rec["ok"] says whether both held."""
+    Every observation `required` (check()'s rec["required"]) normalizes must be in the frame, and
+    its output must be finite and match the mode's formula on the step's stats; the unnormalized
+    actions likewise, and the action round trip must be the identity within ROUND_TRIP_RTOL. An
+    identity transform (mean 0, std 1) passes: what is checked is the formula, not movement.
+    Returns the record; rec["ok"] says whether all of it held."""
     from lerobot.utils.constants import ACTION
 
     pre_steps = _steps(preprocess, "NormalizerProcessorStep")
-    norm_keys = {k: m for s in pre_steps for k, m in normalized_keys(s).items() if k != ACTION}
-    observations = _probe_observations(sample, to_batch(sample, preprocess), norm_keys, rename_map)
+    obs_modes = {k: m for k, m in required["pre"].items() if k != ACTION}
+    observations = _probe_observations(sample, to_batch(sample, preprocess), obs_modes, pre_steps,
+                                       rename_map)
     rec = {"observations": observations, "action_round_trip": None}
-    ok = all(o["changed"] for o in observations.values() if o["present"])
+    ok = all(o["ok"] for o in observations.values())
     if action_shape is not None and pre_steps:
-        round_trip = _probe_action_round_trip(pre_steps[0], postprocess, action_shape, seed)
+        round_trip = _probe_action_round_trip(pre_steps[-1], postprocess, action_shape, seed)
         rec["action_round_trip"] = round_trip
-        ok = ok and round_trip["identity"] and (round_trip["unnormalize_changed"] or not round_trip["modes"])
+        ok = ok and round_trip["ok"]
     rec["ok"] = bool(ok)
     return rec
 
 
-def _probe_observations(sample, batch, norm_keys, rename_map) -> dict:
-    """{key: record} of each normalized observation, raw (`sample`) against preprocessed (`batch`)."""
+def _covering(steps, key):
+    """(the last of `steps` that normalizes `key`, its float32 stats for `key`), or (None, None)."""
+    for step in reversed(steps):
+        if key in normalized_keys(step):
+            return step, _float_stats(step).get(key)
+    return None, None
+
+
+def _usable(stats, mode) -> bool:
+    return stats is not None and mode in REQUIRED and all(n in stats for n in REQUIRED[mode][0])
+
+
+def _affine(mode, stats, eps, inverse):
+    """(offset, denom, scale, shift) of lerobot's transform (normalize_processor.py:347-417):
+    normalize is scale * (x - offset) / denom + shift, unnormalize its inverse. MEAN_STD adds eps
+    to the std when normalizing only."""
+    lo, hi = (stats[n].double() for n in REQUIRED[mode][0])
+    if mode == "MEAN_STD":
+        return lo, hi if inverse else hi + eps, 1.0, 0.0
+    return lo, hi - lo, 2.0, -1.0
+
+
+def formula_check(x, y, mode, stats, eps, inverse=False) -> dict:
+    """Compare a processor's output `y` with the formula applied to its input `x` in float64,
+    within FORMULA_ULPS units of `y`'s dtype on the magnitudes involved (NEW)."""
+    offset, denom, scale, shift = _affine(mode, stats, eps, inverse)
+    x = x.double()
+    if inverse:
+        want = (x - shift) / scale * denom + offset
+        size = (x.abs() + abs(shift)) / scale * denom.abs() + offset.abs()
+    else:
+        want = scale * (x - offset) / denom + shift
+        size = scale * (x.abs() + offset.abs()) / denom.abs() + abs(shift)
+    err = (y.double() - want).abs()
+    bound = FORMULA_ULPS * torch.finfo(y.dtype).eps * (want.abs() + size) + 1e-12
+    return {"finite": bool(torch.isfinite(y).all()), "max_formula_err": float(err.max()),
+            "matches": bool((err <= bound).all())}
+
+
+def _probe_observations(sample, batch, modes, steps, rename_map) -> dict:
+    """{key: record} of each required observation, raw (`sample`) against preprocessed (`batch`);
+    a required key missing from either is a failure."""
     inv = {v: k for k, v in (rename_map or {}).items()}
     out_rec = {}
-    for key, mode in sorted(norm_keys.items()):
+    for key, mode in sorted(modes.items()):
         src = inv.get(key, key)
         if src not in sample or key not in batch:
-            out_rec[key] = {"mode": mode, "present": False}
+            out_rec[key] = {"mode": mode, "present": False, "ok": False}
             continue
-        raw = torch.as_tensor(sample[src]).float().cpu()
-        out = batch[key].float().cpu().reshape(raw.shape) if batch[key].numel() == raw.numel() \
-            else batch[key].float().cpu()
-        changed = out.shape != raw.shape or not torch.allclose(out, raw, rtol=1e-3, atol=1e-3)
-        out_rec[key] = {"mode": mode, "present": True, "changed": changed,
-                        "raw_mean": float(raw.mean()), "raw_std": float(raw.std()),
-                        "normalized_mean": float(out.mean()), "normalized_std": float(out.std())}
+        out_rec[key] = _probe_observation(torch.as_tensor(sample[src]), batch[key], mode,
+                                          *_covering(steps, key))
     return out_rec
 
 
+def _probe_observation(raw, out, mode, step, stats) -> dict:
+    raw, out = raw.float().cpu(), out.detach().cpu()
+    rec = {"mode": mode, "present": True, "raw_mean": float(raw.mean()), "raw_std": float(raw.std()),
+           "normalized_mean": float(out.float().mean()), "normalized_std": float(out.float().std())}
+    if out.numel() != raw.numel():
+        return {**rec, "ok": False, "reason": f"shape {tuple(out.shape)} vs raw {tuple(raw.shape)}"}
+    if not _usable(stats, mode):
+        return {**rec, "ok": False, "reason": "no usable stats"}
+    found = formula_check(raw, out.reshape(raw.shape), mode, _image_stats(stats, raw), step.eps)
+    return {**rec, **found, "ok": found["finite"] and found["matches"]}
+
+
+def _image_stats(stats, raw):
+    """Flat (C,) stats as (C, 1, 1) over a (C, H, W) image, as lerobot reshapes visual stats."""
+    if raw.ndim != 3:
+        return stats
+    return {n: t.view(-1, 1, 1) if t.ndim == 1 and t.numel() == raw.shape[0] else t
+            for n, t in stats.items()}
+
+
 def _probe_action_round_trip(normalizer, postprocess, action_shape, seed) -> dict:
-    """Unnormalize a seeded model-space action chunk with `postprocess`, then normalize it back
-    with a copy of the preprocessor's `normalizer` step."""
+    """Unnormalize a seeded model-space action chunk with `postprocess` and check it against the
+    formula, then normalize it back with a copy of the preprocessor's `normalizer` step."""
     from lerobot.lerobot_types import TransitionKey
     from lerobot.processor.converters import create_transition
-    from lerobot.utils.constants import ACTION
 
     g = torch.Generator().manual_seed(seed)
     chunk = torch.randn((1, 4, *action_shape), generator=g)  # NEW: a model-space chunk
-    unnorm = postprocess(chunk.clone()).float().cpu()
+    unnorm = postprocess(chunk.clone()).cpu()
     step = copy.deepcopy(normalizer)  # keeps the run's step free of the probe's dtype change
-    back = step(create_transition(action=unnorm.clone()))[TransitionKey.ACTION].float().cpu()
+    back = step(create_transition(action=unnorm.clone().float()))[TransitionKey.ACTION].float().cpu()
     err = float((back - chunk).abs().max())
-    scale = float(chunk.abs().max())
-    post_modes = {m for s in _steps(postprocess, "UnnormalizerProcessorStep")
-                  for k, m in normalized_keys(s).items() if k == ACTION}
-    return {"max_abs_err": err, "rtol": ROUND_TRIP_RTOL,
-            "identity": err <= ROUND_TRIP_RTOL * max(scale, 1.0),
-            "unnormalize_changed": not torch.allclose(unnorm, chunk), "modes": sorted(post_modes),
-            "unnormalized_mean": float(unnorm.mean()), "unnormalized_std": float(unnorm.std())}
+    rec = {"max_abs_err": err, "rtol": ROUND_TRIP_RTOL,
+           "identity": err <= ROUND_TRIP_RTOL * max(float(chunk.abs().max()), 1.0),
+           "finite": bool(torch.isfinite(unnorm).all() and torch.isfinite(back).all()),
+           "unnormalized_mean": float(unnorm.float().mean()),
+           "unnormalized_std": float(unnorm.float().std())}
+    rec.update(_unnormalize_check(postprocess, chunk, unnorm))
+    rec["ok"] = rec["identity"] and rec["finite"] and rec["matches"]
+    return rec
+
+
+def _unnormalize_check(postprocess, chunk, unnorm) -> dict:
+    """The unnormalizer's output against the formula; an action the config leaves IDENTITY (no
+    covering step) must come back unchanged."""
+    from lerobot.utils.constants import ACTION
+
+    step, stats = _covering(_steps(postprocess, "UnnormalizerProcessorStep"), ACTION)
+    if step is None:
+        return {"modes": [], "matches": bool(torch.equal(unnorm.float(), chunk))}
+    mode = normalized_keys(step)[ACTION]
+    if not _usable(stats, mode):
+        return {"modes": [mode], "matches": False, "reason": "no usable stats"}
+    found = formula_check(chunk, unnorm, mode, stats, step.eps, inverse=True)
+    return {"modes": [mode], "matches": found["matches"], "max_formula_err": found["max_formula_err"]}
 
 
 # ---------------------------------------------------------------------------------------------
 # Records and exports
 # ---------------------------------------------------------------------------------------------
 
+RECORD_VERSION = 2   # NEW in 2: the transform (mode, eps) beside the stats, and its digest
+
+
 def export_record(norm: dict) -> dict:
-    """What an export carries in manifest.json and policy.json."""
+    """What an export carries in manifest.json and policy.json. `stats_sha256*` are kept as in
+    record version 1; `transform_sha256*` and `transform` add the mode and eps per key."""
     guard = norm.get("guard") or {}
-    return {"protocol": norm["protocol"], "status": norm["status"],
+    per_role = {r: guard.get(r, {}) for r, _ in ROLES}
+    return {"record_version": RECORD_VERSION,
+            "protocol": norm["protocol"], "status": norm["status"],
             "stats_source": norm.get("stats_source"),
             "stats_sha256": norm.get("stats_sha256"),
-            "stats_sha256_per_key": {r: {k: v.get("sha256") for k, v in guard.get(r, {}).items()}
-                                     for r in ("pre", "post")}}
+            "stats_sha256_per_key": {r: {k: v.get("sha256") for k, v in keys.items()}
+                                     for r, keys in per_role.items()},
+            "transform_sha256": norm.get("transform_sha256"),
+            "transform": {r: {k: {"mode": v.get("mode"), "eps": v.get("eps"),
+                                  "sha256": v.get("transform_sha256")} for k, v in keys.items()}
+                          for r, keys in per_role.items()}}
+
+
+LEGACY_EXPORT = {"protocol": "checkpoint", "status": LEGACY, "stats_sha256": None}
 
 
 def check_export(manifest: dict, norm: dict) -> None:
     """--from-export: the export's normalization must be the one requested (NEW). An export written
-    before this protocol existed carries none and counts as checkpoint / legacy-unverified."""
-    have = manifest.get("normalization") or {"protocol": "checkpoint", "status": LEGACY,
-                                             "stats_sha256": None}
+    before this protocol existed carries none and counts as checkpoint / legacy-unverified; a
+    verified export must carry the transform digest (record version 2) and match it."""
+    have = manifest.get("normalization") or LEGACY_EXPORT
+    _check_export_protocol(have, norm)
+    _check_export_stats(have, norm)
+    if have["status"] == LEGACY:
+        return
+    if not have.get("transform_sha256"):
+        raise NormalizationError(
+            "--from-export: the export records only its normalization stats, not the transform "
+            f"(record version {have.get('record_version', 1)}); re-export it")
+    if norm.get("transform_sha256") and have["transform_sha256"] != norm["transform_sha256"]:
+        raise NormalizationError(
+            f"--from-export: the export's normalization transform (sha256 "
+            f"{have['transform_sha256'][:12]}, modes {_modes(have)}) differs from this run's "
+            f"({norm['transform_sha256'][:12]}); the stats source was {have.get('stats_source')}")
+
+
+def _check_export_protocol(have: dict, norm: dict) -> None:
     want = (norm["protocol"], norm["status"])
     got = (have.get("protocol"), have.get("status"))
     if got != want:
@@ -329,8 +508,16 @@ def check_export(manifest: dict, norm: dict) -> None:
             f"--from-export: the export was made with normalization {got[0]} / {got[1]}, this run "
             f"requests {want[0]} / {want[1]}; re-export with --norm-stats {want[0]} or request "
             f"--norm-stats {got[0]}" + (" --allow-unnormalized" if got[1] == LEGACY else ""))
+
+
+def _check_export_stats(have: dict, norm: dict) -> None:
     if have.get("stats_sha256") and norm.get("stats_sha256") and have["stats_sha256"] != norm["stats_sha256"]:
         raise NormalizationError(
             f"--from-export: the export's normalization stats (sha256 {have['stats_sha256'][:12]}) "
             f"differ from this run's ({norm['stats_sha256'][:12]}); the stats source was "
             f"{have.get('stats_source')}")
+
+
+def _modes(record: dict) -> dict:
+    return {f"{r}:{k}": v.get("mode") for r, keys in (record.get("transform") or {}).items()
+            for k, v in keys.items()}

@@ -133,27 +133,30 @@ def setup_normalization(args, cfg, rename, ds, idx):
     else:
         source = {"kind": "checkpoint", "id": args.policy}
     preprocess, postprocess = build_processors(cfg, args, rename, norm_stats)
-    guard = policy_norm.check(preprocess, postprocess)
+    guard = policy_norm.check(preprocess, postprocess, cfg)
     status = policy_norm.require(guard, args.norm_stats, args.allow_unnormalized)
     act = cfg.output_features.get("action")
-    probe = policy_norm.probe(preprocess, postprocess, ds[idx[0]], to_batch, rename,
+    probe = policy_norm.probe(preprocess, postprocess, ds[idx[0]], to_batch, guard["required"], rename,
                               tuple(act.shape) if act is not None else None, seed=args.seed)
     if not probe["ok"] and status == policy_norm.VERIFIED:
         raise policy_norm.NormalizationError(f"normalization probe failed: {json.dumps(probe)}")
     norm = {"protocol": args.norm_stats, "status": status, "stats_source": source,
-            "stats_sha256": policy_norm.combined_sha256(guard), "guard": guard, "probe": probe,
+            "stats_sha256": policy_norm.combined_sha256(guard),
+            "transform_sha256": policy_norm.combined_sha256(guard, "transform_sha256"),
+            "guard": guard, "probe": probe,
             "new": ("--norm-stats dataset is a NEW zero-shot evaluation protocol for a pretraining "
                     "checkpoint (the stats a fine-tune would start from); the guard, the probe and "
                     "--allow-unnormalized are NEW")}
-    print(f"normalization: {status} (--norm-stats {args.norm_stats}, stats sha256 "
-          f"{norm['stats_sha256']}, probe ok {probe['ok']})", flush=True)
+    print(f"normalization: {status} (--norm-stats {args.norm_stats}, transform sha256 "
+          f"{norm['transform_sha256']}, probe ok {probe['ok']})", flush=True)
     return norm, norm_stats
 
 
-def require_guarded_normalization(mode, preprocess, postprocess, norm):
+def require_guarded_normalization(mode, cfg, preprocess, postprocess, norm):
     """Every mode rebuilds its processors; they must normalize exactly as the guarded ones did."""
-    guard = policy_norm.check(preprocess, postprocess)
-    if policy_norm.combined_sha256(guard) != norm["stats_sha256"] or guard["problems"] != norm["guard"]["problems"]:
+    guard = policy_norm.check(preprocess, postprocess, cfg)
+    same = policy_norm.combined_sha256(guard, "transform_sha256") == norm["transform_sha256"]
+    if not same or guard["problems"] != norm["guard"]["problems"]:
         raise RuntimeError(f"{mode}: the processors' normalization differs from the guarded one")
 
 
@@ -385,7 +388,8 @@ def _calib_loader(cache, args, cfg, preprocess, norm=None):
                 args.calib_n or algo_calib.DEFAULT_N["policy"], args.calib_seed,
                 lambda sample: to_batch(sample, preprocess)))
             if norm is not None:   # the evaluated frames' processors, so the same normalization
-                cache[0][1]["normalization"] = {k: norm[k] for k in ("protocol", "status", "stats_sha256")}
+                cache[0][1]["normalization"] = {k: norm[k] for k in ("protocol", "status", "stats_sha256",
+                                                                      "transform_sha256")}
         batches, rec = cache[0]
         seeds = {id(b): args.calib_seed + i for i, b in enumerate(batches)}
 
@@ -442,7 +446,7 @@ def main():
         policy, cfg = load_policy(args.policy, args.device, dtype)
         result["provenance"].setdefault("checkpoint_key_repair", policy.checkpoint_key_repair)
         preprocess, postprocess = build_processors(cfg, args, rename, norm_stats)
-        require_guarded_normalization(mode, preprocess, postprocess, norm)
+        require_guarded_normalization(mode, cfg, preprocess, postprocess, norm)
         if not args.export_only:
             result["data"] = {"dataset": args.dataset, "test_episodes": test_eps,
                               "frames": len(idx), "fps": meta.fps}
