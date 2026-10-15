@@ -160,10 +160,23 @@ def test_required_observation_missing_from_the_frame_fails_the_probe():
                                                                 "ok": False}
 
 
-def test_degenerate_range_is_refused_by_the_guard():
-    stats = {STATE: {"min": torch.zeros(3), "max": torch.full((3,), 1e-40)}, ACTION: _stats("MIN_MAX", 2)}
+def test_zero_range_is_refused_by_the_guard():
+    stats = {STATE: {"min": torch.zeros(3), "max": torch.tensor([1.0, 0.0, 1.0])}, ACTION: _stats("MIN_MAX", 2)}
     g = policy_norm.check(*_pipes("MIN_MAX", stats), _cfg("MIN_MAX"))
-    assert not g["ok"] and any("degenerate range" in p for p in g["problems"])
+    assert not g["ok"] and any("non-positive range in 1 of 3" in p for p in g["problems"])
+
+
+@pytest.mark.parametrize("mode", ["MIN_MAX", "QUANTILES", "QUANTILE10"])
+def test_tiny_finite_range_passes_the_guard_and_the_probe(mode):
+    # 1 / 1e-39 overflows float32, yet normalizing a frame inside [0, 1e-39] is finite and exact
+    tiny = dict(zip(policy_norm.REQUIRED[mode][0], (torch.zeros(3), torch.full((3,), 1e-39))))
+    pre, post = _pipes(mode, {STATE: tiny, ACTION: _stats(mode, 2)})
+    g = policy_norm.check(pre, post, _cfg(mode))
+    assert g["ok"], g["problems"]
+    sample = {**_sample(), STATE: torch.tensor([0.0, 5e-40, 1e-39])}
+    probe = policy_norm.probe(pre, post, sample, _to_batch, g["required"], action_shape=(2,))
+    state = probe["observations"][STATE]
+    assert probe["ok"] and state["finite"] and state["matches"], probe
 
 
 def test_non_finite_normalized_observation_fails_the_probe():
