@@ -26,8 +26,7 @@ from types import SimpleNamespace
 
 import torch
 
-OPENPI_CANDIDATES = (os.environ.get("OPENPI_DIR", ""),
-                     "/scratch2/lorenhung/merlin-wt-tracka/third_party_ext/openpi")
+OPENPI_CANDIDATES = (os.environ.get("OPENPI_DIR", ""),)
 
 TINY = {
     "tiny_vlm": dict(width=64, depth=2, mlp_dim=128, num_heads=8, num_kv_heads=1, head_dim=16),
