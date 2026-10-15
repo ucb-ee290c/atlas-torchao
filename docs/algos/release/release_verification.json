@@ -8,17 +8,22 @@
   },
   "release": {
     "tag": "atlas-v1.0",
+    "tag_scope": "local tag only, never published; cite the commit",
     "code_commit": "5ff028ee58b28606873278236a379dcc09339b82",
     "code_unchanged_during_gpu_verification": true,
     "export_verification_gate": "passed",
     "tag_annotation": "historical snapshot before final GPU verification; unchanged",
-    "publication": "on hold; no republication authorized"
+    "publication": "merged to main by pull request #1 (merge commit 54e1855, tree of 2d4b187); the atlas-v1.0 tag was not published"
+  },
+  "path_placeholders": {
+    "$GPU_ATLAS_ROOT": "the atlas-fp8 working directory on the GPU machine",
+    "$LOCAL_ARTIFACTS": "the out/artifacts directory of the local Merlin checkout"
   },
   "gpu_paths": {
-    "source": "/scratch/lsh/atlas-fp8/release-check-pgu1ehd7/source",
-    "export": "/scratch/lsh/atlas-fp8/exports/release-check/dit-bx20fgr0/multitask_dit/default",
-    "results": "/scratch/lsh/atlas-fp8/results/release-check/dit-gm22y2tp",
-    "report": "/scratch/lsh/atlas-fp8/results/release-check/dit-gm22y2tp/release_verification.json"
+    "source": "$GPU_ATLAS_ROOT/release-check-pgu1ehd7/source",
+    "export": "$GPU_ATLAS_ROOT/exports/release-check/dit-bx20fgr0/multitask_dit/default",
+    "results": "$GPU_ATLAS_ROOT/results/release-check/dit-gm22y2tp",
+    "report": "$GPU_ATLAS_ROOT/results/release-check/dit-gm22y2tp/release_verification.json"
   },
   "export": {
     "files": [
@@ -138,7 +143,7 @@
   ],
   "retention": "GPU source checkout, exports and logs retained unchanged",
   "local_test_log_archive": {
-    "root": "/scratch2/lorenhung/merlin-wt-tracka/out/artifacts/handoff/atlas-fp8/atlas_v1/release",
+    "root": "$LOCAL_ARTIFACTS/handoff/atlas-fp8/atlas_v1/release",
     "files": {
       "pytest-full.log": "9f71455705fdf306a9a61f8ba4d43aac47c359118c3e9932536a236b07c3d7b3",
       "pytest-release-regressions.log": "9c5c79197bd11a8744f0e5a2d2dc3b3b2fe47067569c09a87bf88e262ae54886",
