@@ -320,12 +320,12 @@ def _check_role(role, cls, pipe) -> tuple[list, list]:
 def _duplicate_problems(role, transforms) -> list:
     """A key (un)normalized by more than one step: lerobot would compose them, which neither the
     per-key record nor the probe's formula describes, so it is refused (NEW)."""
-    steps_by_key = {}
+    positions_by_key = {}
     for t in transforms:
-        steps_by_key.setdefault(t["key"], []).append(t["step"])
-    return [f"{role}: {key!r} is normalized by {len(steps)} steps (pipeline positions {steps}); "
+        positions_by_key.setdefault(t["key"], []).append(t["step"])
+    return [f"{role}: {key!r} is normalized by {len(positions)} steps (pipeline positions {positions}); "
             "one step per key is supported"
-            for key, steps in sorted(steps_by_key.items()) if len(steps) > 1]
+            for key, positions in sorted(positions_by_key.items()) if len(positions) > 1]
 
 
 def _per_key(transforms) -> dict:
