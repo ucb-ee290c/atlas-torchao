@@ -151,6 +151,31 @@ def test_processor_mode_differing_from_the_config_is_refused():
     assert not g["ok"] and any("MIN_MAX in the processor, MEAN_STD in the config" in p for p in g["problems"])
 
 
+def test_processor_normalizing_a_config_identity_feature_is_refused_and_probed():
+    # config VISUAL IDENTITY, processor VISUAL MEAN_STD with stats that send every pixel to inf
+    stats = {STATE: _stats("MEAN_STD", 3), ACTION: _stats("MEAN_STD", 2),
+             IMAGE: {"mean": torch.full((3,), -3e38), "std": torch.full((3,), 0.1)}}
+    pre, post = _pipes(stats=stats, visual=NormalizationMode.MEAN_STD)
+    g = policy_norm.check(pre, post, _cfg())
+    assert not g["ok"]
+    assert any(f"{IMAGE!r} is MEAN_STD in the processor, IDENTITY in the config" in p for p in g["problems"])
+    probe = policy_norm.probe(pre, post, _sample(), _to_batch, g["required"], action_shape=(2,))
+    assert not probe["ok"] and not probe["observations"][IMAGE]["finite"]
+
+
+def test_processor_normalizing_an_undeclared_feature_is_refused():
+    extra = "observation.environment_state"
+    features = {**FEATURES, extra: PolicyFeature(FeatureType.STATE, (2,))}
+    stats = {STATE: _stats("MEAN_STD", 3), ACTION: _stats("MEAN_STD", 2), extra: _stats("MEAN_STD", 2)}
+    pre, post = _pipes(stats=stats, features=features)
+    g = policy_norm.check(pre, post, _cfg())
+    assert not g["ok"] and any(f"{extra!r} (MEAN_STD) but the config does not declare it" in p
+                               for p in g["problems"])
+    sample = {**_sample(), extra: torch.tensor([7.0, -7.0])}
+    probe = policy_norm.probe(pre, post, sample, _to_batch, g["required"], action_shape=(2,))
+    assert probe["observations"][extra]["matches"]
+
+
 def test_required_observation_missing_from_the_frame_fails_the_probe():
     pre, post = _pipes()
     g = policy_norm.check(pre, post, _cfg())
