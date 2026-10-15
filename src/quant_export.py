@@ -92,8 +92,8 @@ NEW_DECISIONS = [
 
 PENDING_RULINGS = [
     {"id": "Q2", "ruling": "run-time vs static activation scales (is a dynamic amax on chip intended?)",
-     "affects": "every site whose activation mode is dynamic (atlas_v1_awq / atlas_v1_sq per-token; attention operands of "
-                "every recipe)", "status": "open"},
+     "affects": "every site whose activation mode is dynamic (atlas_v1_awq / atlas_v1_sq per-token; "
+                "attention operands of every recipe)", "status": "open"},
     {"id": "H2", "ruling": "how a per-row exponent is derived from vredmax.row (no floor / exponent-extract "
                            "instruction)", "affects": "per-token activation and dynamic per-tensor scales",
      "status": "open"},
@@ -631,6 +631,7 @@ def export(model: nn.Module, export_dir, *, mode: str, report: dict, algo, algo_
         calib = {**(jsonable(calib_record) or {}),
                  "data_sha256": digest_batches(calib_batches) if calib_batches is not None else None}
     site_list = [{"site_id": n, "status": s["status"], "kind": s["kind"]} for n, s in policy["sites"].items()]
+    recipe_rec = getattr(algo, "recipe", None) or {}
     manifest = {
         "schema": MANIFEST_SCHEMA, "format_version": FORMAT_VERSION,
         "created_utc": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -639,8 +640,7 @@ def export(model: nn.Module, export_dir, *, mode: str, report: dict, algo, algo_
         "policy_sha256": sha256_file(pf),
         "model": model_record or {},
         "exported_mode": mode, "ladder": jsonable(report.get("ladder")),
-        "recipe": {"algo": algo_spec, "alias": (getattr(algo, "recipe", None) or {}).get("alias"),
-                   "resolved": (getattr(algo, "recipe", None) or {}).get("name"),
+        "recipe": {"algo": algo_spec, "alias": recipe_rec.get("alias"), "resolved": recipe_rec.get("name"),
                    "expanded": expanded, "stack": jsonable(stack),
                    "recipe": jsonable(getattr(algo, "recipe", None)),
                    "algorithm_record": jsonable(algo_rec)},

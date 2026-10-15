@@ -169,8 +169,14 @@ def recipe_record(spec: str | None) -> dict | None:
 def expand(spec: str | None) -> str:
     """`spec` with a named recipe (or alias) replaced by its stack."""
     parts = split(spec)
-    return "+".join(RECIPES[resolve(p)[1]]["spec"] if _is_recipe(p) and ":" not in p.strip() else p
-                    for p in parts)
+    return "+".join(_expand_part(p) for p in parts)
+
+
+def _expand_part(part: str) -> str:
+    """A bare recipe or alias token as its stack; any other token unchanged."""
+    if _is_recipe(part) and ":" not in part.strip():
+        return RECIPES[resolve(part)[1]]["spec"]
+    return part
 
 
 def parse_stack(spec: str | None) -> list:
@@ -305,9 +311,10 @@ def quantize(model, mode, skip=(), options=None, algo=None, calib=None) -> dict:
     for name in exact:
         import torch.nn as nn
 
-        if type(mods.get(name)) is not nn.Conv2d:
+        site_type = type(mods.get(name))
+        if site_type is not nn.Conv2d:
             raise ValueError(f"{algo.name}: exact BF16 site {name!r} must be an nn.Conv2d of the model "
-                             f"(got {type(mods.get(name)).__name__})")
+                             f"(got {site_type.__name__})")
     exact_bf16 = list(exact)
     bf16 = list(dict.fromkeys(bf16 + exact_bf16))
     if algo.needs_calibration and calib is None:
