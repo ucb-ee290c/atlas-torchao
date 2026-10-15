@@ -70,13 +70,14 @@ the tests also checks the policy. It is meant to become the m2m adapter's policy
     The entry also gives `output_rescale` (`2^(s_x+s_w)` in float32, then the layer dtype, bias
     after), `residual_passes`, and for a Conv2d the im2col geometry.
   - **Attention**: one rule per operand `q`, `k`, `p`, `v`.
-  - **BF16 opt-outs**: status `host` and the reason. NEW: canonical `atlas_v1` on
-    `multi_task_dit` keeps the exact CLIP patch embedding Conv2d in BF16. Its top-level
-    `bf16_opt_out` row has `match: exact`; the loader excludes only that site, preserving
-    similarly named siblings. Historical exports without `match` retain substring replay.
-    The canonical full-checkpoint release export passed an eight-frame, 96-tensor
-    byte-identical round trip at `5ff028e`; all historical run-5.3 DiT exports had zero
-    BF16 opt-outs. See the [verification record](release/release_verification.json).
+  - **BF16 opt-outs**: status `host` and the reason. A site an algorithm keeps by exact fqn
+    (`bf16_exact`, e.g. [`keep_bf16:rule=input_conv`](keep-bf16.md)) has a top-level
+    `bf16_opt_out` row with `match: exact` and the reason the selecting rule gave; the loader
+    excludes only that site, preserving similarly named siblings. Historical exports without
+    `match` retain substring replay. The v1.0 release export (commit `5ff028e`) carried the
+    since-removed DiT patch-embedding exception of that version's `atlas_v1`; it passed an
+    eight-frame, 96-tensor byte-identical round trip. All historical run-5.3 DiT exports had
+    zero BF16 opt-outs. See the [verification record](release/release_verification.json).
   - **`--skip` layers**: status `skipped`.
 - **`runtime`**:
   - `chip_options`: the recipe's chip defaults, such as `chip_vadd rn` on residual sites, plus any
@@ -96,9 +97,12 @@ the tests also checks the policy. It is meant to become the m2m adapter's policy
 - **`model`**: the CLI, model id and checkpoint record. That record holds the sha256 of each
   `*.safetensors` of a local checkpoint or cached HF snapshot. For Pi0 it is
   `pi0_model.checkpoint_info`.
-- **`recipe`**: the `--algo` string, its expanded stack with parameters, the recipe record
-  (`algos.RECIPES` on `atlas_v1`), and the full algorithm record from `algos.quantize`, including
-  per-member calibration and prepare records.
+- **`recipe`**: the `--algo` string (`algo`), the alias it used (`alias`, e.g. `atlas_v1`, or
+  null), the recipe it resolved to (`resolved`), its fully expanded stack (`expanded`) with
+  parameters (`stack`), the recipe record (`algos.recipe_record`: requested token, alias,
+  resolved name, recipe spec, expanded spec, chip defaults), and the full algorithm record from
+  `algos.quantize`, including per-member calibration and prepare records and every exact BF16
+  site with its reason.
 - **`calibration`**: the calibration loader's record (source, n, seed, windows / episodes /
   frames). `data_sha256` is a digest over the calibration batches as the CLI held them.
 - **`normalization`** (LeRobot policies, NEW): `protocol` (`checkpoint` / `dataset`), `status`
