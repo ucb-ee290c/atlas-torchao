@@ -89,6 +89,50 @@ statistical significance from them.
 All repeats were identical, all layers were reached, all values were finite, and chip
 cross-checks had zero mismatches. This is output fidelity evidence, not closed-loop task success.
 
+**SmolVLA rows above predate the normalization protocol (next section).** They are model-space
+fidelity on unnormalized inputs: SmolVLA received raw joint degrees as state and its actions were
+never unnormalized. Their rel L2 / cosine against BF16 compare two quantizations of that same
+unnormalized computation; their ground-truth MSE / MAE (on the order of 2000) are invalid and
+must not be cited. The TinyLlama, Pi0 and DiT rows are unaffected.
+
+## LeRobot normalization protocol (`--norm-stats`)
+
+`lerobot/smolvla_base`'s saved processors declare STATE / ACTION `MEAN_STD` but store stats only
+under `so100{,-blue,-red}.buffer.action.{mean,std}`. LeRobot 0.6.1 passes a tensor through
+unchanged when its key has no stats (`lerobot/processor/normalize_processor.py:330-331`), so with
+the checkpoint's processors nothing is normalized and nothing fails. The `so100` stats do not match
+`svla_so100_pickplace` and are not aliased.
+
+`src/eval_policy.py` (and `src/policy_norm.py`) therefore:
+
+- `--norm-stats checkpoint` (default): the processors as saved.
+- `--norm-stats dataset` (NEW): a zero-shot evaluation protocol for a pretraining checkpoint,
+  mirroring what a fine-tune would start from. The normalizer and unnormalizer stats are replaced
+  with the evaluated dataset's `LeRobotDatasetMetadata(...).stats` through the overrides
+  `lerobot_train` passes when it fine-tunes from a pretrained checkpoint
+  (`lerobot/scripts/lerobot_train.py:355-377`: features, `norm_map` and `stats` of
+  `normalizer_processor` / `unnormalizer_processor`). The stats' camera keys follow the rename map,
+  as in LeRobot's rollout path (`rename_stats`, `lerobot/rollout/context.py:461`).
+- A guard (NEW), for every protocol, right after the processors are built: every feature whose
+  mode is not `IDENTITY` must have finite stats under the exact key the step looks up (the action
+  under `action`) in both the normalizer and the unnormalizer, with a positive std (`MEAN_STD`) or
+  range (`MIN_MAX`, `QUANTILES`, `QUANTILE10`). Otherwise the run refuses, names the keys and
+  suggests `--norm-stats dataset`. SmolVLA is refused with `checkpoint`; the Multi-Task DiT
+  (literal `MIN_MAX` state / action and `MEAN_STD` image stats) passes with `checkpoint`.
+- A probe (NEW): one evaluated frame through the preprocessor (each normalized observation must
+  change) and one action chunk through the postprocessor and back through the normalizer (must be
+  the identity within 1e-4 relative).
+- `--allow-unnormalized` (NEW, `checkpoint` only) reproduces the historical behaviour for
+  comparison; the result JSON says `"normalization": "legacy-unverified"` at the top and in every
+  mode.
+
+Every result records `normalization` (status) and `normalization_protocol`: the protocol, the stats
+source (dataset repo, revision and resolved snapshot, or the checkpoint id), the sha256 of each
+key's canonically serialized stats and their combined digest, the guard and the probe.
+Calibration frames go through the same processors and record the same digest. Exports carry the
+protocol and the digest, and `--from-export` refuses an export made under another protocol or with
+other stats ([export.md](export.md)).
+
 ### DiT after checkpoint repair (run 5.2, `4ab3889`)
 
 The repaired checkpoint remapped 395 CLIP keys. Earlier DiT measurements are superseded.
@@ -198,11 +242,12 @@ for R in none atlas_v1 atlas_v1_sq atlas_v1_static; do
   python src/eval.py --model $TL --modes bf16 ref_conv --algo $R --out out/v1_R_tl_$R.json
   python src/eval.py --model $TL --protocol mxq --nsamples $NC --seed 0 --modes bf16 chip --kl \
       --algo $R --out out/v1_C_tl_$R.json
-  # SmolVLA
+  # SmolVLA (its checkpoint stats are refused by the guard; see the normalization protocol)
   python src/eval_policy.py --policy lerobot/smolvla_base --dataset lerobot/svla_so100_pickplace \
-      --n-frames 200 --seed 0 --modes bf16 ref_conv --algo $R --out out/v1_R_smolvla_$R.json
+      --n-frames 200 --seed 0 --modes bf16 ref_conv --algo $R --norm-stats dataset \
+      --out out/v1_R_smolvla_$R.json
   python src/eval_policy.py --policy lerobot/smolvla_base --dataset lerobot/svla_so100_pickplace \
-      --n-frames 32 --seed 0 --modes chip --algo $R --out out/v1_C_smolvla_$R.json
+      --n-frames 32 --seed 0 --modes chip --algo $R --norm-stats dataset --out out/v1_C_smolvla_$R.json
   # Multi-Task DiT (full recipe through this repo)
   python src/eval_policy.py --policy TRI-ML/multitask-dit-robosuite-wrist-diffusion-064000 \
       --dataset TRI-ML/PretrainFinetune --n-frames 200 --seed 0 --modes bf16 ref_conv \
@@ -235,7 +280,7 @@ for R in atlas_v1 atlas_v1_static; do
   python src/eval.py --model $TL --modes ref_conv --algo $R \
       --export-dir $E/tinyllama/$R --export-only --out $E/tinyllama/$R.run.json
   python src/eval_policy.py --policy lerobot/smolvla_base --dataset lerobot/svla_so100_pickplace \
-      --n-frames 200 --seed 0 --modes ref_conv --algo $R \
+      --n-frames 200 --seed 0 --modes ref_conv --algo $R --norm-stats dataset \
       --export-dir $E/smolvla/$R --export-only --out $E/smolvla/$R.run.json
   python src/eval_policy.py --policy TRI-ML/multitask-dit-robosuite-wrist-diffusion-064000 \
       --dataset TRI-ML/PretrainFinetune --n-frames 200 --seed 0 --modes ref_conv --algo $R \

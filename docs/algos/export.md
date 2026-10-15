@@ -21,6 +21,11 @@ have all been applied, and evaluation has not started. Evaluation then runs as u
   evaluation, `--rmse` and `--kl`.
 - `--from-export DIR` builds every quantized mode from an export instead of quantizing. Use it to
   re-evaluate an export under the same protocol. It cannot be combined with `--export-dir`.
+  For a LeRobot policy (NEW) it refuses an export whose `normalization` protocol or status differs
+  from the run's (`--norm-stats`, `--allow-unnormalized`), or whose stats digest differs. An export
+  written before the protocol existed carries no `normalization` and counts as `checkpoint` /
+  `legacy-unverified`; the SmolVLA exports of that time must be re-exported with
+  `--norm-stats dataset` ([atlas_v1.md](atlas_v1.md#lerobot-normalization-protocol---norm-stats)).
 
 `collab_v0`, `collab_v0_hw` and `torchao` cannot be exported. Their weights are not E4M3 codes with
 power-of-two exponents.
@@ -79,6 +84,7 @@ the tests also checks the policy. It is meant to become the m2m adapter's policy
   - requirements such as RoPE / timestep tables as host constants, and a run-time amax for
     dynamic sites.
 - **`pending_hardware_rulings`**: the open rulings listed below.
+- **`normalization`** (LeRobot policies, NEW): as in `manifest.json`.
 
 ### `manifest.json` (`atlas_torchao.export_manifest.v1`, NEW)
 
@@ -95,6 +101,10 @@ the tests also checks the policy. It is meant to become the m2m adapter's policy
   per-member calibration and prepare records.
 - **`calibration`**: the calibration loader's record (source, n, seed, windows / episodes /
   frames). `data_sha256` is a digest over the calibration batches as the CLI held them.
+- **`normalization`** (LeRobot policies, NEW): `protocol` (`checkpoint` / `dataset`), `status`
+  (`verified` / `legacy-unverified`), `stats_source` (dataset repo, revision, snapshot and rename
+  map, or the checkpoint id), `stats_sha256` (the combined digest) and `stats_sha256_per_key`
+  (`pre` / `post`, per normalized key; `src/policy_norm.stats_sha256`).
 - **`sites`** and **`counts`**: the site census.
 - **`new_decisions`** and **`pending_hardware_rulings`**.
 - **`m2m_manifest_v2_aligned: "partial"`**, with `m2m_manifest_v2_matching_fields` and
@@ -194,6 +204,7 @@ then emit the v2 manifest with these fields filled.
   promoted (1+w) norms and SmolVLA's FP32 action projections stay FP32.
 - BF16 opt-outs have m2m status `host`, and `--skip` layers have status `skipped`.
 - The calibration data digest.
+- The LeRobot `normalization` record and the `--from-export` protocol check.
 
 ## Pending hardware rulings (also in `policy.json` and `manifest.json`)
 

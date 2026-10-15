@@ -98,10 +98,12 @@ TinyLlama (WikiText-2; no Conv2d, so step 5 is not run):
     # side profiles: the collaborator's protocol, the hardware cast, stock torchao
     python src/eval.py --model $TL --modes bf16 collab_v0 collab_v0_hw ref_conv torchao --out out/tl_fast_default.json
 
-SmolVLA (lerobot/svla_so100_pickplace; F from the benchmark):
+SmolVLA (lerobot/svla_so100_pickplace; F from the benchmark). `--norm-stats dataset` is required:
+smolvla_base's saved processors hold no stats for its state / action keys, which the normalization
+guard refuses (docs/algos/atlas_v1.md, "LeRobot normalization protocol"):
 
-    python src/eval_policy.py --policy lerobot/smolvla_base --dataset lerobot/svla_so100_pickplace --n-frames 200 --modes bf16 collab_v0 ref_linear ref_attn ref_conv --rmse --out out/smolvla_ladder_fast.json
-    python src/eval_policy.py --policy lerobot/smolvla_base --dataset lerobot/svla_so100_pickplace --n-frames $F --modes reference_hw chip chip_rope_vpu --mxu ipt --out out/smolvla_ladder_subset.json
+    python src/eval_policy.py --policy lerobot/smolvla_base --dataset lerobot/svla_so100_pickplace --norm-stats dataset --n-frames 200 --modes bf16 collab_v0 ref_linear ref_attn ref_conv --rmse --out out/smolvla_ladder_fast.json
+    python src/eval_policy.py --policy lerobot/smolvla_base --dataset lerobot/svla_so100_pickplace --norm-stats dataset --n-frames $F --modes reference_hw chip chip_rope_vpu --mxu ipt --out out/smolvla_ladder_subset.json
 
 Multi-Task DiT. Steps 1-5 here with the generic rules: `ref_attn` patches only the CLIP vision
 attention (DiT's own RoPEAttention is left unpatched, see `attention_sites`); the full ladder, with
@@ -417,7 +419,7 @@ docs/algos/vpu-numerics.md).
         --modes bf16 chip --chip-mxu framework --device cpu --out out/tinyllama_chip.json
     python src/eval_policy.py --policy lerobot/smolvla_base --dataset lerobot/svla_so100_pickplace \
         --modes bf16 chip --chip-mxu framework --n-test-episodes 1 --n-frames 2 --device cpu \
-        --out out/smolvla_chip.json
+        --norm-stats dataset --out out/smolvla_chip.json
 
 ### Pi0
 
