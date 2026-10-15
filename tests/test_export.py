@@ -132,23 +132,28 @@ def test_conv2d_round_trip(tmp_path):
 
 
 @pytest.mark.parametrize("mode", ["ref_conv", "reference_hw", "chip"])
-def test_canonical_dit_bf16_exception_round_trip(tmp_path, mode):
+def test_input_conv_bf16_exception_round_trip(tmp_path, mode):
     from test_algo_atlas_v1 import DIT_PATCH, TinyDiT, dit_calib
 
     torch.manual_seed(17)
     m0 = TinyDiT()
     fresh = copy.deepcopy(m0)
     opts = {**FAST, "chip_mxu": "framework"}
-    a = algos.make("atlas_v1")
+    spec = "atlas_v1+keep_bf16:rule=input_conv"
+    a = algos.make(spec)
     rep = algos.quantize(m0, mode, options=opts, algo=a, calib=dit_calib())
     man = quant_export.export(m0, tmp_path, mode=mode, report=rep, algo=a,
-                              algo_spec="atlas_v1", options=opts)
+                              algo_spec=spec, options=opts)
     pol = json.loads((tmp_path / "policy.json").read_text())
-    assert pol["bf16_opt_out"] == [{"site": DIT_PATCH,
-        "reason": pol["sites"][DIT_PATCH]["reason"], "match": "exact"}]
-    assert "NEW" in pol["sites"][DIT_PATCH]["reason"]
+    reason = rep["algo"]["bf16_opt_out_reasons"][DIT_PATCH]
+    assert pol["bf16_opt_out"] == [{"site": DIT_PATCH, "reason": reason, "match": "exact"}]
+    assert pol["sites"][DIT_PATCH]["reason"] == reason and reason.startswith("keep_bf16 rule=input_conv")
     assert man["counts"]["host"] == 1
-    assert any("patch_embedding" in d for d in man["new_decisions"])
+    rec = man["recipe"]
+    assert (rec["algo"], rec["alias"], rec["resolved"]) == (spec, "atlas_v1", "atlas_v1_awq")
+    assert rec["expanded"] == algos.RECIPES["atlas_v1_awq"]["spec"] + "+keep_bf16:rule=input_conv"
+    assert rec["recipe"]["alias"] == "atlas_v1" and rec["recipe"]["expanded"] == rec["expanded"]
+    assert rec["algorithm_record"]["bf16_opt_out_exact"] == [DIT_PATCH]
     st = load_file(str(tmp_path / "model.safetensors"))
     assert st[DIT_PATCH + ".weight"].dtype == torch.bfloat16
     assert DIT_PATCH + ".weight_codes" not in st
@@ -161,6 +166,19 @@ def test_canonical_dit_bf16_exception_round_trip(tmp_path, mode):
     x = torch.randn(2, 3, 4, 4, dtype=torch.bfloat16)
     with torch.no_grad():
         assert torch.equal(m0(x), m1(x))
+
+
+def test_recipe_export_records_no_bf16_exception(tmp_path):
+    from test_algo_atlas_v1 import TinyDiT, dit_calib
+
+    m0 = TinyDiT()
+    a = algos.make("atlas_v1")
+    rep = algos.quantize(m0, "ref_conv", options=dict(FAST), algo=a, calib=dit_calib())
+    man = quant_export.export(m0, tmp_path, mode="ref_conv", report=rep, algo=a,
+                              algo_spec="atlas_v1", options=dict(FAST))
+    assert json.loads((tmp_path / "policy.json").read_text())["bf16_opt_out"] == []
+    assert man["counts"]["host"] == 0
+    assert (man["recipe"]["alias"], man["recipe"]["resolved"]) == ("atlas_v1", "atlas_v1_awq")
 
 
 @pytest.mark.parametrize("spec", SPECS)
@@ -221,7 +239,7 @@ def test_recipe_specs_match_the_registry():
     if not HAVE_RECIPES:
         pytest.skip("no named recipes on this branch")
     for n, s in RECIPE_SPECS.items():
-        assert algos.RECIPES[n]["spec"] == s
+        assert algos.expand(n) == s
 
 
 def test_export_refuses_what_it_cannot_express():

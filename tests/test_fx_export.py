@@ -99,12 +99,12 @@ def test_causal_cli_captures_local_export_with_local_architecture(tmp_path):
     assert all(fixtures[case["inputs"][0]].shape == (1, 8) for case in parity["cases"])
 
 
-def test_canonical_tiny_dit_capture_retains_exact_bf16_exception(tmp_path):
+def test_tiny_dit_capture_retains_exact_input_conv_bf16_exception(tmp_path):
     from test_algo_atlas_v1 import DIT_PATCH, TinyDiT, dit_calib
 
     torch.manual_seed(21)
     module = TinyDiT()
-    algo = algos.make("atlas_v1")
+    algo = algos.make("atlas_v1+keep_bf16:rule=input_conv")
     report = algos.quantize(module, "ref_conv", options=dict(FAST), algo=algo, calib=dit_calib())
     policy = quant_export.build_policy(module, "ref_conv", report, algo, dict(FAST), [],
                                        report["algo"]["bf16_opt_out"], {}, {})

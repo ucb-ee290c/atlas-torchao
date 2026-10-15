@@ -92,7 +92,7 @@ NEW_DECISIONS = [
 
 PENDING_RULINGS = [
     {"id": "Q2", "ruling": "run-time vs static activation scales (is a dynamic amax on chip intended?)",
-     "affects": "every site whose activation mode is dynamic (atlas_v1 per-token; attention operands of "
+     "affects": "every site whose activation mode is dynamic (atlas_v1_awq / atlas_v1_sq per-token; attention operands of "
                 "every recipe)", "status": "open"},
     {"id": "H2", "ruling": "how a per-row exponent is derived from vredmax.row (no floor / exponent-extract "
                            "instruction)", "affects": "per-token activation and dynamic per-tensor scales",
@@ -577,8 +577,10 @@ def export(model: nn.Module, export_dir, *, mode: str, report: dict, algo, algo_
     bf16 = list(algo_rec.get("bf16_opt_out") or [])
     reasons = _opt_out_reasons(algo, bf16)
     exact_bf16 = list(algo_rec.get("bf16_opt_out_exact") or [])
+    # the reason of an exact site is the one its selecting rule gave (algos.base.Algo.bf16_exact)
+    exact_reasons = algo_rec.get("bf16_opt_out_reasons") or {}
     for n in exact_bf16:
-        reasons[n] = "NEW: canonical atlas_v1 DiT patch_embedding BF16 exception; run-5.2 ref_conv evidence; pending R4"
+        reasons[n] = exact_reasons.get(n, "algorithm exact BF16 opt-out (bf16_exact)")
     quant = {}
     policy = build_policy(model, mode, report, algo, options, list(skip or ()), bf16, reasons, quant)
     # NEW: exact site identity avoids excluding similarly named sibling layers on replay.
@@ -637,7 +639,9 @@ def export(model: nn.Module, export_dir, *, mode: str, report: dict, algo, algo_
         "policy_sha256": sha256_file(pf),
         "model": model_record or {},
         "exported_mode": mode, "ladder": jsonable(report.get("ladder")),
-        "recipe": {"algo": algo_spec, "expanded": expanded, "stack": jsonable(stack),
+        "recipe": {"algo": algo_spec, "alias": (getattr(algo, "recipe", None) or {}).get("alias"),
+                   "resolved": (getattr(algo, "recipe", None) or {}).get("name"),
+                   "expanded": expanded, "stack": jsonable(stack),
                    "recipe": jsonable(getattr(algo, "recipe", None)),
                    "algorithm_record": jsonable(algo_rec)},
         "calibration": calib,

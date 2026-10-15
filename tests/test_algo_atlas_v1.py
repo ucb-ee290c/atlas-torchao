@@ -1,7 +1,7 @@
-"""Named recipes atlas_v1, atlas_v1_awq and atlas_v1_static (docs/algos/atlas_v1.md): expansion,
-recorded chip defaults, explicit refusals, and one quantized forward per recipe."""
+"""Named recipes atlas_v1_sq, atlas_v1_awq, atlas_v1_static and the alias atlas_v1
+(docs/algos/atlas_v1.md): immutable expansions, alias records, recorded chip defaults, explicit
+refusals, and one quantized forward per recipe."""
 import copy
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -16,28 +16,39 @@ ORDERS = {"atlas_v1": ["gptq_awq", "granularity"],
           "atlas_v1_sq": ["smoothquant", "gptq_awq", "granularity"],
           "atlas_v1_static": ["smoothquant", "gptq_awq"]}
 
+# The recipes, verbatim (docs/algos/atlas_v1.md). A recipe name never changes meaning: a new stack
+# needs a new name, never an edit here.
+FROZEN = {
+    "atlas_v1_sq": "smoothquant:alpha=0.5,po2=true,gain=false,partial=true"
+                   "+gptq_awq:method=gptq,actorder=true+granularity:w=channel,a=token,rule=nc",
+    "atlas_v1_awq": "gptq_awq:method=awq_gptq,actorder=true+granularity:w=channel,a=token,rule=nc",
+    "atlas_v1_static": "smoothquant:alpha=0.5,po2=true,gain=true,static=true,partial=true"
+                       "+gptq_awq:method=gptq,actorder=true",
+}
+CHIP = {"chip_vadd": "rn", "chip_vadd_sites": "residual"}
+
 DIT_PATCH = "observation_encoder.vision_encoder.model.vision_model.embeddings.patch_embedding"
 
 
 class TinyDiT(torch.nn.Module):
-    """The exact policy identity/path plus a sibling that substring skips would also exclude."""
+    """A vision-tower path ending in an RGB patch embedding, plus a similarly named sibling
+    convolution that reads the patch features (4 channels), which substring skips would also hit."""
 
-    def __init__(self, policy_type="multi_task_dit"):
+    def __init__(self):
         super().__init__()
-        self.config = SimpleNamespace(type=policy_type)
         parent = self
         for name in DIT_PATCH.split(".")[:-1]:
             child = torch.nn.Module()
             parent.add_module(name, child)
             parent = child
         parent.patch_embedding = torch.nn.Conv2d(3, 4, 2, stride=2)
-        parent.patch_embedding_extra = torch.nn.Conv2d(3, 4, 2, stride=2)
+        parent.patch_embedding_extra = torch.nn.Conv2d(4, 4, 1)
         self.head = torch.nn.Linear(4, 3)
         self.to(torch.bfloat16).eval()
 
     def forward(self, x):
         emb = self.get_submodule(DIT_PATCH.rsplit(".", 1)[0])
-        return self.head((emb.patch_embedding(x) + emb.patch_embedding_extra(x)).mean((2, 3)))
+        return self.head(emb.patch_embedding_extra(emb.patch_embedding(x)).mean((2, 3)))
 
 
 def dit_calib():
@@ -46,43 +57,49 @@ def dit_calib():
     return lambda: ([x], lambda m, b: m(b), {"source": "test", "n_samples": 2, "seed": 42})
 
 
-@pytest.mark.parametrize("policy_type,recipe,expected", [
-    ("multi_task_dit", "atlas_v1", [DIT_PATCH]),
-    ("smolvla", "atlas_v1", []),
-    ("pi0", "atlas_v1", []),
-    ("multi_task_dit", "atlas_v1_awq", []),
+def test_recipes_are_frozen():
+    assert set(algos.RECIPES) == set(FROZEN)
+    for name, spec in FROZEN.items():
+        assert algos.RECIPES[name]["spec"] == spec
+        assert algos.RECIPES[name]["chip"] == CHIP
+        assert not set(algos.RECIPES[name]) - {"spec", "chip", "activation_scales", "new_decisions"}
+
+
+def test_alias_resolves_to_one_recipe():
+    assert algos.ALIASES == {"atlas_v1": "atlas_v1_awq"}
+    assert algos.resolve("atlas_v1") == ("atlas_v1", "atlas_v1_awq")
+    assert algos.resolve("atlas_v1_sq") == (None, "atlas_v1_sq")
+    assert algos.expand("atlas_v1") == FROZEN["atlas_v1_awq"]
+    with pytest.raises(ValueError, match="unknown recipe"):
+        algos.resolve("atlas_v2")
+
+
+@pytest.mark.parametrize("spec,alias,name", [
+    ("atlas_v1", "atlas_v1", "atlas_v1_awq"),
+    ("atlas_v1_awq", None, "atlas_v1_awq"),
+    ("atlas_v1+mixed_precision:units=a.b", "atlas_v1", "atlas_v1_awq"),
+    ("atlas_v1_sq", None, "atlas_v1_sq"),
 ])
-def test_exact_dit_exception_and_historical_alias(policy_type, recipe, expected):
+def test_records_carry_alias_resolved_and_expanded(spec, alias, name):
+    expanded = algos.expand(spec)
+    assert expanded.startswith(FROZEN[name])
+    for rec in (algos.make(spec).recipe, algos.none_record(spec, "bf16")["recipe"]):
+        assert rec["requested"] == spec.partition("+mixed")[0]
+        assert rec["alias"] == alias and rec["name"] == rec["resolved"] == name
+        assert rec["spec"] == FROZEN[name] and rec["expanded"] == expanded
+
+
+@pytest.mark.parametrize("recipe", list(ORDERS))
+def test_no_recipe_keeps_a_layer_in_bf16(recipe):
+    """The input-conv exception is opt-in (keep_bf16): no recipe applies it."""
     need_refs()
-    m = TinyDiT(policy_type)
-    w0 = m.get_submodule(DIT_PATCH).weight.detach().clone()
-    a = algos.make(recipe)
-    rep = algos.quantize(m, "ref_conv", algo=a, calib=dit_calib())
-    assert rep["algo"]["bf16_opt_out"] == expected
-    assert rep["algo"]["bf16_opt_out_exact"] == expected
-    assert (type(m.get_submodule(DIT_PATCH)) is torch.nn.Conv2d) == bool(expected)
-    assert type(m.get_submodule(DIT_PATCH + "_extra")).__name__ == "RefQuantConv2d"
-    if expected:
-        assert torch.equal(m.get_submodule(DIT_PATCH).weight, w0)
-        assert all(DIT_PATCH not in member.layers for member in a.members if hasattr(member, "layers"))
-        assert rep["algo"]["recipe"]["new_decisions"]
-
-
-@pytest.mark.parametrize("missing", [False, True])
-def test_dit_exception_refuses_changed_structure_before_calibration(missing):
     m = TinyDiT()
-    emb = m.get_submodule(DIT_PATCH.rsplit(".", 1)[0])
-    if missing:
-        del emb.patch_embedding
-    else:
-        emb.patch_embedding = torch.nn.Identity()
-    def unexpected_calib():
-        pytest.fail("the exact exception must be validated before calibration")
-    with pytest.raises(ValueError, match="expected exact BF16 Conv2d"):
-        algos.quantize(m, "ref_conv", algo=algos.make("atlas_v1"), calib=unexpected_calib)
+    rep = algos.quantize(m, "ref_conv", algo=algos.make(recipe), calib=dit_calib())
+    assert rep["algo"]["bf16_opt_out"] == [] and rep["algo"]["bf16_opt_out_exact"] == []
+    assert type(m.get_submodule(DIT_PATCH)).__name__ == "RefQuantConv2d"
 
 
-def test_canonical_non_dit_matches_historical_awq_bit_for_bit():
+def test_alias_matches_its_recipe_bit_for_bit():
     need_refs()
     canonical = tiny_llama(layers=2)
     historical = copy.deepcopy(canonical)
@@ -103,14 +120,15 @@ def _calib(n=2, T=12):
 @pytest.mark.parametrize("name", list(ORDERS))
 def test_recipe_expands_to_its_documented_stack(name):
     a = algos.make(name)
+    resolved = algos.resolve(name)[1]
     assert [m.name for m in a.members] == ORDERS[name]
-    assert a.recipe["name"] == name and a.recipe["spec"] == algos.RECIPES[name]["spec"]
-    assert a.recipe["chip_defaults"] == {"chip_vadd": "rn", "chip_vadd_sites": "residual"}
+    assert a.recipe["name"] == resolved and a.recipe["spec"] == algos.RECIPES[resolved]["spec"]
+    assert a.recipe["chip_defaults"] == CHIP
     sq = next((m for m in a.members if m.name == "smoothquant"), None)
     if sq is not None:
         assert sq.partial is True                      # policies: unfolded blocks are recorded
     rec = algos.none_record(name, "bf16")
-    assert rec["recipe"]["name"] == name and rec["applied"] is False
+    assert rec["recipe"]["name"] == resolved and rec["applied"] is False
 
 
 def test_recipe_components():
@@ -129,7 +147,7 @@ def test_recipe_components():
 
 def test_opt_in_and_refusals():
     a = algos.make("atlas_v1+mixed_precision:units=model.layers.0.mlp.down_proj")
-    assert [m.name for m in a.members][-1] == "mixed_precision" and a.recipe["name"] == "atlas_v1"
+    assert [m.name for m in a.members][-1] == "mixed_precision" and a.recipe["alias"] == "atlas_v1"
     with pytest.raises(ValueError, match="no parameters"):
         algos.make("atlas_v1:alpha=0.3")
     with pytest.raises(ValueError, match="more than one recipe"):
@@ -162,7 +180,7 @@ def test_recipe_runs_and_records_chip_defaults(name, mode):
         y0, y1 = m0(IDS).logits.float(), m1(IDS).logits.float()
     assert torch.isfinite(y1).all() and ((y1 - y0).norm() / y0.norm()) < 0.1
     r = rep["algo"]
-    assert r["order"] == ORDERS[name] and r["recipe"]["name"] == name
+    assert r["order"] == ORDERS[name] and r["recipe"]["name"] == algos.resolve(name)[1]
     if mode == "chip":
         assert r["recipe"]["chip_options_applied"] == {"chip_vadd": "rn", "chip_vadd_sites": "residual"}
         assert any("--chip-vadd rn" in s for s in rep["ladder"]["off_ladder_reasons"])
