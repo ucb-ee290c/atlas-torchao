@@ -253,13 +253,12 @@ def _coverage_problems(role, required: dict, covered: dict) -> list:
     """Each (key, mode) the config requires must be normalized by the step under that mode."""
     problems = []
     for key, mode in sorted(required.items()):
-        have = covered.get(key, {}).get("mode")
-        if have is None:
+        covered_mode = covered.get(key, {}).get("mode")
+        if covered_mode is None:
             problems.append(f"{role}: the config normalizes {key!r} ({mode}) but no step covers it")
-        elif have != mode:
-            problems.append(f"{role}: {key!r} is {have} in the processor, {mode} in the config")
+        elif covered_mode != mode:
+            problems.append(f"{role}: {key!r} is {covered_mode} in the processor, {mode} in the config")
     return problems
-
 
 
 def check(preprocess, postprocess, cfg) -> dict:
@@ -487,8 +486,11 @@ def check_export(manifest: dict, norm: dict) -> None:
     have = manifest.get("normalization") or LEGACY_EXPORT
     _check_export_protocol(have, norm)
     _check_export_stats(have, norm)
-    if have["status"] == LEGACY:
-        return
+    if have["status"] != LEGACY:
+        _check_export_transform(have, norm)
+
+
+def _check_export_transform(have: dict, norm: dict) -> None:
     if not have.get("transform_sha256"):
         raise NormalizationError(
             "--from-export: the export records only its normalization stats, not the transform "
