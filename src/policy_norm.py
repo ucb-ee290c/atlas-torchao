@@ -23,9 +23,11 @@ The guard (`check`, `require`) runs after the processors are built, for every pr
 feature the policy config normalizes (its input / output features under its normalization_mapping,
 NEW: not the processors' own saved features, which can omit one) must be covered by the matching
 step under the same mode, with finite stats under the exact key the step looks up and a positive
-std (MEAN_STD) or range (MIN_MAX, QUANTILES, QUANTILE10). The probe then checks one real frame and
-one action chunk against the mode's formula (in float64) and requires finite outputs; a tiny but
-positive scale is judged there, by what it actually produces.
+std (MEAN_STD) or range (MIN_MAX, QUANTILES, QUANTILE10); and, the other way round, every feature
+a step normalizes must be declared by the config under the same mode (a config IDENTITY is a
+mismatch). The probe then checks one real frame, on every key the config requires or a step
+transforms, and one action chunk against the mode's formula (in float64) and requires finite
+outputs; a tiny but positive scale is judged there, by what it actually produces.
 `--allow-unnormalized` (NEW) skips the refusal to reproduce the historical behaviour for
 comparison; results then say `normalization: legacy-unverified`.
 """
@@ -141,9 +143,9 @@ def normalized_keys(step) -> dict:
     return out
 
 
-def required_keys(cfg) -> dict:
-    """{role: {key: mode}} every normalizer ("pre") and unnormalizer ("post") must cover, from the
-    policy config rather than from the processors' own saved features (NEW).
+def declared_modes(cfg) -> dict:
+    """{role: {key: mode}} the policy config declares for the normalizer ("pre") and unnormalizer
+    ("post"), IDENTITY included, from the config rather than the processors' saved features (NEW).
 
     The config's feature keys are the policy-side names, i.e. already after the observation rename
     map, which is what the normalizer looks up since it runs after the rename step."""
@@ -154,13 +156,18 @@ def required_keys(cfg) -> dict:
     pre, post = {}, {}
     for key, feat in {**cfg.input_features, **cfg.output_features}.items():
         mode = mapping.get(feat.type.value, "IDENTITY")
-        if mode == "IDENTITY":
-            continue
         if feat.type == FeatureType.ACTION:
             pre[ACTION] = post[ACTION] = mode
         else:
             pre[key] = mode
     return {"pre": pre, "post": post}
+
+
+def required_keys(cfg) -> dict:
+    """{role: {key: mode}} every normalizer ("pre") and unnormalizer ("post") must cover: the
+    config's declared features that are not IDENTITY."""
+    return {role: {k: m for k, m in keys.items() if m != "IDENTITY"}
+            for role, keys in declared_modes(cfg).items()}
 
 
 def _float_stats(step) -> dict:
@@ -246,23 +253,35 @@ def _scale_problem(role, key, mode, sub) -> str | None:
             f"{int((width <= 0).sum())} of {width.numel()} entries")
 
 
-def _coverage_problems(role, required: dict, covered: dict) -> list:
-    """Each (key, mode) the config requires must be normalized by the step under that mode."""
+def _coverage_problems(role, declared: dict, covered: dict) -> list:
+    """Both directions, per key: each key the config declares non-IDENTITY must be covered by a
+    step under that mode, and each key a step transforms must be declared by the config under the
+    step's mode (NEW: a config IDENTITY or undeclared key that a step normalizes is refused)."""
     problems = []
-    for key, mode in sorted(required.items()):
-        covered_mode = covered.get(key, {}).get("mode")
-        if covered_mode is None:
-            problems.append(f"{role}: the config normalizes {key!r} ({mode}) but no step covers it")
-        elif covered_mode != mode:
-            problems.append(f"{role}: {key!r} is {covered_mode} in the processor, {mode} in the config")
+    for key in sorted(set(declared) | set(covered)):
+        problem = _coverage_problem(role, key, declared.get(key), covered.get(key, {}).get("mode"))
+        if problem is not None:
+            problems.append(problem)
     return problems
+
+
+def _coverage_problem(role, key, config_mode, step_mode) -> str | None:
+    if step_mode is None:
+        if config_mode in (None, "IDENTITY"):
+            return None
+        return f"{role}: the config normalizes {key!r} ({config_mode}) but no step covers it"
+    if config_mode is None:
+        return f"{role}: a step normalizes {key!r} ({step_mode}) but the config does not declare it"
+    if step_mode != config_mode:
+        return f"{role}: {key!r} is {step_mode} in the processor, {config_mode} in the config"
+    return None
 
 
 def check(preprocess, postprocess, cfg) -> dict:
     """The guard's findings for built pipelines against the policy config `cfg`: per role and key,
     the mode, eps, stats / transform sha256 and any problem. Every protocol goes through it."""
-    required = required_keys(cfg)
-    rec, problems = {"required": required}, []
+    declared = declared_modes(cfg)
+    rec, problems = {"required": required_keys(cfg), "declared": declared}, []
     for (role, cls), pipe in zip(ROLES, (preprocess, postprocess)):
         steps = _steps(pipe, cls)
         if not steps:
@@ -272,7 +291,7 @@ def check(preprocess, postprocess, cfg) -> dict:
             keys, step_problems = check_step(step, role)
             rec[role].update(keys)
             problems += step_problems
-        problems += _coverage_problems(role, required[role], rec[role])
+        problems += _coverage_problems(role, declared[role], rec[role])
     rec["problems"] = problems
     rec["ok"] = not problems
     return rec
@@ -317,7 +336,8 @@ def probe(preprocess, postprocess, sample, to_batch, required, rename_map=None, 
     """Push one real frame through `preprocess` and one action chunk through `postprocess`, then
     back through the preprocessor's normalizer (NEW).
 
-    Every observation `required` (check()'s rec["required"]) normalizes must be in the frame, and
+    Every observation `required` (check()'s rec["required"]) normalizes, and every one a
+    normalizer step actually transforms whatever the config says (NEW), must be in the frame, and
     its output must be finite and match the mode's formula on the step's stats; the unnormalized
     actions likewise, and the action round trip must be the identity within ROUND_TRIP_RTOL. An
     identity transform (mean 0, std 1) passes: what is checked is the formula, not movement.
@@ -325,7 +345,7 @@ def probe(preprocess, postprocess, sample, to_batch, required, rename_map=None, 
     from lerobot.utils.constants import ACTION
 
     pre_steps = _steps(preprocess, "NormalizerProcessorStep")
-    obs_modes = {k: m for k, m in required["pre"].items() if k != ACTION}
+    obs_modes = {k: m for k, m in _probe_modes(required["pre"], pre_steps).items() if k != ACTION}
     observations = _probe_observations(sample, to_batch(sample, preprocess), obs_modes, pre_steps,
                                        rename_map)
     rec = {"observations": observations, "action_round_trip": None}
@@ -336,6 +356,15 @@ def probe(preprocess, postprocess, sample, to_batch, required, rename_map=None, 
         ok = ok and round_trip["ok"]
     rec["ok"] = bool(ok)
     return rec
+
+
+def _probe_modes(required: dict, steps) -> dict:
+    """{key: mode} to probe: the config's required keys, overridden by the mode of the last step
+    that transforms each key, so that every transformed key is probed under its real mode."""
+    modes = dict(required)
+    for step in steps:
+        modes.update(normalized_keys(step))
+    return modes
 
 
 def _covering(steps, key):
