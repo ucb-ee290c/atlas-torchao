@@ -1,6 +1,8 @@
 # Atlas v1 release contents
 
-The local `atlas-v1.0` tag pins verified code at `5ff028ee58b28606873278236a379dcc09339b82`. It provides a reproducible BF16-to-FP8 quantization, numerical evaluation, and export workflow for TinyLlama, SmolVLA, Pi0 and Multi-Task DiT. Merging the release history into `main` would make these capabilities the repository's mainline implementation. Publication is on hold; no integration branch or change to `main` has been pushed.
+> **Corrected 2026-10-14** ([CORRECTIONS.md](CORRECTIONS.md)): `atlas_v1` rows of run 5.x are the SmoothQuant stack (`atlas_v1_sq`); SmolVLA numbers predate input normalization (ground-truth metrics invalid); AWQ vs SmoothQuant was within noise on SmolVLA and Pi0, and the Pi0 rows mixed commits; `atlas-v1.0` is a local tag (cite `5ff028e`); the release was merged to `main` (`54e1855`).
+
+The local `atlas-v1.0` tag pins verified code at `5ff028ee58b28606873278236a379dcc09339b82`. It provides a reproducible BF16-to-FP8 quantization, numerical evaluation, and export workflow for TinyLlama, SmolVLA, Pi0 and Multi-Task DiT. The release history was merged into `main` by pull request #1 (merge `54e1855`), making these capabilities the repository's mainline implementation. The `atlas-v1.0` tag itself was not published.
 
 ## What users get
 
@@ -28,7 +30,7 @@ The canonical DiT export is 277,366,330 bytes with 204 total sites: 179 quantize
 
 AWQ is numerically best among the candidates on the three supplied chip model comparisons and ties the unmodified DiT candidate at reference precision. This does not establish a statistically resolved win on every model or closed-loop policy success. See `RESULTS_SUMMARY.md` for measurement protocols and noise qualifications.
 
-## What remains after merging
+## What remained after merging
 
 FX graph serialization, the external model2MLIR adapter, complete manifest-v2 contract integration and real-model FP8-preserving compiler capture remain compiler work. Separately committed compiler infrastructure is outside this release and does not establish real-model integration. The current export manifest is only partially aligned with m2m v2. No serialized FX graph, whole-model Atlas executable or hardware execution qualification ships in this tag.
 
