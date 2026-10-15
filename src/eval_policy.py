@@ -150,6 +150,13 @@ def setup_normalization(args, cfg, rename, ds, idx):
     return norm, norm_stats
 
 
+def require_guarded_normalization(mode, preprocess, postprocess, norm):
+    """Every mode rebuilds its processors; they must normalize exactly as the guarded ones did."""
+    guard = policy_norm.check(preprocess, postprocess)
+    if policy_norm.combined_sha256(guard) != norm["stats_sha256"] or guard["problems"] != norm["guard"]["problems"]:
+        raise RuntimeError(f"{mode}: the processors' normalization differs from the guarded one")
+
+
 def make_data(policy_cfg, dataset, n_test_episodes, n_frames, seed):
     from lerobot.datasets.factory import resolve_delta_timestamps
     from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
@@ -435,9 +442,7 @@ def main():
         policy, cfg = load_policy(args.policy, args.device, dtype)
         result["provenance"].setdefault("checkpoint_key_repair", policy.checkpoint_key_repair)
         preprocess, postprocess = build_processors(cfg, args, rename, norm_stats)
-        again = policy_norm.check(preprocess, postprocess)   # every mode's processors, guarded
-        if policy_norm.combined_sha256(again) != norm["stats_sha256"] or again["problems"] != norm["guard"]["problems"]:
-            raise RuntimeError(f"{mode}: the processors' normalization differs from the guarded one")
+        require_guarded_normalization(mode, preprocess, postprocess, norm)
         if not args.export_only:
             result["data"] = {"dataset": args.dataset, "test_episodes": test_eps,
                               "frames": len(idx), "fps": meta.fps}
