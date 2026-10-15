@@ -107,7 +107,7 @@ def test_modes_pass_with_their_stats(mode):
     g = policy_norm.check(pre, post, _cfg(mode))
     assert g["ok"], g["problems"]
     assert all(rec["sha256"] and rec["transform_sha256"] for rec in g["pre"].values())
-    assert policy_norm.combined_sha256(g) and policy_norm.combined_sha256(g, "transform_sha256")
+    assert policy_norm.combined_sha256(g) and policy_norm.chain_sha256(g)
     probe = policy_norm.probe(pre, post, _sample(), _to_batch, g["required"], action_shape=(2,))
     assert probe["ok"], probe
     assert probe["observations"][STATE]["matches"] and probe["observations"][STATE]["finite"]
@@ -174,6 +174,26 @@ def test_processor_normalizing_an_undeclared_feature_is_refused():
     sample = {**_sample(), extra: torch.tensor([7.0, -7.0])}
     probe = policy_norm.probe(pre, post, sample, _to_batch, g["required"], action_shape=(2,))
     assert probe["observations"][extra]["matches"]
+
+
+def _prepend_normalizer(pre, stats):
+    first = pre.steps[0]
+    extra = NormalizerProcessorStep(features={STATE: FEATURES[STATE]}, norm_map=first.norm_map, stats=stats)
+    return PolicyProcessorPipeline(steps=[extra, *pre.steps], to_transition=batch_to_transition,
+                                   to_output=transition_to_batch)
+
+
+def test_a_second_normalizer_for_a_key_is_refused_and_changes_the_digest():
+    pre, post = _pipes()
+    single = policy_norm.check(pre, post, _cfg())
+    # an identity normalizer in front keeps the probe frame: only the guard and the digest see it
+    pre = _prepend_normalizer(pre, {STATE: {"mean": torch.zeros(3), "std": torch.ones(3)}})
+    assert policy_norm.probe(pre, post, _sample(), _to_batch, single["required"], action_shape=(2,))["ok"]
+    g = policy_norm.check(pre, post, _cfg())
+    assert not g["ok"] and any(f"{STATE!r} is normalized by 2 steps" in p for p in g["problems"])
+    assert [(t["role"], t["step"], t["key"]) for t in g["transforms"]] == [
+        ("pre", 0, STATE), ("pre", 1, ACTION), ("pre", 1, STATE), ("post", 0, ACTION)]
+    assert policy_norm.chain_sha256(g) != policy_norm.chain_sha256(single)
 
 
 def test_required_observation_missing_from_the_frame_fails_the_probe():
@@ -311,7 +331,7 @@ def test_export_carries_the_protocol(tmp_path):
         assert got["protocol"] == "dataset" and got["status"] == "verified"
         assert got["stats_sha256"] == "a" * 64
         assert got["stats_sha256_per_key"]["pre"][STATE] == "b" * 64
-        assert got["record_version"] == 2 and got["transform_sha256"] == "d" * 64
+        assert got["record_version"] == 3 and got["transform_sha256"] == "d" * 64
         assert got["transform"]["pre"][STATE] == {"mode": "MEAN_STD", "eps": 1e-8, "sha256": "e" * 64}
     assert man["normalization"]["protocol"] == "dataset"
     policy_norm.check_export(man, _norm())                     # same protocol and stats: accepted
@@ -331,8 +351,7 @@ def _guarded_norm(mode, stats):
     g = policy_norm.check(*_pipes(mode, stats), _cfg(mode))
     assert g["ok"], g["problems"]
     return {"protocol": "dataset", "status": policy_norm.VERIFIED, "stats_source": None, "guard": g,
-            "stats_sha256": policy_norm.combined_sha256(g),
-            "transform_sha256": policy_norm.combined_sha256(g, "transform_sha256")}
+            "stats_sha256": policy_norm.combined_sha256(g), "transform_sha256": policy_norm.chain_sha256(g)}
 
 
 def test_export_refuses_a_changed_transform_with_the_same_stats():
@@ -340,6 +359,8 @@ def test_export_refuses_a_changed_transform_with_the_same_stats():
     mean_std, min_max = _guarded_norm("MEAN_STD", stats), _guarded_norm("MIN_MAX", stats)
     assert mean_std["stats_sha256"] == min_max["stats_sha256"]
     manifest = {"normalization": policy_norm.export_record(mean_std)}
+    assert [(t["role"], t["step"], t["key"], t["mode"]) for t in manifest["normalization"]["transforms"]] == [
+        ("pre", 0, ACTION, "MEAN_STD"), ("pre", 0, STATE, "MEAN_STD"), ("post", 0, ACTION, "MEAN_STD")]
     policy_norm.check_export(manifest, mean_std)
     with pytest.raises(policy_norm.NormalizationError, match="transform"):
         policy_norm.check_export(manifest, min_max)
@@ -350,6 +371,9 @@ def test_verified_export_without_the_transform_is_refused():
           if k not in ("record_version", "transform_sha256", "transform")}
     with pytest.raises(policy_norm.NormalizationError, match="re-export"):
         policy_norm.check_export({"normalization": v1}, _norm())
+    v2 = {**policy_norm.export_record(_norm()), "record_version": 2}   # per-key digest only
+    with pytest.raises(policy_norm.NormalizationError, match="re-export"):
+        policy_norm.check_export({"normalization": v2}, _norm())
 
 
 def test_from_export_mismatch_is_refused_by_the_cli(tmp_path, monkeypatch):

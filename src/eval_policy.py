@@ -142,7 +142,7 @@ def setup_normalization(args, cfg, rename, ds, idx):
         raise policy_norm.NormalizationError(f"normalization probe failed: {json.dumps(probe)}")
     norm = {"protocol": args.norm_stats, "status": status, "stats_source": source,
             "stats_sha256": policy_norm.combined_sha256(guard),
-            "transform_sha256": policy_norm.combined_sha256(guard, "transform_sha256"),
+            "transform_sha256": policy_norm.chain_sha256(guard),
             "guard": guard, "probe": probe,
             "new": ("--norm-stats dataset is a NEW zero-shot evaluation protocol for a pretraining "
                     "checkpoint (the stats a fine-tune would start from); the guard, the probe and "
@@ -155,7 +155,7 @@ def setup_normalization(args, cfg, rename, ds, idx):
 def require_guarded_normalization(mode, cfg, preprocess, postprocess, norm):
     """Every mode rebuilds its processors; they must normalize exactly as the guarded ones did."""
     guard = policy_norm.check(preprocess, postprocess, cfg)
-    same = policy_norm.combined_sha256(guard, "transform_sha256") == norm["transform_sha256"]
+    same = policy_norm.chain_sha256(guard) == norm["transform_sha256"]
     if not same or guard["problems"] != norm["guard"]["problems"]:
         raise RuntimeError(f"{mode}: the processors' normalization differs from the guarded one")
 

@@ -51,6 +51,9 @@ REQUIRED = {"MEAN_STD": (("mean", "std"), "std"),
 ROUND_TRIP_RTOL = 1e-4   # NEW: float32 (x * s + m - m) / (s + 1e-8) stays well inside this
 FORMULA_ULPS = 8         # NEW: probe outputs match the formula to this many ulps of their dtype
 ROLES = (("pre", "NormalizerProcessorStep"), ("post", "UnnormalizerProcessorStep"))
+# NEW: where a transform sits in the ordered chain, and what the chain digest covers per transform
+POSITION_FIELDS = ("role", "step", "step_name", "key")
+CHAIN_FIELDS = (*POSITION_FIELDS, "mode", "eps", "sha256")
 
 
 class NormalizationError(RuntimeError):
@@ -115,8 +118,13 @@ def merge_overrides(base: dict, extra: dict) -> dict:
 # The guard
 # ---------------------------------------------------------------------------------------------
 
+def _indexed_steps(pipeline, cls_name):
+    """[(position in the pipeline, step)] of the pipeline's `cls_name` steps, in order."""
+    return [(i, s) for i, s in enumerate(getattr(pipeline, "steps", [])) if type(s).__name__ == cls_name]
+
+
 def _steps(pipeline, cls_name):
-    return [s for s in getattr(pipeline, "steps", []) if type(s).__name__ == cls_name]
+    return [s for _, s in _indexed_steps(pipeline, cls_name)]
 
 
 def _mode_name(mode) -> str:
@@ -278,32 +286,78 @@ def _coverage_problem(role, key, config_mode, step_mode) -> str | None:
 
 
 def check(preprocess, postprocess, cfg) -> dict:
-    """The guard's findings for built pipelines against the policy config `cfg`: per role and key,
-    the mode, eps, stats / transform sha256 and any problem. Every protocol goes through it."""
+    """The guard's findings for built pipelines against the policy config `cfg`: the ordered list
+    of transforms (NEW: one entry per step and key, so several steps cannot hide behind one key),
+    per role and key the mode, eps, stats / transform sha256, and any problem. Every protocol goes
+    through it."""
     declared = declared_modes(cfg)
-    rec, problems = {"required": required_keys(cfg), "declared": declared}, []
+    rec = {"required": required_keys(cfg), "declared": declared, "transforms": []}
+    problems = []
     for (role, cls), pipe in zip(ROLES, (preprocess, postprocess)):
-        steps = _steps(pipe, cls)
-        if not steps:
-            problems.append(f"{role}: the pipeline has no {cls}")
-        rec[role] = {}
-        for step in steps:
-            keys, step_problems = check_step(step, role)
-            rec[role].update(keys)
-            problems += step_problems
-        problems += _coverage_problems(role, declared[role], rec[role])
+        transforms, role_problems = _check_role(role, cls, pipe)
+        rec["transforms"] += transforms
+        rec[role] = _per_key(transforms)
+        problems += role_problems + _coverage_problems(role, declared[role], rec[role])
     rec["problems"] = problems
     rec["ok"] = not problems
     return rec
 
 
-def combined_sha256(guard: dict, field: str = "sha256") -> str | None:
-    """One digest over every role and key's `field` ("sha256": stats only, the historical digest;
-    "transform_sha256": mode, eps and stats, NEW); None when any key lacks it."""
-    per = {f"{r}:{k}": v.get(field) for r, _ in ROLES for k, v in sorted(guard.get(r, {}).items())}
+def _check_role(role, cls, pipe) -> tuple[list, list]:
+    """(ordered transforms, problems) of one pipeline's `cls` steps."""
+    steps = _indexed_steps(pipe, cls)
+    if not steps:
+        return [], [f"{role}: the pipeline has no {cls}"]
+    transforms, problems = [], []
+    for index, step in steps:
+        keys, step_problems = check_step(step, role)
+        transforms += [{"role": role, "step": index, "step_name": cls, "key": k, **r}
+                       for k, r in keys.items()]
+        problems += step_problems
+    return transforms, problems + _duplicate_problems(role, transforms)
+
+
+def _duplicate_problems(role, transforms) -> list:
+    """A key (un)normalized by more than one step: lerobot would compose them, which neither the
+    per-key record nor the probe's formula describes, so it is refused (NEW)."""
+    steps_by_key = {}
+    for t in transforms:
+        steps_by_key.setdefault(t["key"], []).append(t["step"])
+    return [f"{role}: {key!r} is normalized by {len(steps)} steps (pipeline positions {steps}); "
+            "one step per key is supported"
+            for key, steps in sorted(steps_by_key.items()) if len(steps) > 1]
+
+
+def _per_key(transforms) -> dict:
+    """{key: record} of one role, the first step's for a key several steps normalize (refused)."""
+    out = {}
+    for t in transforms:
+        out.setdefault(t["key"], {k: v for k, v in t.items() if k not in POSITION_FIELDS})
+    return out
+
+
+def combined_sha256(guard: dict) -> str | None:
+    """The historical stats-only digest over every role and key's stats sha256; None when any key
+    lacks it."""
+    per = {f"{r}:{k}": v.get("sha256") for r, _ in ROLES for k, v in sorted(guard.get(r, {}).items())}
     if not per or any(v is None for v in per.values()):
         return None
     return hashlib.sha256(json.dumps(per, sort_keys=True).encode()).hexdigest()
+
+
+def transform_chain(guard: dict) -> list:
+    """The ordered transforms as recorded and hashed: step position and name, key, mode, eps and
+    stats sha256 (NEW)."""
+    return [{f: t.get(f) for f in CHAIN_FIELDS} for t in guard.get("transforms", [])]
+
+
+def chain_sha256(guard: dict) -> str | None:
+    """Digest of the ordered transform chain (NEW: replaces a per-key digest, which an extra step
+    normalizing an already covered key left unchanged); None when any transform lacks stats."""
+    chain = transform_chain(guard)
+    if not chain or any(t["sha256"] is None for t in chain):
+        return None
+    return _sha256(chain)
 
 
 def require(guard: dict, protocol: str, allow_unnormalized: bool) -> str:
@@ -482,12 +536,13 @@ def _unnormalize_check(postprocess, chunk, unnorm) -> dict:
 # Records and exports
 # ---------------------------------------------------------------------------------------------
 
-RECORD_VERSION = 2   # NEW in 2: the transform (mode, eps) beside the stats, and its digest
+RECORD_VERSION = 3   # 2: the transform (mode, eps) beside the stats; NEW in 3: the ordered chain
 
 
 def export_record(norm: dict) -> dict:
     """What an export carries in manifest.json and policy.json. `stats_sha256*` are kept as in
-    record version 1; `transform_sha256*` and `transform` add the mode and eps per key."""
+    record version 1; `transform` adds the mode and eps per key, and `transforms` the ordered chain
+    that `transform_sha256` digests (record version 3)."""
     guard = norm.get("guard") or {}
     per_role = {r: guard.get(r, {}) for r, _ in ROLES}
     return {"record_version": RECORD_VERSION,
@@ -499,7 +554,8 @@ def export_record(norm: dict) -> dict:
             "transform_sha256": norm.get("transform_sha256"),
             "transform": {r: {k: {"mode": v.get("mode"), "eps": v.get("eps"),
                                   "sha256": v.get("transform_sha256")} for k, v in keys.items()}
-                          for r, keys in per_role.items()}}
+                          for r, keys in per_role.items()},
+            "transforms": transform_chain(guard)}
 
 
 LEGACY_EXPORT = {"protocol": "checkpoint", "status": LEGACY, "stats_sha256": None}
@@ -508,7 +564,7 @@ LEGACY_EXPORT = {"protocol": "checkpoint", "status": LEGACY, "stats_sha256": Non
 def check_export(manifest: dict, norm: dict) -> None:
     """--from-export: the export's normalization must be the one requested (NEW). An export written
     before this protocol existed carries none and counts as checkpoint / legacy-unverified; a
-    verified export must carry the transform digest (record version 2) and match it."""
+    verified export must carry the transform chain digest (record version 3) and match it."""
     have = manifest.get("normalization") or LEGACY_EXPORT
     _check_export_protocol(have, norm)
     _check_export_stats(have, norm)
@@ -517,10 +573,11 @@ def check_export(manifest: dict, norm: dict) -> None:
 
 
 def _check_export_transform(have: dict, norm: dict) -> None:
-    if not have.get("transform_sha256"):
+    version = have.get("record_version", 1)
+    if not have.get("transform_sha256") or version < RECORD_VERSION:
         raise NormalizationError(
-            "--from-export: the export records only its normalization stats, not the transform "
-            f"(record version {have.get('record_version', 1)}); re-export it")
+            "--from-export: the export does not record its ordered normalization transforms "
+            f"(record version {version}, need {RECORD_VERSION}); re-export it")
     if norm.get("transform_sha256") and have["transform_sha256"] != norm["transform_sha256"]:
         raise NormalizationError(
             f"--from-export: the export's normalization transform (sha256 "
