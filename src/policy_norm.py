@@ -88,11 +88,11 @@ def overrides(cfg, stats):
     """The normalizer / unnormalizer overrides lerobot_train passes for a fine-tune from a
     pretrained checkpoint (lerobot_train.py:355-377): features, norm_map and stats."""
     pre = {"normalizer_processor": {"features": {**cfg.input_features, **cfg.output_features},
-                                    "norm_map": cfg.normalization_mapping}}
+                                    "norm_map": cfg.normalization_mapping,
+                                    "stats": stats}}
     post = {"unnormalizer_processor": {"features": cfg.output_features,
                                        "norm_map": cfg.normalization_mapping,
                                        "stats": stats}}
-    pre["normalizer_processor"]["stats"] = stats
     return pre, post
 
 
@@ -151,38 +151,43 @@ def stats_sha256(stats: dict) -> str:
 
 
 def check_step(step, role) -> tuple[dict, list]:
+    """({key: guard record}, problems) for one (un)normalizer step."""
     stats = _float_stats(step)
     keys, problems = {}, []
     for key, mode in sorted(normalized_keys(step).items()):
         rec = {"mode": mode}
         keys[key] = rec
-        need, scale = REQUIRED.get(mode, (None, None))
-        if need is None:
-            problems.append(f"{role}: {key!r} uses unsupported mode {mode}")
-            continue
-        sub = stats.get(key)
-        if sub is None:
-            problems.append(f"{role}: no stats for {key!r} ({mode}); stored keys: {sorted(stats)[:8]}")
-            rec["missing"] = list(need)
-            continue
-        missing = [n for n in need if n not in sub]
-        if missing:
-            problems.append(f"{role}: {key!r} ({mode}) lacks {missing}")
-            rec["missing"] = missing
-            continue
-        bad = [n for n in need if not torch.isfinite(sub[n]).all()]
-        if bad:
-            problems.append(f"{role}: {key!r} ({mode}) has non-finite {bad}")
-            continue
-        width = sub[scale] if isinstance(scale, str) else sub[scale[1]] - sub[scale[0]]
-        if not (width > 0).all():
-            problems.append(f"{role}: {key!r} ({mode}) has a non-positive "
-                            f"{'std' if isinstance(scale, str) else 'range'} in "
-                            f"{int((width <= 0).sum())} of {width.numel()} entries")
-            continue
-        rec["sha256"] = stats_sha256(sub)
-        rec["min_scale"] = float(width.min())
+        problem = _check_key(rec, role, key, mode, stats)
+        if problem is not None:
+            problems.append(problem)
     return keys, problems
+
+
+def _check_key(rec, role, key, mode, stats) -> str | None:
+    """The problem with `key`'s stats under `mode`, or None; fills `rec` (missing stat names, or
+    the sha256 and smallest scale of usable stats)."""
+    need, scale = REQUIRED.get(mode, (None, None))
+    if need is None:
+        return f"{role}: {key!r} uses unsupported mode {mode}"
+    sub = stats.get(key)
+    if sub is None:
+        rec["missing"] = list(need)
+        return f"{role}: no stats for {key!r} ({mode}); stored keys: {sorted(stats)[:8]}"
+    missing = [n for n in need if n not in sub]
+    if missing:
+        rec["missing"] = missing
+        return f"{role}: {key!r} ({mode}) lacks {missing}"
+    non_finite = [n for n in need if not torch.isfinite(sub[n]).all()]
+    if non_finite:
+        return f"{role}: {key!r} ({mode}) has non-finite {non_finite}"
+    is_std = isinstance(scale, str)
+    width = sub[scale] if is_std else sub[scale[1]] - sub[scale[0]]
+    if not (width > 0).all():
+        return (f"{role}: {key!r} ({mode}) has a non-positive {'std' if is_std else 'range'} in "
+                f"{int((width <= 0).sum())} of {width.numel()} entries")
+    rec["sha256"] = stats_sha256(sub)
+    rec["min_scale"] = float(width.min())
+    return None
 
 
 def check(preprocess, postprocess) -> dict:
@@ -196,9 +201,9 @@ def check(preprocess, postprocess) -> dict:
             problems.append(f"{role}: the pipeline has no {cls}")
         rec[role] = {}
         for step in steps:
-            keys, p = check_step(step, role)
+            keys, step_problems = check_step(step, role)
             rec[role].update(keys)
-            problems += p
+            problems += step_problems
     rec["problems"] = problems
     rec["ok"] = not problems
     return rec
@@ -215,10 +220,7 @@ def require(guard: dict, protocol: str, allow_unnormalized: bool) -> str:
     """The run's normalization status; raises NormalizationError when the guard failed and the
     escape hatch is not set."""
     if allow_unnormalized:
-        print("WARNING: --allow-unnormalized: normalization is NOT verified; results are marked "
-              f"normalization: {LEGACY}" + (f" ({len(guard['problems'])} guard problem(s): "
-                                            + "; ".join(guard["problems"]) + ")" if guard["problems"] else ""),
-              flush=True)
+        print(_legacy_warning(guard["problems"]), flush=True)
         return LEGACY
     if guard["problems"]:
         raise NormalizationError(
@@ -227,6 +229,12 @@ def require(guard: dict, protocol: str, allow_unnormalized: bool) -> str:
             + "\nUse --norm-stats dataset to normalize with the evaluated dataset's stats "
               "(or --allow-unnormalized to reproduce the historical, unverified behaviour).")
     return VERIFIED
+
+
+def _legacy_warning(problems: list) -> str:
+    detail = f" ({len(problems)} guard problem(s): " + "; ".join(problems) + ")" if problems else ""
+    return ("WARNING: --allow-unnormalized: normalization is NOT verified; results are marked "
+            f"normalization: {LEGACY}" + detail)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -239,48 +247,60 @@ def probe(preprocess, postprocess, sample, to_batch, rename_map=None, action_sha
 
     Each normalized observation must change; the action round trip must be the identity within
     ROUND_TRIP_RTOL. Returns the record; rec["ok"] says whether both held."""
-    from lerobot.processor.converters import create_transition
-    from lerobot.lerobot_types import TransitionKey
     from lerobot.utils.constants import ACTION
 
-    inv = {v: k for k, v in (rename_map or {}).items()}
-    rec = {"observations": {}, "action_round_trip": None}
-    ok = True
     pre_steps = _steps(preprocess, "NormalizerProcessorStep")
     norm_keys = {k: m for s in pre_steps for k, m in normalized_keys(s).items() if k != ACTION}
-    batch = to_batch(sample, preprocess)
+    observations = _probe_observations(sample, to_batch(sample, preprocess), norm_keys, rename_map)
+    rec = {"observations": observations, "action_round_trip": None}
+    ok = all(o["changed"] for o in observations.values() if o["present"])
+    if action_shape is not None and pre_steps:
+        round_trip = _probe_action_round_trip(pre_steps[0], postprocess, action_shape, seed)
+        rec["action_round_trip"] = round_trip
+        ok = ok and round_trip["identity"] and (round_trip["unnormalize_changed"] or not round_trip["modes"])
+    rec["ok"] = bool(ok)
+    return rec
+
+
+def _probe_observations(sample, batch, norm_keys, rename_map) -> dict:
+    """{key: record} of each normalized observation, raw (`sample`) against preprocessed (`batch`)."""
+    inv = {v: k for k, v in (rename_map or {}).items()}
+    out_rec = {}
     for key, mode in sorted(norm_keys.items()):
         src = inv.get(key, key)
         if src not in sample or key not in batch:
-            rec["observations"][key] = {"mode": mode, "present": False}
+            out_rec[key] = {"mode": mode, "present": False}
             continue
         raw = torch.as_tensor(sample[src]).float().cpu()
         out = batch[key].float().cpu().reshape(raw.shape) if batch[key].numel() == raw.numel() \
             else batch[key].float().cpu()
         changed = out.shape != raw.shape or not torch.allclose(out, raw, rtol=1e-3, atol=1e-3)
-        ok &= changed
-        rec["observations"][key] = {"mode": mode, "present": True, "changed": changed,
-                                    "raw_mean": float(raw.mean()), "raw_std": float(raw.std()),
-                                    "normalized_mean": float(out.mean()), "normalized_std": float(out.std())}
-    if action_shape is not None and pre_steps:
-        g = torch.Generator().manual_seed(seed)
-        chunk = torch.randn((1, 4, *action_shape), generator=g)  # NEW: a model-space chunk
-        unnorm = postprocess(chunk.clone()).float().cpu()
-        step = copy.deepcopy(pre_steps[0])  # keeps the run's step free of the probe's dtype change
-        back = step(create_transition(action=unnorm.clone()))[TransitionKey.ACTION].float().cpu()
-        err = float((back - chunk).abs().max())
-        scale = float(chunk.abs().max())
-        post_modes = {m for s in _steps(postprocess, "UnnormalizerProcessorStep")
-                      for k, m in normalized_keys(s).items() if k == ACTION}
-        changed = not torch.allclose(unnorm, chunk)
-        identity = err <= ROUND_TRIP_RTOL * max(scale, 1.0)
-        rec["action_round_trip"] = {"max_abs_err": err, "rtol": ROUND_TRIP_RTOL, "identity": identity,
-                                    "unnormalize_changed": changed, "modes": sorted(post_modes),
-                                    "unnormalized_mean": float(unnorm.mean()),
-                                    "unnormalized_std": float(unnorm.std())}
-        ok &= identity and (changed or not post_modes)
-    rec["ok"] = bool(ok)
-    return rec
+        out_rec[key] = {"mode": mode, "present": True, "changed": changed,
+                        "raw_mean": float(raw.mean()), "raw_std": float(raw.std()),
+                        "normalized_mean": float(out.mean()), "normalized_std": float(out.std())}
+    return out_rec
+
+
+def _probe_action_round_trip(normalizer, postprocess, action_shape, seed) -> dict:
+    """Unnormalize a seeded model-space action chunk with `postprocess`, then normalize it back
+    with a copy of the preprocessor's `normalizer` step."""
+    from lerobot.lerobot_types import TransitionKey
+    from lerobot.processor.converters import create_transition
+    from lerobot.utils.constants import ACTION
+
+    g = torch.Generator().manual_seed(seed)
+    chunk = torch.randn((1, 4, *action_shape), generator=g)  # NEW: a model-space chunk
+    unnorm = postprocess(chunk.clone()).float().cpu()
+    step = copy.deepcopy(normalizer)  # keeps the run's step free of the probe's dtype change
+    back = step(create_transition(action=unnorm.clone()))[TransitionKey.ACTION].float().cpu()
+    err = float((back - chunk).abs().max())
+    scale = float(chunk.abs().max())
+    post_modes = {m for s in _steps(postprocess, "UnnormalizerProcessorStep")
+                  for k, m in normalized_keys(s).items() if k == ACTION}
+    return {"max_abs_err": err, "rtol": ROUND_TRIP_RTOL,
+            "identity": err <= ROUND_TRIP_RTOL * max(scale, 1.0),
+            "unnormalize_changed": not torch.allclose(unnorm, chunk), "modes": sorted(post_modes),
+            "unnormalized_mean": float(unnorm.mean()), "unnormalized_std": float(unnorm.std())}
 
 
 # ---------------------------------------------------------------------------------------------
