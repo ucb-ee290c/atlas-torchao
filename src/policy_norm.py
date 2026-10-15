@@ -22,9 +22,10 @@ Protocols (`--norm-stats`):
 The guard (`check`, `require`) runs after the processors are built, for every protocol: every
 feature the policy config normalizes (its input / output features under its normalization_mapping,
 NEW: not the processors' own saved features, which can omit one) must be covered by the matching
-step under the same mode, with finite stats under the exact key the step looks up and a positive,
-non-degenerate std (MEAN_STD) or range (MIN_MAX, QUANTILES, QUANTILE10). The probe then checks one
-real frame and one action chunk against the mode's formula and requires finite outputs.
+step under the same mode, with finite stats under the exact key the step looks up and a positive
+std (MEAN_STD) or range (MIN_MAX, QUANTILES, QUANTILE10). The probe then checks one real frame and
+one action chunk against the mode's formula (in float64) and requires finite outputs; a tiny but
+positive scale is judged there, by what it actually produces.
 `--allow-unnormalized` (NEW) skips the refusal to reproduce the historical behaviour for
 comparison; results then say `normalization: legacy-unverified`.
 """
@@ -220,7 +221,7 @@ def _check_key(rec, role, key, mode, stats) -> str | None:
     non_finite = [n for n in need if not torch.isfinite(sub[n]).all()]
     if non_finite:
         return f"{role}: {key!r} ({mode}) has non-finite {non_finite}"
-    problem = _scale_problem(role, key, mode, sub, rec["eps"])
+    problem = _scale_problem(role, key, mode, sub)
     if problem is not None:
         return problem
     rec["sha256"] = stats_sha256(sub)
@@ -234,19 +235,15 @@ def _width(mode, sub):
     return sub[scale] if isinstance(scale, str) else sub[scale[1]] - sub[scale[0]]
 
 
-def _scale_problem(role, key, mode, sub, eps) -> str | None:
-    """A non-positive std / range, or one so small its reciprocal overflows float32 (NEW: such a
-    scale passes as positive yet normalizes every input to inf)."""
-    is_std = isinstance(REQUIRED[mode][1], str)
-    what = "std" if is_std else "range"
+def _scale_problem(role, key, mode, sub) -> str | None:
+    """A zero or negative std / range. A tiny positive one is left to the probe: whether it
+    overflows depends on the inputs, and the probe checks real outputs for finiteness."""
     width = _width(mode, sub)
-    if not (width > 0).all():
-        return (f"{role}: {key!r} ({mode}) has a non-positive {what} in "
-                f"{int((width <= 0).sum())} of {width.numel()} entries")
-    denom = width + eps if is_std else width
-    if not torch.isfinite(1.0 / denom).all():
-        return f"{role}: {key!r} ({mode}) has a degenerate {what} (min {float(width.min()):.3g})"
-    return None
+    if (width > 0).all():
+        return None
+    what = "std" if isinstance(REQUIRED[mode][1], str) else "range"
+    return (f"{role}: {key!r} ({mode}) has a non-positive {what} in "
+            f"{int((width <= 0).sum())} of {width.numel()} entries")
 
 
 def _coverage_problems(role, required: dict, covered: dict) -> list:
