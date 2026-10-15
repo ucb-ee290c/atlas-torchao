@@ -28,6 +28,7 @@ import torch.nn as nn
 from algos.base import Algo
 
 RULES = ("input_conv",)
+DEFAULT_CHANNELS = 3   # RGB
 
 
 class KeepBF16(Algo):
@@ -39,7 +40,7 @@ class KeepBF16(Algo):
             raise ValueError(f"keep_bf16: unknown parameters {sorted(unknown)}")
         if params.get("rule") not in RULES:
             raise ValueError(f"keep_bf16: rule= is required, one of {RULES}")
-        channels = params.get("channels", 3)
+        channels = params.get("channels", DEFAULT_CHANNELS)
         if not isinstance(channels, int) or channels < 1:
             raise ValueError(f"keep_bf16: channels must be a positive integer, got {channels!r}")
         super().__init__(**params)
@@ -51,17 +52,17 @@ class KeepBF16(Algo):
 
     @property
     def channels(self):
-        return self.params.get("channels", 3)
+        return self.params.get("channels", DEFAULT_CHANNELS)
 
     def select(self, model) -> dict:
         """{fqn: reason} of the sites the rule selects, in module order."""
-        out = {}
+        selected = {}
         for n, m in model.named_modules():
             if n and type(m) is nn.Conv2d and m.in_channels == self.channels and m.groups == 1:
-                out[n] = (f"keep_bf16 rule={self.rule}: Conv2d in_channels={m.in_channels} == "
-                          f"channels={self.channels}, reads image pixels directly (NEW structural "
-                          "rule, docs/algos/keep-bf16.md); no MXU path for BF16 operands (pending R4)")
-        return out
+                selected[n] = (f"keep_bf16 rule={self.rule}: Conv2d in_channels={m.in_channels} == "
+                               f"channels={self.channels}, reads image pixels directly (NEW structural "
+                               "rule, docs/algos/keep-bf16.md); no MXU path for BF16 operands (pending R4)")
+        return selected
 
     def bf16_exact(self, model, mode):
         self.kept = self.select(model)
@@ -69,7 +70,7 @@ class KeepBF16(Algo):
 
     def record(self) -> dict:
         return {**super().record(), "rule": self.rule, "channels": self.channels,
-                "selected": list(getattr(self, "kept", {}) or {})}
+                "selected": list(self.kept)}
 
 
 ALGO = KeepBF16
