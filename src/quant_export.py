@@ -558,9 +558,13 @@ def _opt_out_reasons(algo, bf16) -> dict:
 
 def export(model: nn.Module, export_dir, *, mode: str, report: dict, algo, algo_spec: str, options=None,
            skip=(), model_record: dict | None = None, calib_batches=None, calib_record=None,
-           device=None, extra_provenance: dict | None = None) -> dict:
+           device=None, extra_provenance: dict | None = None, normalization: dict | None = None) -> dict:
     """Write model.safetensors, policy.json and manifest.json for `model`, quantized under `mode`
-    by algos.quantize (whose return value is `report`). Returns the manifest."""
+    by algos.quantize (whose return value is `report`). Returns the manifest.
+
+    normalization (NEW; LeRobot policies, src/policy_norm.export_record): the input / output
+    normalization protocol and its stats sha256, written to both files; --from-export refuses an
+    export whose protocol differs from the requested one."""
     from safetensors.torch import save_file
 
     import quant_modes
@@ -604,6 +608,8 @@ def export(model: nn.Module, export_dir, *, mode: str, report: dict, algo, algo_
     sf = out / "model.safetensors"
     save_file(tensors, str(sf), metadata=meta)
     policy["aliases"] = aliases
+    if normalization is not None:
+        policy["normalization"] = jsonable(normalization)
     policy["tensors"] = {"count": len(tensors), "quantized_layers": len(qmods),
                          "float_weights_of_quantized_layers": 0}
     pf = out / "policy.json"
@@ -635,6 +641,7 @@ def export(model: nn.Module, export_dir, *, mode: str, report: dict, algo, algo_
                    "recipe": jsonable(getattr(algo, "recipe", None)),
                    "algorithm_record": jsonable(algo_rec)},
         "calibration": calib,
+        **({"normalization": jsonable(normalization)} if normalization is not None else {}),
         "provenance": {**git_state(), "versions": versions(), "host": platform.node(),
                        "device": str(device) if device is not None else None,
                        "gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else None,
