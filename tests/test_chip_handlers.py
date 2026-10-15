@@ -1,4 +1,5 @@
 """Op handlers of the chip router: semantics of torch, numerics of the VPU sequences."""
+import pytest
 import torch
 
 import chip_coverage as cc
@@ -107,3 +108,27 @@ def test_masked_softmax_masks():
     out = run(r, A._softmax.default, s + m, -1, False)
     assert close(out, torch.softmax(s + m, -1), atol=1e-2)
     assert (out[m < 0] == 0).all()
+
+
+def test_zero_dim_cpu_operand_follows_the_other_device():
+    """A 0-dim CPU tensor joins an op on another device as in PyTorch; a larger CPU tensor does
+    not move, so a real device mix still fails where PyTorch would."""
+    like = torch.empty(3, device="meta")
+    scalar = torch.tensor(0.5)
+    assert cc._as_f(scalar, like).device.type == "meta"
+    assert cc._as_f(torch.ones(2), like).device.type == "cpu"
+    assert cc._operand_device(scalar, like) is like
+    assert cc._operand_device(like, scalar) is like
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_scheduler_style_scalar_times_cuda_sample():
+    """diffusers' DDPM step multiplies a 0-dim CPU coefficient by a CUDA sample."""
+    r = router()
+    coef = torch.tensor(0.3)
+    sample = torch.randn(2, 8, device="cuda").bfloat16()
+    for args in ((coef, sample), (sample, coef)):
+        out = run(r, A.mul.Tensor, *args)
+        assert out.device.type == "cuda" and close(out, (coef.cuda() * sample.float()))
+    out = run(r, A.sub.Tensor, sample, coef)
+    assert out.device.type == "cuda" and close(out, sample.float() - 0.3)

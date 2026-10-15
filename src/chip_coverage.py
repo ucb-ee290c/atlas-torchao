@@ -379,10 +379,25 @@ class _H:
 
 
 def _as_f(x, like):
-    """Python scalar or tensor -> float32 tensor on like's device."""
+    """Python scalar or tensor -> float32 tensor on like's device.
+
+    A 0-dim CPU tensor follows like's device, as PyTorch lets a 0-dim CPU tensor take part in
+    an op on another device (e.g. a diffusers scheduler coefficient times a CUDA sample). Any
+    other device mix is left alone, so the op fails exactly where PyTorch itself would."""
     if isinstance(x, torch.Tensor):
+        if x.dim() == 0 and x.device.type == "cpu" and x.device != like.device:
+            x = x.to(like.device)
         return x.float()
     return torch.tensor(float(x), dtype=torch.float32, device=like.device)
+
+
+def _operand_device(a, b):
+    """The device a binary op computes on: the device of an operand that is not a 0-dim CPU
+    tensor (PyTorch's rule), else the first operand's."""
+    for x in (a, b):
+        if isinstance(x, torch.Tensor) and not (x.dim() == 0 and x.device.type == "cpu"):
+            return x
+    return next(x for x in (a, b) if isinstance(x, torch.Tensor))
 
 
 def _bcast2(a, b):
@@ -414,7 +429,8 @@ def _binary(op):
         dt = _dtype_of(func, args, kwargs)
         if name == "rsub":
             a, b = b, a
-        fa, fb = _as_f(a, args[0]), _as_f(b, args[0])
+        like = _operand_device(a, b)
+        fa, fb = _as_f(a, like), _as_f(b, like)
         if alpha != 1:
             fb = r.vpu.mul(*_bcast2(fb, _as_f(alpha, fb)))
         if op in ("add", "sub") and r.vadd is not None and r.vadd.wants(r.ctx, name, fa, fb):
