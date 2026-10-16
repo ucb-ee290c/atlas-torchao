@@ -7,7 +7,8 @@
           NEW ones below (each listed in `new_decisions` of the report),
   MXU     matmuls the reference_hw profile did not replace (attention scores, stray mm/bmm,
           convolutions) cast to FP8 and accumulated by the same MXU model,
-  scalar  integer/bool ops: exact, run natively,
+  scalar  integer/bool ops: exact, run natively; arithmetic whose tensor operands are all
+          one-element float32 (schedule coefficients): software float32, run natively,
   data    movement and casts: exact, run natively,
   host    no Atlas instruction: run natively and listed with the reason,
   eval    loss ops of the perplexity evaluation: listed separately.
@@ -187,6 +188,23 @@ def _tensors(args):
             yield from (t for t in a if isinstance(t, torch.Tensor))
 
 
+def _is_one_element_fp32(tensors, floats) -> bool:
+    """Every tensor operand holds one element and every float one is float32.
+
+    Python scalars may join (`1 - alpha_prod_t` is rsub(tensor, 1)): a literal never promotes a
+    float32 tensor, so the op still computes in float32. One-element integer/bool tensors may join
+    too (they promote to float32). Any operand with more than one element (a sample, an activation)
+    keeps the op on the VPU, and a BF16/FP16 or float64 one-element operand keeps its own treatment."""
+    return bool(floats) and all(t.numel() == 1 for t in tensors) \
+        and all(t.dtype == torch.float32 for t in floats)
+
+
+def _vpu_handler(func, name, unit=None):
+    """The chip handler of an op (by overload, then by packet name), optionally only on `unit`."""
+    h = _VPU_HANDLERS.get(func) or _VPU_HANDLERS.get(name)
+    return h if h is not None and unit in (None, h.unit) else None
+
+
 def _is_const(t) -> bool:
     if not isinstance(t, torch.Tensor):
         return True
@@ -278,7 +296,7 @@ class ChipRouter(TorchDispatchMode):
                 self.cov.add("host", row, _host_work(name, args, out), reason=why, new=new)
             return out
         unit, handler, reason = self.classify(func, name, args, kwargs, kind)
-        new = M.NEW_TREATMENTS.get(reason) if unit in ("host", "data") else None
+        new = M.NEW_TREATMENTS.get(reason) if unit in ("scalar", "host", "data") else None
         self._instr.clear()
         out = handler.fn(self, func, name, args, kwargs) if handler else func(*args, **kwargs)
         if unit == "VPU":
@@ -323,7 +341,13 @@ class ChipRouter(TorchDispatchMode):
         if kind == "mxu_module" and name == "exp2":
             # 2^(sx+sw) from integer scale exponents: an exponent field written by the scalar core
             return "scalar", None, "2^k from an integer scale exponent: exponent-field construction (exact)"
-        h = _VPU_HANDLERS.get(func) or _VPU_HANDLERS.get(name)
+        if _is_one_element_fp32(ts, floats) and _vpu_handler(func, name, unit="VPU") is not None:
+            # schedule arithmetic on one-element fp32 coefficients (diffusers DDPM alphas/betas): BF16
+            # lanes would round 1 - alpha_prod_t to 0 and the step would divide 0 by 0. NEW, as
+            # multitask-dit-quant chip_full.py:58-65. After the loop-scalar and exponent rules above,
+            # which keep their own (also float32) treatment of 0-d operands.
+            return "scalar", None, M.ONE_ELEMENT_FP32
+        h = _vpu_handler(func, name)
         if h is not None:
             ok, why = h.applies(self, func, name, args, kwargs)
             if ok:
