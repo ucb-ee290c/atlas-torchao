@@ -5,6 +5,7 @@ import hashlib
 import json
 import subprocess
 import sys
+import tomllib
 import types
 from pathlib import Path
 
@@ -18,6 +19,24 @@ import torch.nn.functional as F
 from safetensors.torch import load_file
 from test_export import _calib, _quantize_export, _reload
 from test_ladder import FAST, tiny_llama
+
+
+def _pinned_torch_version() -> str:
+    """The exact torch version pyproject.toml pins (`torch==X`)."""
+    pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    dependencies = tomllib.loads(pyproject.read_text())["project"]["dependencies"]
+    pins = [d.partition("==")[2].strip() for d in dependencies if d.partition("==")[0].strip() == "torch"]
+    assert len(pins) == 1, f"pyproject.toml must pin torch exactly once: {dependencies}"
+    return pins[0]
+
+
+PINNED_TORCH = _pinned_torch_version()
+# Older torch (e.g. openpi's 2.7.1 in the Pi0 environment) cannot torch.export these captures:
+# it does not trace transformers' vmap-built attention mask and does not keep the dynamic
+# activation-scale derivation in the graph.
+pytestmark = pytest.mark.skipif(torch.__version__ < PINNED_TORCH,
+                                reason=f"torch.export captures need the pinned torch {PINNED_TORCH} "
+                                       f"(found {torch.__version__})")
 
 
 @pytest.fixture

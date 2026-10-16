@@ -12,7 +12,9 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-pytest.importorskip("lerobot")
+# the processor pipeline API (lerobot >= 0.4); openpi's pinned lerobot 0.1.0 has neither it nor
+# FeatureType in lerobot.configs
+pytest.importorskip("lerobot.processor.converters")
 
 from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature  # noqa: E402
 from lerobot.processor import (NormalizerProcessorStep, PolicyProcessorPipeline,  # noqa: E402
