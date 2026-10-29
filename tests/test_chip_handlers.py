@@ -176,3 +176,23 @@ def test_ddpm_sampling_on_the_chip_stays_finite():
     assert torch.isfinite(sample).all()
     units = {(row["op"], row["unit"]) for row in r.cov.report()["ops"]}
     assert {("div", "scalar"), ("rsub", "scalar"), ("pow", "scalar"), ("mul", "VPU")} <= units
+
+
+def test_clamp_computes_on_the_device_pytorch_would():
+    """clamp.Tensor: a 0-dim CPU bound follows the tensor; a 0-dim CPU input follows a bound on
+    another device; the compute device is never a larger CPU tensor's."""
+    big = torch.empty(3, device="meta")
+    zero = torch.tensor(0.5)
+    assert cc._operand_device(zero, big, None) is big
+    assert cc._operand_device(big, zero, zero) is big
+    assert cc._operand_device(zero, zero, big) is big
+    assert cc._operand_device(zero, zero) is zero
+
+
+def test_clamp_tensor_bounds_match_torch():
+    r = router()
+    x = torch.randn(4, 32)
+    lo, hi = torch.tensor(-0.3), torch.full((32,), 0.4)
+    assert close(run(r, A.clamp.Tensor, x, lo, hi), x.clamp(lo, hi))
+    assert close(run(r, A.clamp.Tensor, x, lo), x.clamp(lo))
+    assert close(run(r, A.clamp.Tensor, x, None, hi), x.clamp(max=hi))

@@ -415,13 +415,11 @@ def _as_f(x, like):
     return torch.tensor(float(x), dtype=torch.float32, device=like.device)
 
 
-def _operand_device(a, b):
-    """The device a binary op computes on: the device of an operand that is not a 0-dim CPU
-    tensor (PyTorch's rule), else the first operand's."""
-    for x in (a, b):
-        if isinstance(x, torch.Tensor) and not (x.dim() == 0 and x.device.type == "cpu"):
-            return x
-    return next(x for x in (a, b) if isinstance(x, torch.Tensor))
+def _operand_device(*operands):
+    """The operand an op computes on: the first that is not a 0-dim CPU tensor (PyTorch's rule),
+    else the first tensor."""
+    tensors = [x for x in operands if isinstance(x, torch.Tensor)]
+    return next((x for x in tensors if not (x.dim() == 0 and x.device.type == "cpu")), tensors[0])
 
 
 def _bcast2(a, b):
@@ -527,7 +525,10 @@ def _clamp(r, func, name, args, kwargs):
     hi = kwargs.get("max", args[2] if len(args) > 2 else None)
     if name == "clamp_max":
         lo, hi = None, args[1]
-    f = x.float()
+    # clamp.Tensor takes tensor bounds: compute on the device PyTorch would, so a 0-dim CPU
+    # operand follows the others and any other device mix fails as it does natively
+    like = _operand_device(x, lo, hi)
+    f = _as_f(x, like)
     if lo is not None:
         f = r.vpu.pairwise_max(*_bcast2(f, _as_f(lo, f)))
     if hi is not None:

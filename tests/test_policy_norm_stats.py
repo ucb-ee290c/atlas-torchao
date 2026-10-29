@@ -474,3 +474,47 @@ def test_dit_checkpoint_passes_the_guard():
     assert norm["guard"]["pre"]["observation.state"]["mode"] == "MIN_MAX"
     assert norm["guard"]["pre"]["observation.images.wrist"]["mode"] == "MEAN_STD"
     assert norm["probe"]["ok"] and norm["probe"]["action_round_trip"]["identity"]
+
+
+# ---------------------------------------------------------------------------------------------
+# Hidden normalizers and the probe's step choice
+# ---------------------------------------------------------------------------------------------
+
+class _TunedNormalizer(NormalizerProcessorStep):
+    """A subclass: the exact class name differs from NormalizerProcessorStep."""
+
+
+def _with_action_normalizer_in_front(pre, stats, cls=NormalizerProcessorStep):
+    first = pre.steps[0]
+    extra = cls(features={ACTION: FEATURES[ACTION]}, norm_map=first.norm_map, stats=stats)
+    return PolicyProcessorPipeline(steps=[extra, *pre.steps], to_transition=batch_to_transition,
+                                   to_output=transition_to_batch)
+
+
+def test_a_subclassed_action_normalizer_is_seen_by_the_guard():
+    pre, post = _pipes()
+    pre = _with_action_normalizer_in_front(
+        pre, {ACTION: {"mean": torch.zeros(2), "std": torch.ones(2)}}, _TunedNormalizer)
+    g = policy_norm.check(pre, post, _cfg())
+    assert not g["ok"] and any(f"{ACTION!r} is normalized by 2 steps" in p for p in g["problems"])
+    assert [t["step"] for t in g["transforms"] if t["key"] == ACTION and t["role"] == "pre"] == [0, 1]
+
+
+def test_action_round_trip_uses_the_step_that_normalizes_the_action():
+    pre, post = _pipes()
+    # a trailing step that normalizes only the state: the action's normalizer is the first one
+    last = NormalizerProcessorStep(features={STATE: FEATURES[STATE]}, norm_map=pre.steps[0].norm_map,
+                                   stats={STATE: _stats("MEAN_STD", 3)})
+    pre = PolicyProcessorPipeline(steps=[*pre.steps, last], to_transition=batch_to_transition,
+                                  to_output=transition_to_batch)
+    required = policy_norm.required_keys(_cfg())
+    probe = policy_norm.probe(pre, post, _sample(), _to_batch, required, action_shape=(2,))
+    assert probe["action_round_trip"]["ok"], probe["action_round_trip"]
+
+
+def test_probe_fails_when_no_preprocessor_step_normalizes_the_action():
+    pre, post = _pipes()
+    pre.steps[0].features = {STATE: FEATURES[STATE]}
+    required = policy_norm.required_keys(_cfg())
+    probe = policy_norm.probe(pre, post, _sample(), _to_batch, required, action_shape=(2,))
+    assert not probe["ok"] and not probe["action_round_trip"]["ok"]
