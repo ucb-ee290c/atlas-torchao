@@ -120,7 +120,13 @@ def merge_overrides(base: dict, extra: dict) -> dict:
 
 def _indexed_steps(pipeline, cls_name):
     """[(position in the pipeline, step)] of the pipeline's `cls_name` steps, in order."""
-    return [(i, s) for i, s in enumerate(getattr(pipeline, "steps", [])) if type(s).__name__ == cls_name]
+    return [(i, s) for i, s in enumerate(getattr(pipeline, "steps", [])) if _is_step(s, cls_name)]
+
+
+def _is_step(step, cls_name) -> bool:
+    """Whether `step` is a `cls_name` or a subclass of it (NEW: matching the exact class name let a
+    subclass normalize a key, the action included, without the guard or the probe seeing it)."""
+    return any(c.__name__ == cls_name for c in type(step).__mro__)
 
 
 def _steps(pipeline, cls_name):
@@ -405,7 +411,11 @@ def probe(preprocess, postprocess, sample, to_batch, required, rename_map=None, 
     rec = {"observations": observations, "action_round_trip": None}
     ok = all(o["ok"] for o in observations.values())
     if action_shape is not None and pre_steps:
-        round_trip = _probe_action_round_trip(pre_steps[-1], postprocess, action_shape, seed)
+        # NEW: the step that normalizes the action, not whichever normalizer comes last
+        covering, _ = _covering(pre_steps, ACTION)
+        round_trip = (_probe_action_round_trip(covering, postprocess, action_shape, seed)
+                      if covering is not None else
+                      {"ok": False, "reason": "no preprocessor step normalizes the action"})
         rec["action_round_trip"] = round_trip
         ok = ok and round_trip["ok"]
     rec["ok"] = bool(ok)
