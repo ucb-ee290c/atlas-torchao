@@ -63,5 +63,8 @@ def dma_load_cycles(nbytes: int) -> float:
 
 
 def mxu_tile_cycles(tokens: int = TILE) -> int:
-    """DERIVED: MXU cycles to push `tokens` activation rows (<= 32) through one resident weight tile."""
-    return min(tokens, TILE) if tokens < TILE else MXU_ISSUE_GAP
+    """DERIVED: MXU cycles per resident weight tile and token block. The sequencer always iterates all
+    32 activation rows (InnerProductTreesSequencer.scala:191-193), so fewer than 32 tokens cost the same.
+    The DMA rate above is not scaled by the 8 channels: the TileLink port streams about 23 cycles per
+    32 B beat whatever the channel count (found by the cost worker's read, MEAS ee290sim_vcs.json)."""
+    return MXU_ISSUE_GAP
