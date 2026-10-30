@@ -191,3 +191,116 @@ def test_cost_dma_and_instruction_counts():
     assert r["dma_cycles"] == pytest.approx(4096 * 764, rel=0.01)
     assert r["mxu_cycles_2"] - hp.MXU_MATMUL_LATENCY["ipt"] == 2 * (r["mxu_cycles_1"] - hp.MXU_MATMUL_LATENCY["ipt"])
     assert r["vpu_extra_tile_instrs"] == 64 * 7 + 64 * 2
+
+
+# ---- attention two-term (--act-two-term attnq | attn | all+attn) -----------------------------------
+def _qkv(seed=0, B=2, H=3, Sq=6, Skv=9, D=32, heavy_q=True):
+    g = torch.Generator().manual_seed(seed)
+    q = torch.randn(B, H, Sq, D, generator=g) * (torch.exp2(torch.randn(B, H, Sq, D, generator=g) * 2) if heavy_q else 1)
+    k = torch.randn(B, H, Skv, D, generator=g)
+    v = torch.randn(B, H, Skv, D, generator=g)
+    mask = torch.rand(B, Sq, Skv, generator=g) > 0.3
+    mask[..., 0] = True
+    return q.bfloat16(), k.bfloat16(), v.bfloat16(), mask
+
+
+def _bf16_attn(q, k, v, mask, scale):
+    s = q.double() @ k.double().transpose(-1, -2) * scale
+    s = s.masked_fill(~mask[:, None], float("-inf"))
+    return torch.softmax(s, -1) @ v.double()
+
+
+def test_attention_default_off_bit_identical():
+    import ref_attention as ra
+    q, k, v, mask = _qkv()
+    a = ra.ref_attention(q, k, v, 0.2, mask)
+    b = ra.ref_attention(q, k, v, 0.2, mask, two_term=None)
+    assert torch.equal(a, b)
+    m = quantized("reference")
+    assert tt.apply(m, "reference", "off") is None
+
+
+def test_attention_two_pass_by_hand():
+    import ref_attention as ra
+    q, k, v, mask = _qkv()
+    sc = 0.2
+    got = ra.ref_attention(q, k, v, sc, mask, two_term="qp")
+    hd = (-2, -1)
+    q1q, sq = rn.quantize(q, hd)
+    q1 = rn.dequantize(q1q, sq).to(torch.bfloat16)
+    q2q, sq2 = rn.quantize(VPU.sub(q, q1), hd)
+    kq, sk = rn.quantize(k, hd)
+    mm = lambda aq, asx: torch.matmul(rn.dequantize(aq, asx), rn.dequantize(kq, sk).transpose(-1, -2))
+    s = VPU.add(mm(q1q, sq).to(torch.bfloat16), mm(q2q, sq2).to(torch.bfloat16)).float() * sc
+    s = torch.where(mask[:, None], s, torch.finfo(torch.float32).min)
+    p = torch.softmax(s, -1).to(torch.bfloat16)
+    p1q, sp = rn.quantize(p, hd)
+    p1 = rn.dequantize(p1q, sp).to(torch.bfloat16)
+    p2q, sp2 = rn.quantize(VPU.sub(p, p1), hd)
+    vq, sv = rn.quantize(v, hd)
+    vd = rn.dequantize(vq, sv)
+    o = VPU.add(torch.matmul(rn.dequantize(p1q, sp), vd).to(torch.bfloat16),
+                torch.matmul(rn.dequantize(p2q, sp2), vd).to(torch.bfloat16))
+    assert torch.equal(got, o)
+    # attnq: Q only, P single-term
+    gq = ra.ref_attention(q, k, v, sc, mask, two_term="q")
+    pq = torch.softmax(s, -1).to(torch.bfloat16)
+    pqq, spq = rn.quantize(pq, hd)
+    assert torch.equal(gq, torch.matmul(rn.dequantize(pqq, spq), vd).to(torch.bfloat16))
+
+
+@pytest.mark.parametrize("two", ["q", "qp"])
+def test_attention_two_term_error_lower_heavy_q(two):
+    import ref_attention as ra
+    q, k, v, mask = _qkv(seed=3)
+    want = _bf16_attn(q, k, v, mask, 0.2)
+    e = lambda t: float((ra.ref_attention(q, k, v, 0.2, mask, two_term=t).double() - want).norm() / want.norm())
+    assert e(two) < e(None)
+    # additive-mask (Llama eager) path too
+    add = torch.zeros(mask.shape).masked_fill(~mask, float("-inf"))[:, None]
+    assert torch.isfinite(ra.ref_attention(q, k, v, 0.2, add, two_term=two).float()).all()
+
+
+def test_attention_apply_choices_and_llama_hook():
+    from test_ladder import tiny_llama
+    ids = torch.randint(0, 128, (1, 24), generator=torch.Generator().manual_seed(0))
+    base = None
+    for opt, n_lin in (("attnq", 0), ("attn", 0), ("all+attn", 14)):
+        model = tiny_llama(layers=2)
+        from ref_attention import patch_attention
+        sites = patch_attention(model)
+        assert len(sites) == 2
+        algos.quantize(model, "reference", ["lm_head"], {}, algo=algos.make("granularity:w=channel,a=token,rule=nc"))
+        with torch.no_grad():
+            base = model(ids).logits.float()
+            rec = tt.apply(model, "reference", opt)
+            two = model(ids).logits.float()
+        assert rec["attention_sites"] == 2 and rec["wrapped_layers"] == n_lin
+        assert rec["attention_two_term"] == tt.ATTN_TWO_TERM[opt]
+        assert torch.isfinite(two).all() and not torch.equal(two, base)
+    with pytest.raises(ValueError):
+        tt.apply(model, "reference", "bogus")
+
+
+def test_attention_chip_smoke():
+    from test_ladder import tiny_llama
+    from ref_attention import patch_attention
+    ids = torch.randint(0, 128, (1, 24), generator=torch.Generator().manual_seed(0))
+    model = tiny_llama(layers=1)
+    algos.quantize(model, "chip", ["lm_head"], {"chip_mxu": "framework"},
+                   algo=algos.make("granularity:w=channel,a=token,rule=nc"))
+    with torch.no_grad():
+        base = model(ids).logits.float()
+        rec = tt.apply(model, "chip", "attn")
+        two = model(ids).logits.float()
+    assert torch.isfinite(two).all()
+    assert rec["attention_sites"] == 1
+
+
+def test_attention_cost_model():
+    a = hw_cost.attention_two_term_cost(2048, 2048, 64, 32, 4, "q", "vmem")
+    assert a["mxu_cycles_2"] > a["mxu_cycles_1"] and a["dma_cycles"] == 0 and a["overhead"] > 0.45
+    d = hw_cost.attention_two_term_cost(1, 2048, 64, 32, 4, "q", "hbm")
+    assert d["overhead"] == 0 and d["bound_2"] == "dma"          # decode against an HBM-streamed KV cache: free for Q
+    qp = hw_cost.attention_two_term_cost(1, 2048, 64, 32, 4, "qp", "hbm")
+    assert qp["vpu_extra_tile_instrs"] > d["vpu_extra_tile_instrs"]

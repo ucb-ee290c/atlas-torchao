@@ -11,7 +11,7 @@ A wrapped RefQuantLinear (reference, reference_hw, chip, chip_rope_vpu) computes
     r  = x - x1                      (BF16 vsub, truncating like the VPU)
     y  = F(x1) + F_nobias(r)         (F = the layer's existing forward; the bias is in the first term only;
                                       the sum is one BF16 vadd)
-Weights are never two-term. Attention matmuls and Conv2d are not touched.
+Weights are never two-term. Attention matmuls (unless the attn choices are given, see ref_attention two_term) and Conv2d are not touched.
 
 Hooks: eval.py / eval_policy.py call `apply(model, mode, option)` after the quantized model is built.
 The forward is replaced on the module instance, so module names, hooks and state are unchanged.
@@ -25,7 +25,9 @@ import chip_ops
 import ref_numerics as rn
 from algos import base as algo_hooks
 
-CHOICES = ("off", "all", "down")
+CHOICES = ("off", "all", "down", "attnq", "attn", "all+attn")
+ATTN_TWO_TERM = {"attnq": "q", "attn": "qp", "all+attn": "qp"}     # option -> ref_attention two_term
+LINEAR_CHOICES = ("all", "down", "all+attn")
 _VPU = chip_ops.ChipVPU()                 # bit-exact vadd/vsub (truncating upper-16-bit slice), uncounted
 
 
@@ -34,7 +36,9 @@ def add_args(ap) -> None:
     g.add_argument("--act-two-term", choices=CHOICES, default="off",
                    help="off (default): unchanged. all: every quantized Linear runs F(x1)+F(x-x1) with x1 the "
                         "FP8 round trip of x (bias once, BF16 vsub/vadd); down: down_proj layers only. "
-                        "Attention matmuls and Conv2d are not touched; weights stay single-term")
+                        "attnq: attention only, S = fm(Q1,K)+fm(Q2,K); attn: attention only, Q and P two-term "
+                        "(O = fm(P1,V)+fm(P2,V) too); all+attn: all Linears plus attention Q and P. K, V, "
+                        "weights stay single-term; Conv2d is never touched")
 
 
 def _router():
@@ -115,8 +119,24 @@ def apply(model, mode: str, option: str = "off") -> dict | None:
         raise ValueError(f"--act-two-term {option!r}: choose from {CHOICES}")
     if option == "off" or mode == "bf16":
         return None
+    attn_sites = []
+    if option in ATTN_TWO_TERM:
+        for name, m in model.named_modules():
+            cfg = getattr(m, "_atlas_ref_attn", None)
+            if isinstance(cfg, dict):
+                if cfg.get("algo") is not None and cfg["algo"].online_transform(cfg.get("site", name),
+                                                                                "attention.q") is not None:
+                    raise NotImplementedError(f"{name}: an online attention transform does not commute with "
+                                              "the two-term split")
+                cfg["two_term"] = ATTN_TWO_TERM[option]
+                attn_sites.append(name)
+        if not attn_sites and option != "all+attn":
+            raise RuntimeError(f"--act-two-term {option}: no patched attention site in mode {mode!r} "
+                               "(profile without --ops attention?)")
     wrapped, skipped = [], []
     for name, m in model.named_modules():
+        if option not in LINEAR_CHOICES:
+            break
         if type(m).__name__ != "RefQuantLinear":
             continue
         if option == "down" and not name.endswith("down_proj"):
@@ -126,9 +146,13 @@ def apply(model, mode: str, option: str = "off") -> dict | None:
             continue
         wrap_layer(m)
         wrapped.append(name)
-    if not wrapped:
+    if not wrapped and option in LINEAR_CHOICES:
         raise RuntimeError(f"--act-two-term {option}: no quantized Linear found to wrap in mode {mode!r} "
                            "(profile without Linear quantization?)")
     return {"act_two_term": option, "mode": mode, "wrapped_layers": len(wrapped), "skipped_non_bf16": skipped,
-            "semantics": "y = F(x1) + F_nobias(x - x1), x1 = dq(Q(x)); BF16 vsub/vadd (truncating; chip: router "
-                         "VPU, active vadd mode); bias once; weights single-term; attention/conv untouched"}
+            "attention_sites": len(attn_sites),
+            "attention_two_term": ATTN_TWO_TERM.get(option),
+            "semantics": "Linear: y = F(x1) + F_nobias(x - x1), x1 = dq(Q(x)); attention: S = fm(Q1,K)+fm(Q2,K) "
+                         "[and O = fm(P1,V)+fm(P2,V) for attn/all+attn], x1 = dq(Q(x)) per (b,h), x2 = Q(x - x1); "
+                         "BF16 vsub/vadd (truncating; chip: router VPU, active vadd mode); bias once; K, V, "
+                         "weights single-term; conv untouched"}

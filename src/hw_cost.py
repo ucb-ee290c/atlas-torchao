@@ -461,3 +461,53 @@ def two_term_free_blocks() -> float:
     """Largest block count (32 tokens each) for which the second pass is still hidden behind the weight DMA:
     2 x MXU_ISSUE_GAP x blocks <= DMA cycles per 1 KiB tile (latency and VPU terms ignored). About 11.9."""
     return hp.dma_load_cycles(4 * hp.KIB) / (4 * hp.KIB // hp.WEIGHT_SLOT_BYTES) / (2 * hp.MXU_ISSUE_GAP)
+
+
+# ------------------------------------------------------------------------------------------------
+# Part 3b: two-term attention operands (--act-two-term attnq | attn | all+attn; ref_attention two_term)
+# ------------------------------------------------------------------------------------------------
+def attention_two_term_cost(Sq: int, Skv: int, D: int, heads: int, kv_heads: int, variant: str = "qp",
+                            kv: str = "vmem", mxu: str = "ipt") -> dict:
+    """DERIVED cycles of one attention layer (S = Q K^T, O = P V; every query head its own pair of matmuls,
+    full Sq x Skv square, no causal tile skipping, softmax and the single-term casts not modelled in either column).
+
+    The resident operand is K (tiles of 32 keys x 32 head-dim) for S and V^T for O; the streamed operand is Q
+    (Sq/32 blocks) or P. The second term only adds MXU passes against the same resident tile: matrix passes
+    double, NO extra weight DMA. kv="vmem": K and V are already in VMEM (KV cache of one layer, FP8: 2 x kv_heads x
+    Skv x D bytes; the 1.5 MiB VMEM holds it for TinyLlama at 2048 tokens only if little else is resident), so
+    there is no DMA term. kv="hbm": the FP8 K and V tiles are loaded once per kv head (dma_cycles_tiled).
+    variant "q": only S gets the second pass; "qp": S and O.
+    VPU extras (INFERRED, same instruction sequence as two_term_layer_cost): per streamed tile (Q: Sq/32 x D/32;
+    P: Sq/32 x Skv/32) the activation-side sequence, per output tile (S: Sq/32 x Skv/32; O: Sq/32 x D/32) the
+    pass-2 rescale and the BF16 vadd. The per-(batch, head) exponent needs the max over the whole residual tile
+    set, so the residual (bf16 Sq x D, and Sq x Skv for P) must be held until its reductions finish."""
+    if variant not in ("q", "qp"):
+        raise ValueError(variant)
+    blocks = max(1, -(-Sq // hp.TILE))
+    dt, st_ = pad_to(D) // hp.TILE, pad_to(Skv) // hp.TILE
+    tiles = dt * st_                                     # resident tiles of K (S) and of V^T (O), per head
+    act = TWO_TERM_ACT_TILE_INSTRS
+    act_cyc = (sum(v for k, v in act.items() if not k.startswith("vred")) * hp.VPU_TILE_ELEMENTWISE_CYCLES
+               + sum(v for k, v in act.items() if k.startswith("vred")) * hp.VREDMAX_ROW_CYCLES)
+    out_cyc = sum(TWO_TERM_OUT_TILE_INSTRS.values()) * hp.VPU_TILE_ELEMENTWISE_CYCLES
+    n_act, n_out = sum(act.values()), sum(TWO_TERM_OUT_TILE_INSTRS.values())
+    lat = hp.MXU_MATMUL_LATENCY[mxu]
+    mm1 = 2 * tiles * blocks * hp.MXU_ISSUE_GAP * heads + 2 * lat           # S and O, one pass, all heads
+    mm_two = (2 if variant == "qp" else 1)                                  # matmuls that get a second pass
+    mm2 = mm1 + mm_two * (tiles * blocks * hp.MXU_ISSUE_GAP * heads + lat)
+    q_act, p_act = blocks * dt, blocks * st_                                 # streamed tiles per head
+    s_out, o_out = blocks * st_, blocks * dt
+    tiles_act = q_act + (p_act if variant == "qp" else 0)
+    tiles_out = s_out + (o_out if variant == "qp" else 0)
+    vpu = heads * (q_act * act_cyc + s_out * out_cyc
+                   + ((p_act * act_cyc + o_out * out_cyc) if variant == "qp" else 0))
+    instrs = heads * (tiles_act * n_act + tiles_out * n_out)
+    dma = dma_cycles_tiled(2 * tiles * kv_heads * hp.WEIGHT_SLOT_BYTES) if kv == "hbm" else 0.0
+    t1 = max(dma, mm1)
+    t2 = max(dma, mm2, vpu)
+    return dict(Sq=Sq, Skv=Skv, D=D, heads=heads, kv_heads=kv_heads, variant=variant, kv=kv, blocks=blocks,
+                resident_tiles_per_head=tiles, dma_cycles=dma, mxu_cycles_1=mm1, mxu_cycles_2=mm2,
+                vpu_extra_cycles=vpu, vpu_extra_tile_instrs=instrs, cycles_1=t1, cycles_2=t2,
+                overhead=t2 / t1 - 1.0,
+                bound_2=max(("dma", dma), ("mxu", mm2), ("vpu", vpu), key=lambda p: p[1])[0],
+                label="DERIVED (VPU part INFERRED; softmax/casts/causal skipping not modelled)")
