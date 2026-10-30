@@ -25,9 +25,9 @@ import chip_ops
 import ref_numerics as rn
 from algos import base as algo_hooks
 
-CHOICES = ("off", "all", "down", "attnq", "attn", "all+attn")
-ATTN_TWO_TERM = {"attnq": "q", "attn": "qp", "all+attn": "qp"}     # option -> ref_attention two_term
-LINEAR_CHOICES = ("all", "down", "all+attn")
+CHOICES = ("off", "all", "down", "attnq", "attn", "all+attn", "all+attnq")
+ATTN_TWO_TERM = {"attnq": "q", "attn": "qp", "all+attn": "qp", "all+attnq": "q"}     # option -> ref_attention two_term
+LINEAR_CHOICES = ("all", "down", "all+attn", "all+attnq")
 _VPU = chip_ops.ChipVPU()                 # bit-exact vadd/vsub (truncating upper-16-bit slice), uncounted
 
 
@@ -130,7 +130,7 @@ def apply(model, mode: str, option: str = "off") -> dict | None:
                                               "the two-term split")
                 cfg["two_term"] = ATTN_TWO_TERM[option]
                 attn_sites.append(name)
-        if not attn_sites and option != "all+attn":
+        if not attn_sites and option not in ("all+attn", "all+attnq"):
             raise RuntimeError(f"--act-two-term {option}: no patched attention site in mode {mode!r} "
                                "(profile without --ops attention?)")
     wrapped, skipped = [], []
