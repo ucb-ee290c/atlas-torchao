@@ -53,7 +53,7 @@ def mxu_cycles(tiles: int, tokens: int, mxu: str = "ipt") -> int:
     The sequencer iterates `tileRows` = 32 rows for every matmul whatever the token count
     (InnerProductTreesSequencer.scala:191-193), so the cost is ceil(tokens/32) blocks of MXU_ISSUE_GAP
     per tile, minimum one block: decode at T=1 costs as much MXU time as T=32. The pipeline fill
-    (MXU_MATMUL_LATENCY) is paid once. `hw_params.mxu_tile_cycles` returns `tokens` below 32 and is
+    (MXU_MATMUL_LATENCY) is paid once. `hw_params.mxu_tile_cycles` now always returns the 32-row issue gap and is
     NOT used here for that reason. Weight push (TILE cycles per tile, MXU_PUSH_POP_LATENCY fill) is
     assumed hidden behind the previous tile's matmul by the two weight slots (INFERRED).
     """
@@ -267,9 +267,11 @@ def trace_layer_graph(cfg: dict | None = None, seq: int = 96) -> dict:
     rec = Rec()
     with torch.device("meta"):
         layer = m.LlamaDecoderLayer(hf, 0)
-        rot = m.LlamaRotaryEmbedding(hf)
         x = torch.empty(1, seq, c["hidden_size"], dtype=torch.bfloat16)
-        cos, sin = rot(x, torch.arange(seq)[None])
+        # the rotary tables only matter by shape here; calling LlamaRotaryEmbedding on meta needs
+        # torch.get_autocast_dtype("meta"), which torch 2.7 (the Pi0 environment) does not support
+        cos = torch.empty(1, seq, head_dim, dtype=torch.bfloat16)
+        sin = torch.empty(1, seq, head_dim, dtype=torch.bfloat16)
     for name, mod in layer.named_modules():
         if isinstance(mod, torch.nn.Linear):
             mod.register_forward_pre_hook(lambda mod_, a, n=name: setattr(rec, "cur", n))
