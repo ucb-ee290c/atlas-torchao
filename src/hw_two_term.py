@@ -19,6 +19,8 @@ The forward is replaced on the module instance, so module names, hooks and state
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 import chip_ops
@@ -59,6 +61,10 @@ def vadd(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 def _vop(a, b, sub):
     r = _router()
     if r is None:
+        if os.environ.get("ATLAS_TWO_TERM_ADD", "trunc") == "rne":
+            # round-to-nearest-even BF16 add: what an RNE vadd (the requested RTL change, or the 24-instruction
+            # sequence) gives; the default models the truncating vadd the RTL has today
+            return ((a.float() - b.float()) if sub else (a.float() + b.float())).to(a.dtype)
         return _VPU.sub(a, b) if sub else _VPU.add(a, b)
     import chip_coverage as cc
     import chip_numerics
