@@ -177,3 +177,69 @@ def test_bad_params():
     for bad in ("granularity:w=row", "granularity:a=channel", "granularity:rule=ceil", "granularity:x=1"):
         with pytest.raises(ValueError):
             algos.make(bad)
+
+
+# -- NEW a=block (tokens per block, full K) -----------------------------------------------------------
+
+def _x(m=37, k=64, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    return (torch.randn(m, k, generator=g) * torch.exp(2 * torch.randn(m, 1, generator=g))).to(torch.bfloat16)
+
+
+def test_block_rows1_equals_per_token():
+    x = _x()
+    got = algos.make("granularity:a=block,rows=1").act_scale("l", x, "linear")
+    want = algos.make("granularity:a=token,rule=nc").act_scale("l", x, "linear")
+    assert torch.equal(got.exp, want.exp) and got.exp.shape == (37, 1)
+
+
+def test_block_rows_ge_tokens_equals_per_tensor():
+    x = _x()
+    want = algos.make("granularity:a=tensor,rule=nc").act_scale("l", x, "linear")
+    for rows in (37, 64, 4096):
+        got = algos.make(f"granularity:a=block,rows={rows}").act_scale("l", x, "linear")
+        assert torch.equal(got.exp, want.exp.expand(37, 1))
+
+
+def test_block_short_last_block_and_never_clips():
+    x = _x(70, 32)                                      # 32 + 32 + 6 tokens
+    s = algos.make("granularity:a=block").act_scale("l", x, "linear").exp.reshape(-1)
+    for lo, hi in ((0, 32), (32, 64), (64, 70)):
+        want = scale_exp(x[lo:hi], None, "nc")
+        assert (s[lo:hi] == want).all()
+    amax = x.abs().float().amax(-1)
+    assert (amax <= 448.0 * torch.exp2(s.float())).all()
+
+
+def test_block_default_rows_and_scope():
+    g = algos.make("granularity:a=block")
+    assert g.rows == 32
+    x = _x(8, 32)
+    assert g.act_scale("c", x, "conv2d") is None                       # Linear inputs only (rule=ref: reference)
+    assert g.act_scale("a", x, "attention.q", dims=(-2, -1)) is None   # attention keeps the per-head rule
+    assert g.record()["numerics"]["departs_from_reference_rule"] is True
+    with pytest.raises(ValueError):
+        algos.make("granularity:a=block,rows=0")
+
+
+def test_block_runs_on_mxu_steps_and_chip_cost_below_per_token():
+    need_refs()
+    import hw_scale
+
+    for mode in ("reference_hw", "chip"):
+        m0, m1 = tiny_llama(), tiny_llama()
+        algos.quantize(m0, mode, ["lm_head"], dict(FAST), algo=None)
+        rep = algos.quantize(m1, mode, ["lm_head"], dict(FAST), algo=algos.make("granularity:a=block"))
+        with torch.no_grad():
+            y0, y1 = _out(m0(IDS)).float(), _out(m1(IDS)).float()
+        assert torch.isfinite(y1).all() and ((y1 - y0).norm() / y0.norm()) < 0.1
+        assert rep["algo"]["granularity"]["activation"]["linear:per_token_block"] == 7
+    rows = {r["op"]: r for r in rep["coverage"]["ops"]}
+    assert rows["dyn_scale_chain"]["instructions"]["vstore"] > 0 and "dyn_scale_chain_scalar" in rows
+    assert "dyn_scale_chain" in rep["coverage"]["new_decisions"][-1]["op"] or any(
+        "dyn_scale_chain" in d["op"] for d in rep["coverage"]["new_decisions"])
+    assert rep["coverage"]["dynamic_scale_chain_NEW"]["block"]["serialized_cycles"] > 0
+    # cost: a TinyLlama-sized layer input (128 tokens x K=2048)
+    blk, tok = hw_scale.dynamic_scale_cost(128, 2048, "block"), hw_scale.dynamic_scale_cost(128, 2048, "token")
+    assert blk["instructions"] < tok["instructions"]
+    assert hw_scale.dynamic_scale_cost(128, 2048, "block_vec")["cycles"] < tok["cycles"]

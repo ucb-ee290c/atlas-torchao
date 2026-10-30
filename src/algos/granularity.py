@@ -11,6 +11,9 @@ Parameters (`--algo granularity:w=...,a=...,rule=...,attn=...`):
                                        hw_float_ops.py:31,38-57 = OCP MX sec. 6.3 = MX paper
                                        arXiv 2310.10537 Alg. 1); nc (NEW): s + 1 where amax > 448 * 2^s,
                                        i.e. ceil(log2(amax / 448)), so no block maximum is clipped
+  a=block (NEW) with rows=B (default 32): one never-clip (nc) activation scale per B consecutive tokens over
+                                       the FULL K, Linear inputs only (attention operands keep the
+                                       per-(batch, head) rule); the last short block is allowed
   attn  head | token                   attention operands: the reference per-(batch, head) scale, or
                                        per row for the left operands q and p (k and v stay per head)
 
@@ -48,7 +51,8 @@ from algos.base import Algo, Scale
 E4M3_MAX = 448.0                     # FP8Pack saturation value (fp8_e4m3.py:15-16)
 BLOCK = 32                           # OCP MX v1.0 sec. 5.2 Table 1; = MXU K tile (MxuParams.scala:19)
 W_CHOICES = ("tensor", "channel", "block32")
-A_CHOICES = ("tensor", "token", "block32")
+A_CHOICES = ("tensor", "token", "block32", "block")
+TOKEN_BLOCK = 32                     # default rows per block of a=block (one vpack scale covers 32 tokens)
 RULES = ("ref", "nc")
 ATTN = ("head", "token")
 
@@ -87,11 +91,14 @@ class Granularity(Algo):
         self.a = str(params.get("a", "tensor"))
         self.rule = str(params.get("rule", "ref"))
         self.attn = str(params.get("attn", "head"))
+        self.rows = int(params.get("rows", TOKEN_BLOCK))
+        if self.rows < 1:
+            raise ValueError(f"granularity: rows={self.rows}; must be >= 1")
         for k, v, ok in (("w", self.w, W_CHOICES), ("a", self.a, A_CHOICES), ("rule", self.rule, RULES),
                          ("attn", self.attn, ATTN)):
             if v not in ok:
                 raise ValueError(f"granularity: {k}={v!r}; choose from {ok}")
-        unknown = set(params) - {"w", "a", "rule", "attn"}
+        unknown = set(params) - {"w", "a", "rule", "attn", "rows"}
         if unknown:
             raise ValueError(f"granularity: unknown parameters {sorted(unknown)}")
         self._out = {}                 # layer name -> out features with a per-column factor
@@ -114,12 +121,32 @@ class Granularity(Algo):
             if self.rule == "nc":
                 return Scale(scale_exp(x, dims, "nc"), "per_tensor" if dims is None else "per_head")
             return None
-        if self.a == "tensor":
+        if self.a == "block" and kind == "linear":
+            return self._token_block(x)
+        if self.a == "tensor" or self.a == "block":      # a=block applies to Linear inputs only (NEW)
             return None if self.rule == "ref" else Scale(scale_exp(x, None, "nc"), "per_tensor")
         if self.a == "block32" and x.shape[-1] % BLOCK == 0:
             return Scale(block_scale_exp(x, self.rule), "per_block", block=BLOCK)
         label = "per_token" if self.a == "token" else "per_token(block_tail)"
         return self._token(name, x, kind, out_cols=self._out.get(name, 0), label=label)
+
+    def _token_block(self, x):
+        """NEW a=block: one never-clip power-of-two scale per `rows` consecutive tokens over the FULL K
+        (the MXU accumulator holds BF16 partial sums across K tiles, so a token block's activation scale
+        must be constant across K). Tokens are the flattened leading dims (the matmul M dimension); the
+        last block may be short. Returned as a per-token exponent [..., 1] so the output rescale and
+        the cast are those of a=token."""
+        k = x.shape[-1]
+        m = x.numel() // max(1, k)
+        b = self.rows
+        nb = -(-m // b)
+        xp = x.to(torch.bfloat16).reshape(m, k)
+        if nb * b != m:
+            xp = torch.cat([xp, xp.new_zeros(nb * b - m, k)])        # zeros never change a block's amax
+        s = scale_exp(xp.reshape(nb, b, k), (1, 2), "nc").reshape(nb)
+        s = s.repeat_interleave(b)[:m].reshape(*x.shape[:-1], 1)
+        _count_block_cast(m, k)
+        return Scale(s, "per_token_block")
 
     def _token(self, name, x, kind, out_cols, label):
         _count_token_cast(x, out_cols)
@@ -130,11 +157,23 @@ class Granularity(Algo):
         rec["numerics"] = {
             "scale_rule": "reference floor(log2(amax/256))" if self.rule == "ref"
             else "NEW nc: ceil(log2(amax/448))",
-            "departs_from_reference_rule": self.rule == "nc",
-            "note": NC_NOTE if self.rule == "nc" else None,
+            "act_block_rows": self.rows if self.a == "block" else None,
+            "act_block_rule": "NEW nc (always) on Linear inputs" if self.a == "block" else None,
+            "departs_from_reference_rule": self.rule == "nc" or self.a == "block",
+            "note": NC_NOTE if self.rule == "nc" or self.a == "block" else None,
             "per_block_on_mxu_models": "not defined (hardware ruling H3); framework steps only",
         }
         return rec
+
+
+def _count_block_cast(rows: int, k: int) -> None:
+    """Chip coverage of a=block: the real dynamic-scale chain, one scale per 32-token block (NEW). No
+    pre-vpack vmul: the vpack reads the block's scale register."""
+    import sys
+
+    cp = sys.modules.get("chip_profile")
+    if cp is not None and hasattr(cp, "count_dynamic_scale_chain"):
+        cp.count_dynamic_scale_chain(rows, k, "block")
 
 
 def _count_token_cast(x: torch.Tensor, out_cols: int) -> None:
@@ -149,6 +188,8 @@ def _count_token_cast(x: torch.Tensor, out_cols: int) -> None:
         return
     n = x.numel()
     rows = n // max(1, x.shape[-1])
+    if hasattr(cp, "count_dynamic_scale_chain"):
+        cp.count_dynamic_scale_chain(rows, x.shape[-1], "token")      # NEW, additive: the real chain
     instrs = {"vmul.bf16": n + rows * out_cols}
     cp.count_algo_vpu(
         "granularity_rescale", instrs,

@@ -33,6 +33,7 @@ import torch.nn as nn
 import chip_coverage as cc
 import chip_numerics
 import chip_ops
+import hw_scale
 import ref_numerics as rn
 
 ENTRY_POINTS = ("forward", "predict_action_chunk", "select_action", "_generate_actions",
@@ -52,6 +53,54 @@ def count_algo_cast(n: int, dynamic: bool) -> None:
     _RUNNING[-1].cov.add("VPU", "fp8_operand_cast", sum(instr.values()), instr,
                          reason="algorithm operand cast (src/algos): vpack with the algorithm's scale"
                                 + ("; amax at run time" if dynamic else "; scale fixed ahead of time"))
+
+
+class _ChainCoverage(cc.Coverage):
+    """Coverage that also carries the NEW dynamic-scale chain totals (count_dynamic_scale_chain)."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.chain: dict = {}
+
+    def report(self) -> dict:
+        rep = super().report()
+        if self.chain:
+            rep["dynamic_scale_chain_NEW"] = {
+                mode: {key: (dict(v) if isinstance(v, dict) else v) for key, v in tot.items()}
+                for mode, tot in self.chain.items()}
+            rep["dynamic_scale_chain_NEW_note"] = hw_scale.COST_ASSUMPTIONS
+        return rep
+
+
+def count_dynamic_scale_chain(rows: int, k: int, mode: str, rule: str = "nc") -> None:
+    """NEW, additive to count_algo_cast (whose vpack + vredmax.row + vredmin.row counts stay as they were):
+    the real on-chip chain that derives a dynamic scale (hw_scale.dynamic_scale_cost): vector amax,
+    vstore, scalar RV32I exponent sequence, sb, seld, and for mode 'token' the pre-vpack 2^-s factor
+    path. mode 'block' = one scale per 32-token block over the full K (granularity a=block); 'token' =
+    one per token. Rows: VPU `dyn_scale_chain` and scalar `dyn_scale_chain_scalar` (instructions);
+    serialized cycles go in the report's `dynamic_scale_chain_NEW` section (no overlap claimed)."""
+    if not _RUNNING:
+        return
+    cov = _RUNNING[-1].cov
+    c = hw_scale.dynamic_scale_cost(rows, k, mode, rule)
+    cov.add("VPU", "dyn_scale_chain", sum(c["vpu"].values()), c["vpu"],
+            reason=f"NEW: real dynamic-scale chain, mode={mode} (vredmax/vredmin, combine, vstore"
+                   + (", pre-vpack vmul" if mode == "token" else "") + "); H2 closed by hw_scale",
+            new={"choice": "vredmax.row/vredmin.row -> vstore -> scalar lhu + RV32I exponent -> sb -> seld",
+                 "analogue": "RTL has no exponent-extract instruction (handoff/HW_AWARE_AUDIT.md section 2)",
+                 "reason": "honest cost of dynamic scales; additive to the 3-instruction amax+vpack count"})
+    sc = {"rv32i": c["scalar"]["rv32i"], "seld": c["seld"]}
+    cov.add("scalar", "dyn_scale_chain_scalar", sum(sc.values()), sc,
+            reason="NEW: scalar-core RV32I instructions (lhu, exponent sequence, sb) and seld of the chain")
+    tot = cov.chain.setdefault(mode, {"scales_blocks": 0, "vpu": {}, "rv32i": 0, "seld": 0,
+                                      "instructions": 0, "serialized_cycles": 0})
+    tot["scales_blocks"] += c["blocks"]
+    for key, v in c["vpu"].items():
+        tot["vpu"][key] = tot["vpu"].get(key, 0) + v
+    tot["rv32i"] += c["scalar"]["rv32i"]
+    tot["seld"] += c["seld"]
+    tot["instructions"] += c["instructions"]
+    tot["serialized_cycles"] += c["cycles"]
 
 
 def count_algo_vpu(op: str, instrs: dict, reason: str, new: dict | None = None) -> None:
@@ -267,7 +316,7 @@ def quantize_chip(model: nn.Module, skip=(), options=None) -> dict:
     rep = quant_modes.quantize(model, "reference_hw" if mxu_kind == "model" else "reference", skip, options)
     opts = quant_modes.profile_options(options or {})
     rope = _opt(options, "chip_rope", "host") or "host"
-    cov = cc.Coverage(type(model).__name__)
+    cov = _ChainCoverage(type(model).__name__)
     vadd_mode = _opt(options, "chip_vadd", "trunc") or "trunc"
     # explicit (never the environment): the CLI flags define the chip profile
     vadd = chip_numerics.VaddPolicy(vadd_mode, _opt(options, "chip_vadd_sites", "residual") or "residual")
