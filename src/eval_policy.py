@@ -476,6 +476,11 @@ def main():
             result["export"] = {"dir": args.export_dir, "mode": mode, "files": man["files"]}
             if args.export_only:
                 break
+        tt_rec = None
+        if getattr(args, "act_two_term", "off") != "off":
+            import hw_two_term
+
+            tt_rec = hw_two_term.apply(policy, mode, args.act_two_term)
         algo_rec = algos.entry_record(layers, mode, args.algo)
         eq = layers["ladder"].get("equivalent_to") if layers is not None else None
         if eq in result["modes"]:
@@ -502,6 +507,7 @@ def main():
         preds, gts, pads, times = run_mode(policy, ds, idx, preprocess, postprocess,
                                            args.seed, args.device, before_frame=before)
         entry = {"normalization": norm["status"], "layers": finalize_report(layers),
+                 **({"hw_two_term": tt_rec} if tt_rec else {}),
                  "ladder": layers["ladder"] if layers is not None else ladder_record("bf16", {}, args),
                  "algo": algo_rec,
                  "added_by_subset_compare": mode in added,

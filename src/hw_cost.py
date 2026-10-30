@@ -410,3 +410,54 @@ def classify_linears(graph: dict | None = None) -> dict:
         out[tag] = dict(consumer_class=consumer_class(cons), terminals=sorted({(c["op"], c["arg"]) for c in cons}),
                         via_layout=sorted({"/".join(c["via_layout"]) for c in cons}), contracts_over_tokens=[])
     return out
+
+
+# ------------------------------------------------------------------------------------------------
+# Part 3: two-term FP8 activations (src/hw_two_term.py): the second MXU pass on the resident weight tile
+# ------------------------------------------------------------------------------------------------
+# Extra VPU instructions per ACTIVATION tile (32 tokens x 32 K, formed once and shared by all N tiles) and per
+# OUTPUT tile (32 tokens x 32 channels). All elementwise ops cost VPU_TILE_ELEMENTWISE_CYCLES per BF16 tile and
+# the two row reductions VREDMAX_ROW_CYCLES each (INFERRED: the fp8 unpack / pack are assumed to cost like a
+# BF16 tile op; no simulation of this sequence exists).
+TWO_TERM_ACT_TILE_INSTRS = {"vunpack.fp8.bf16": 1, "vmul.bf16 (x 2^sx, dequant)": 1, "vsub.bf16 (residual)": 1,
+                            "vredmax.row.bf16": 1, "vredmin.row.bf16": 1, "vmul.bf16 (x 2^-sx2, pre-vpack)": 1,
+                            "vpack.bf16.fp8": 1}
+TWO_TERM_OUT_TILE_INSTRS = {"vmul.bf16 (x 2^(sx2+sw), pass-2 rescale)": 1, "vadd.bf16 (y1 + y2)": 1}
+
+
+def two_term_layer_cost(N: int, K: int, tokens: int, mxu: str = "ipt") -> dict:
+    """DERIVED cycles of one N x K linear per forward, one-term vs two-term activations.
+
+    DMA: the weight tiles are loaded once either way (dma_cycles_tiled, about 764 cycles per 1 KiB tile).
+    MXU: ceil(tokens/32) blocks x MXU_ISSUE_GAP per tile and per pass (the second pass reuses the resident tile).
+    VPU extra (two-term only): residual formation + the residual's own cast per activation tile, pass-2 rescale
+    and the final add per output tile. Layer time = max(DMA, MXU, extra VPU); the baseline VPU work (casts,
+    output rescale of pass 1) is not modelled in either column, so the overhead is the DELTA of the extras
+    against the same DMA/MXU bound. Inputs are padded to 32."""
+    Np, Kp = pad_to(N), pad_to(K)
+    nt, kt = Np // hp.TILE, Kp // hp.TILE
+    tiles = nt * kt
+    blocks = max(1, -(-tokens // hp.TILE))
+    dma = dma_cycles_tiled(tiles * hp.WEIGHT_SLOT_BYTES)
+    mxu1 = mxu_cycles(tiles, tokens, mxu)
+    mxu2 = tiles * blocks * 2 * hp.MXU_ISSUE_GAP + hp.MXU_MATMUL_LATENCY[mxu]
+    act_tile_cycles = (sum(v for k, v in TWO_TERM_ACT_TILE_INSTRS.items() if not k.startswith("vred"))
+                       * hp.VPU_TILE_ELEMENTWISE_CYCLES
+                       + sum(v for k, v in TWO_TERM_ACT_TILE_INSTRS.items() if k.startswith("vred"))
+                       * hp.VREDMAX_ROW_CYCLES)
+    out_tile_cycles = sum(TWO_TERM_OUT_TILE_INSTRS.values()) * hp.VPU_TILE_ELEMENTWISE_CYCLES
+    vpu_extra = blocks * (kt * act_tile_cycles + nt * out_tile_cycles)
+    vpu_instrs = blocks * (kt * sum(TWO_TERM_ACT_TILE_INSTRS.values()) + nt * sum(TWO_TERM_OUT_TILE_INSTRS.values()))
+    t1, t2 = max(dma, mxu1), max(dma, mxu2, vpu_extra)
+    return dict(N=N, K=K, tokens=tokens, blocks=blocks, tiles=tiles, dma_cycles=dma, mxu_cycles_1=mxu1,
+                mxu_cycles_2=mxu2, vpu_extra_cycles=vpu_extra, vpu_extra_tile_instrs=vpu_instrs,
+                cycles_1=t1, cycles_2=t2, overhead=t2 / t1 - 1.0,
+                bound_1="dma" if dma >= mxu1 else "mxu", bound_2=max(("dma", dma), ("mxu", mxu2), ("vpu", vpu_extra),
+                                                                     key=lambda p: p[1])[0],
+                label="DERIVED (VPU part INFERRED)")
+
+
+def two_term_free_blocks() -> float:
+    """Largest block count (32 tokens each) for which the second pass is still hidden behind the weight DMA:
+    2 x MXU_ISSUE_GAP x blocks <= DMA cycles per 1 KiB tile (latency and VPU terms ignored). About 11.9."""
+    return hp.dma_load_cycles(4 * hp.KIB) / (4 * hp.KIB // hp.WEIGHT_SLOT_BYTES) / (2 * hp.MXU_ISSUE_GAP)
