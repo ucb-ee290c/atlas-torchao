@@ -258,17 +258,26 @@ component labels here retain their historical meanings.
 Calibration follows docs/algos/README.md: WikiText-2 train for TinyLlama, frames from episodes
 outside the evaluated ones for the policies, and DROID or dummy observations for Pi0.
 
+## Matrix unit choice: the inner-product tree for every linear layer
+
+Run every Linear on the inner-product tree (MXU1, `--mxu ipt`, the default) and treat the systolic array (MXU0, `--mxu sa`) as an ablation. The RTL gives the reasons (audit: `handoff/HW_AWARE_AUDIT.md`):
+
+- **Rounding.** The IPT aligns all 32 products and the incoming BF16 partial sum to one anchor in a 32-bit integer (17 guard bits below the largest product, shifted-out bits truncated), sums them exactly and rounds once per 32-wide K tile (`AnchorAccumulationTree.scala`). The SA's elaborated PE (`CustomFMA`, `SystolicArrayParams.scala:75`) rounds to BF16 after every one of the 32 adds in a tile. For K = 4416 (138 tiles) that is 138 roundings against 4416, which is the measured +3.8 pt TinyLlama cost and the DiT adaLN degradation of the SA in earlier runs.
+- **Latency.** A matmul takes 35 cycles on MXU1 and 95 on MXU0 (`rtl-timing.md:51`; spec 02 says 96, the RTL-calibrated 95 is used). The issue gap is 32 cycles on both, so throughput per MXU is the same; the IPT is the lower-latency path.
+- **Selection.** Software picks the unit per instruction (`Instructions.scala:99-113`), so this is a scheduling and recipe decision, not a hardware ruling. Whether the taped-out tile contains both units should still be confirmed with the hardware team; the standalone elaboration stub (`chipyard/top/AtlasCluster.scala`) instantiates only the IPT.
+- **Evidence.** The IPT numerics were checked bit for bit against the RTL under Verilator on 14,780 tiles from this flow (`scripts/rtl/`, `results/hw-verify/l1.json`).
+
 ## Pending hardware rulings
 
 | Ruling | Affects | Status |
 |---|---|---|
 | Run-time vs static activation scales (static-calib Q2: is a dynamic amax on chip intended at all?) | `atlas_v1_awq` / `atlas_v1_sq` (per-token amax) vs `atlas_v1_static` | Open. This is why there are two recipes. |
 | H2: how a per-row exponent is derived from `vredmax.row` (no floor / exponent-extract instruction) | `atlas_v1_awq`, `atlas_v1_sq` per-token scales; per-tensor dynamic scales too | Open. Counted on chip as the `granularity_rescale` VPU row (NEW). |
-| vadd rounding: `trunc` (as built) vs `rn` (24-instruction sequence) vs an RNE adder | Chip default of all recipes | Open. `rn` is NEW and off-ladder; `rne_hw` models the hardware change. |
-| Operand exponent 15: 448 (RTL: exponent 15 finite) vs 240 (spec `exponent_range: [1,14]`) | Every FP8 cast; `rule=nc` targets 448 | Open. The reference author's numerics use 448. |
-| MXU scale granularity / MX32 | per-channel weights, per-token activations | Open. |
+| vadd rounding: `trunc` (as built) vs `rn` (24-instruction sequence) vs an RNE adder | Chip default of all recipes | Settled for the RTL as built: it truncates (`AddSubSumVec.scala:133`). Open as a request: RNE narrowing there would replace the 24-instruction `rn` sequence with one instruction (`rne_hw`). |
+| Operand exponent 15: 448 (RTL: exponent 15 finite) vs 240 (spec `exponent_range: [1,14]`) | Every FP8 cast; `rule=nc` targets 448 | Settled by the RTL: 448 (`FP8Pack.scala:40-41`, `E4M3Mul.scala:34-43`). The Merlin software spec's 240 is wrong. |
+| MXU scale granularity / MX32 | per-channel weights, per-token activations | Settled by the RTL: the matmul reads no scale; one E8M0 per 32x32 tile applies only at `vmatpop.fp8` (multiply), `vpack` (divide) and `vunpack` (multiply). Per-channel and per-token scales are vector-unit work. |
 | R4: can residual passes share the MXU accumulator? BF16 fallback on VPU or host | `+keep_bf16`; `+mixed_precision` | Open. |
-| SA accumulation precision for long reductions | SA alternative; IPT remains default | Open. |
+| SA accumulation precision for long reductions | SA alternative; IPT remains default | Resolved as a software choice: the instruction's funct7 LSB selects the unit (`Instructions.scala:99-113`), see "Matrix unit choice". |
 | Off-chip memory size and bandwidth | exported model residency and transfer | Open. |
 
 ## Verification commands (GPU)
