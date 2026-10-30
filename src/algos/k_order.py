@@ -42,7 +42,7 @@ _stack.STAGE.setdefault(60, "permutation")
 
 
 def perm_hash(perm: torch.Tensor) -> str:
-    return hashlib.sha256(perm.to(torch.int32).contiguous().numpy().tobytes()).hexdigest()[:16]
+    return hashlib.sha256(perm.detach().cpu().to(torch.int32).contiguous().numpy().tobytes()).hexdigest()[:16]
 
 
 def find_mlps(model) -> dict:
