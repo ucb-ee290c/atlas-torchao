@@ -27,6 +27,7 @@ REGISTRY = {
     "smoothquant": "algos.smoothquant",
     "gptq_awq": "algos.gptq_awq",
     "keep_bf16": "algos.keep_bf16",
+    "k_order": "algos.k_order",
 }
 
 # Named recipes (NEW; docs/algos/atlas_v1.md): `--algo NAME` expands to a documented stack, and
