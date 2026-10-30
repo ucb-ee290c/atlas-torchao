@@ -24,6 +24,13 @@ def bf16_bits(x: torch.Tensor) -> torch.Tensor:
     return x.to(torch.bfloat16).contiguous().view(torch.int16).to(torch.int32) & 0xFFFF
 
 
+# An E8M0 byte e encodes shift e - 127 and the RTL clamps it to [-128, 127] (VectorEngine.scala:247,
+# e8m0ToScaleExpClamped): byte 255 means +127, and byte 0 (-127) is the lowest shift a byte can hold,
+# so shifts outside [-127, 127] are not encodable (found by the Verilator run; po2_scale_exp stays
+# within about [-119, +119], so ordinary flows never reach the clamp).
+SCALE_SHIFT_MAX = 127
+
+
 def e4m3_vpack(x: torch.Tensor, exp_shift) -> torch.Tensor:
     """Port of bf16_to_e4m3_byte(bf16, exp_shift) (fp8_e4m3.py:38-86), i.e. FP8Pack.scala:57-95.
 
@@ -38,7 +45,8 @@ def e4m3_vpack(x: torch.Tensor, exp_shift) -> torch.Tensor:
     mant_bf = b & 0x7F
     if not torch.is_tensor(exp_shift):
         exp_shift = torch.tensor(int(exp_shift), dtype=torch.int32, device=x.device)
-    exp_adj = (exp_bf - 127) - exp_shift.to(device=x.device, dtype=torch.int32)
+    exp_shift = exp_shift.to(device=x.device, dtype=torch.int32).clamp(-SCALE_SHIFT_MAX, SCALE_SHIFT_MAX)
+    exp_adj = (exp_bf - 127) - exp_shift
 
     mant8 = 0x80 | mant_bf                                  # _round_right_shift_4_rne (fp8_e4m3.py:19-31)
     trunc = mant8 >> 4
@@ -75,7 +83,8 @@ def e4m3_unpack(q: torch.Tensor, exp_shift=0) -> torch.Tensor:
     mant = q & 7
     if not torch.is_tensor(exp_shift):
         exp_shift = torch.tensor(int(exp_shift), dtype=torch.int32, device=q.device)
-    e = (exp - 7) + exp_shift.to(device=q.device, dtype=torch.int32) + 127
+    exp_shift = exp_shift.to(device=q.device, dtype=torch.int32).clamp(-SCALE_SHIFT_MAX, SCALE_SHIFT_MAX)
+    e = (exp - 7) + exp_shift + 127
     bits = (sign << 15) | ((e & 0xFF) << 7) | (mant << 4)
     bits = torch.where(e >= 255, (sign << 15) | 0x7F7F, bits)
     zero = (exp == 0) | ((exp == 0xF) & (mant == 7)) | (e <= 0)

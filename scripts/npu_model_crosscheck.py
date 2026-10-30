@@ -34,7 +34,7 @@ DEFAULT_EXPORT = "/scratch2/lorenhung/atlas-fp8/handoff/atlas_v1/export_smoke/ti
 UNARY_NAMES = {"relu": "relu", "rcp": "rcp", "sqrt": "sqrt", "sin": "sin", "cos": "cos",
                "log": "log", "tanh": "tanh", "exp": "exp", "exp2": "exp2", "square": "square",
                "cube": "cube"}
-SHIFTS = (-128, -127, -12, -8, -3, -1, 0, 1, 3, 8, 12, 126, 127)   # scale exponents e - 127 swept for pack/pop/unpack (ends are the clamp)
+SHIFTS = (-127, -126, -12, -8, -3, -1, 0, 1, 3, 8, 12, 126, 127, 128)   # scale shifts e - 127 of the E8M0 bytes 0..255 (ends: byte 0 and byte 255, which the RTL clamps to +127)
 
 
 def load_rtl_math(npu_model: str):
@@ -206,7 +206,7 @@ def check_fp8(R) -> list:
     for s in SHIFTS:
         ours_pack.append(rn.e4m3_vpack(values, s).to(torch.int32))
         theirs_pack.append(R.pack_row(values, s + 127, mxu=False).to(torch.int32))
-        ours_pop.append(at._bf16_scale_to_e4m3(allbits.clone(), s).to(torch.int32))
+        ours_pop.append(at._bf16_scale_to_e4m3(allbits.clone(), max(-127, min(127, s))).to(torch.int32))   # byte -> shift clamp, as the RTL
         theirs_pop.append(R.pack_row(values, s + 127, mxu=True).to(torch.int32))
     out.append(_result("vpack_all_bf16", torch.cat(ours_pack), torch.cat(theirs_pack),
                        f"ref_numerics.e4m3_vpack vs pack_row(mxu=False): 65536 BF16 x {len(SHIFTS)} scales"))
