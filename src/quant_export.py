@@ -92,8 +92,8 @@ NEW_DECISIONS = [
 
 PENDING_RULINGS = [
     {"id": "Q2", "ruling": "run-time vs static activation scales (is a dynamic amax on chip intended?)",
-     "affects": "every site whose activation mode is dynamic (atlas_v1 per-token; attention operands of "
-                "every recipe)", "status": "open"},
+     "affects": "every site whose activation mode is dynamic (atlas_v1_awq / atlas_v1_sq per-token; "
+                "attention operands of every recipe)", "status": "open"},
     {"id": "H2", "ruling": "how a per-row exponent is derived from vredmax.row (no floor / exponent-extract "
                            "instruction)", "affects": "per-token activation and dynamic per-tensor scales",
      "status": "open"},
@@ -558,9 +558,14 @@ def _opt_out_reasons(algo, bf16) -> dict:
 
 def export(model: nn.Module, export_dir, *, mode: str, report: dict, algo, algo_spec: str, options=None,
            skip=(), model_record: dict | None = None, calib_batches=None, calib_record=None,
-           device=None, extra_provenance: dict | None = None) -> dict:
+           device=None, extra_provenance: dict | None = None, normalization: dict | None = None) -> dict:
     """Write model.safetensors, policy.json and manifest.json for `model`, quantized under `mode`
-    by algos.quantize (whose return value is `report`). Returns the manifest."""
+    by algos.quantize (whose return value is `report`). Returns the manifest.
+
+    normalization (NEW; LeRobot policies, src/policy_norm.export_record): the input / output
+    normalization protocol, its stats sha256 and its transform (per-key mode and eps) sha256,
+    written to both files; --from-export refuses an export whose protocol or transform differs
+    from the requested one."""
     from safetensors.torch import save_file
 
     import quant_modes
@@ -573,8 +578,10 @@ def export(model: nn.Module, export_dir, *, mode: str, report: dict, algo, algo_
     bf16 = list(algo_rec.get("bf16_opt_out") or [])
     reasons = _opt_out_reasons(algo, bf16)
     exact_bf16 = list(algo_rec.get("bf16_opt_out_exact") or [])
+    # the reason of an exact site is the one its selecting rule gave (algos.base.Algo.bf16_exact)
+    exact_reasons = algo_rec.get("bf16_opt_out_reasons") or {}
     for n in exact_bf16:
-        reasons[n] = "NEW: canonical atlas_v1 DiT patch_embedding BF16 exception; run-5.2 ref_conv evidence; pending R4"
+        reasons[n] = exact_reasons.get(n, "algorithm exact BF16 opt-out (bf16_exact)")
     quant = {}
     policy = build_policy(model, mode, report, algo, options, list(skip or ()), bf16, reasons, quant)
     # NEW: exact site identity avoids excluding similarly named sibling layers on replay.
@@ -604,6 +611,8 @@ def export(model: nn.Module, export_dir, *, mode: str, report: dict, algo, algo_
     sf = out / "model.safetensors"
     save_file(tensors, str(sf), metadata=meta)
     policy["aliases"] = aliases
+    if normalization is not None:
+        policy["normalization"] = jsonable(normalization)
     policy["tensors"] = {"count": len(tensors), "quantized_layers": len(qmods),
                          "float_weights_of_quantized_layers": 0}
     pf = out / "policy.json"
@@ -623,6 +632,7 @@ def export(model: nn.Module, export_dir, *, mode: str, report: dict, algo, algo_
         calib = {**(jsonable(calib_record) or {}),
                  "data_sha256": digest_batches(calib_batches) if calib_batches is not None else None}
     site_list = [{"site_id": n, "status": s["status"], "kind": s["kind"]} for n, s in policy["sites"].items()]
+    recipe_rec = getattr(algo, "recipe", None) or {}
     manifest = {
         "schema": MANIFEST_SCHEMA, "format_version": FORMAT_VERSION,
         "created_utc": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -631,10 +641,12 @@ def export(model: nn.Module, export_dir, *, mode: str, report: dict, algo, algo_
         "policy_sha256": sha256_file(pf),
         "model": model_record or {},
         "exported_mode": mode, "ladder": jsonable(report.get("ladder")),
-        "recipe": {"algo": algo_spec, "expanded": expanded, "stack": jsonable(stack),
+        "recipe": {"algo": algo_spec, "alias": recipe_rec.get("alias"), "resolved": recipe_rec.get("name"),
+                   "expanded": expanded, "stack": jsonable(stack),
                    "recipe": jsonable(getattr(algo, "recipe", None)),
                    "algorithm_record": jsonable(algo_rec)},
         "calibration": calib,
+        **({"normalization": jsonable(normalization)} if normalization is not None else {}),
         "provenance": {**git_state(), "versions": versions(), "host": platform.node(),
                        "device": str(device) if device is not None else None,
                        "gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else None,

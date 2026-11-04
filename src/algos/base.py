@@ -9,6 +9,10 @@ Model-level hooks (applied by algos.quantize to every mode except bf16):
   bf16_layers(model, mode)            (e) fqns kept in BF16; passed to the profile as extra skip
                                       entries, so the chip coverage report counts them as host
                                       ("kept off the chip on request") and the algo record lists them
+  bf16_exact(model, mode)             (e, exact; NEW) {fqn: reason} of nn.Conv2d sites kept in
+                                      BF16 by exact fqn (no substring siblings), validated before
+                                      calibration; the reason is recorded in the algo record
+                                      (bf16_opt_out_reasons) and in an export's policy.json
   calibrate(model, batches, run)      (f) on the unquantized model; run(model, batch) is one forward
   prepare(model, mode)                (d, folded) in-place transforms folded into weights / norms
                                       (e.g. smoothing, rotations) before any layer is quantized
@@ -87,6 +91,9 @@ class Algo:
     # -- model level -------------------------------------------------------------------------
     def bf16_layers(self, model, mode) -> list:
         return []
+
+    def bf16_exact(self, model, mode) -> dict:
+        return {}
 
     def calibrate(self, model, batches, run) -> dict | None:
         return None

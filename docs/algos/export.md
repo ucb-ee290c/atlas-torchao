@@ -21,6 +21,11 @@ have all been applied, and evaluation has not started. Evaluation then runs as u
   evaluation, `--rmse` and `--kl`.
 - `--from-export DIR` builds every quantized mode from an export instead of quantizing. Use it to
   re-evaluate an export under the same protocol. It cannot be combined with `--export-dir`.
+  For a LeRobot policy (NEW) it refuses an export whose `normalization` protocol or status differs
+  from the run's (`--norm-stats`, `--allow-unnormalized`), or whose stats digest differs. An export
+  written before the protocol existed carries no `normalization` and counts as `checkpoint` /
+  `legacy-unverified`; the SmolVLA exports of that time must be re-exported with
+  `--norm-stats dataset` ([atlas_v1.md](atlas_v1.md#lerobot-normalization-protocol---norm-stats)).
 
 `collab_v0`, `collab_v0_hw` and `torchao` cannot be exported. Their weights are not E4M3 codes with
 power-of-two exponents.
@@ -65,13 +70,14 @@ the tests also checks the policy. It is meant to become the m2m adapter's policy
     The entry also gives `output_rescale` (`2^(s_x+s_w)` in float32, then the layer dtype, bias
     after), `residual_passes`, and for a Conv2d the im2col geometry.
   - **Attention**: one rule per operand `q`, `k`, `p`, `v`.
-  - **BF16 opt-outs**: status `host` and the reason. NEW: canonical `atlas_v1` on
-    `multi_task_dit` keeps the exact CLIP patch embedding Conv2d in BF16. Its top-level
-    `bf16_opt_out` row has `match: exact`; the loader excludes only that site, preserving
-    similarly named siblings. Historical exports without `match` retain substring replay.
-    The canonical full-checkpoint release export passed an eight-frame, 96-tensor
-    byte-identical round trip at `5ff028e`; all historical run-5.3 DiT exports had zero
-    BF16 opt-outs. See the [verification record](release/release_verification.json).
+  - **BF16 opt-outs**: status `host` and the reason. A site an algorithm keeps by exact fqn
+    (`bf16_exact`, e.g. [`keep_bf16:rule=input_conv`](keep-bf16.md)) has a top-level
+    `bf16_opt_out` row with `match: exact` and the reason the selecting rule gave; the loader
+    excludes only that site, preserving similarly named siblings. Historical exports without
+    `match` retain substring replay. The v1.0 release export (commit `5ff028e`) carried the
+    since-removed DiT patch-embedding exception of that version's `atlas_v1`; it passed an
+    eight-frame, 96-tensor byte-identical round trip. All historical run-5.3 DiT exports had
+    zero BF16 opt-outs. See the [verification record](release/release_verification.json).
   - **`--skip` layers**: status `skipped`.
 - **`runtime`**:
   - `chip_options`: the recipe's chip defaults, such as `chip_vadd rn` on residual sites, plus any
@@ -79,6 +85,7 @@ the tests also checks the policy. It is meant to become the m2m adapter's policy
   - requirements such as RoPE / timestep tables as host constants, and a run-time amax for
     dynamic sites.
 - **`pending_hardware_rulings`**: the open rulings listed below.
+- **`normalization`** (LeRobot policies, NEW): as in `manifest.json`.
 
 ### `manifest.json` (`atlas_torchao.export_manifest.v1`, NEW)
 
@@ -90,11 +97,18 @@ the tests also checks the policy. It is meant to become the m2m adapter's policy
 - **`model`**: the CLI, model id and checkpoint record. That record holds the sha256 of each
   `*.safetensors` of a local checkpoint or cached HF snapshot. For Pi0 it is
   `pi0_model.checkpoint_info`.
-- **`recipe`**: the `--algo` string, its expanded stack with parameters, the recipe record
-  (`algos.RECIPES` on `atlas_v1`), and the full algorithm record from `algos.quantize`, including
-  per-member calibration and prepare records.
+- **`recipe`**: the `--algo` string (`algo`), the alias it used (`alias`, e.g. `atlas_v1`, or
+  null), the recipe it resolved to (`resolved`), its fully expanded stack (`expanded`) with
+  parameters (`stack`), the recipe record (`algos.recipe_record`: requested token, alias,
+  resolved name, recipe spec, expanded spec, chip defaults), and the full algorithm record from
+  `algos.quantize`, including per-member calibration and prepare records and every exact BF16
+  site with its reason.
 - **`calibration`**: the calibration loader's record (source, n, seed, windows / episodes /
   frames). `data_sha256` is a digest over the calibration batches as the CLI held them.
+- **`normalization`** (LeRobot policies, NEW): `protocol` (`checkpoint` / `dataset`), `status`
+  (`verified` / `legacy-unverified`), `stats_source` (dataset repo, revision, snapshot and rename
+  map, or the checkpoint id), `stats_sha256` (the combined digest) and `stats_sha256_per_key`
+  (`pre` / `post`, per normalized key; `src/policy_norm.stats_sha256`).
 - **`sites`** and **`counts`**: the site census.
 - **`new_decisions`** and **`pending_hardware_rulings`**.
 - **`m2m_manifest_v2_aligned: "partial"`**, with `m2m_manifest_v2_matching_fields` and
@@ -194,6 +208,7 @@ then emit the v2 manifest with these fields filled.
   promoted (1+w) norms and SmolVLA's FP32 action projections stay FP32.
 - BF16 opt-outs have m2m status `host`, and `--skip` layers have status `skipped`.
 - The calibration data digest.
+- The LeRobot `normalization` record and the `--from-export` protocol check.
 
 ## Pending hardware rulings (also in `policy.json` and `manifest.json`)
 

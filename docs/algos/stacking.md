@@ -33,13 +33,14 @@ Members run in a fixed order, whatever order the spec lists them in:
 |---|---|---|
 | transform | `example_identity`, `smoothquant`, `gptq_awq` | Folds change the weights and activations every later decision is taken on. GPTQ rounds the weights that smoothing left. |
 | scale | `granularity`, `static_calib` | Scale choices are taken on the transformed tensors. |
-| exclusion | `mixed_precision` | Layer exclusions and residual passes act on the final layer set. |
+| exclusion | `mixed_precision`, `keep_bf16` | Layer exclusions and residual passes act on the final layer set. |
 
 A registered track not in this table runs after the transforms and before the scale choices.
 
 Model-level hooks in `algos.quantize`:
 
-1. `bf16_layers` of every member (union, in order).
+1. `bf16_layers` and `bf16_exact` of every member (union, in order; an exact site keeps the
+   first member's reason).
 2. For each member in order: `calibrate` (if it needs calibration) on the model as the earlier
    members' `prepare` left it, then its own `prepare`. The calibration data is loaded once and
    shared.

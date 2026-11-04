@@ -5,7 +5,7 @@ set -euo pipefail
 FX_SRC="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 FX_COMMIT="${FX_COMMIT:?set the full commit from the GPU handoff}"
 FX_EXPECTED_MANIFEST_SHA256="${FX_EXPECTED_MANIFEST_SHA256:?copy the full TinyLlama AWQ digest from run-5.3 exports_summary.json}"
-FX_ROOT="${FX_ROOT:-/scratch/lsh/atlas-fp8}"
+FX_ROOT="${FX_ROOT:?set the absolute atlas-fp8 working directory on the GPU machine}"
 FX_BASE="${FX_BASE:-$FX_ROOT/release-check-pgu1ehd7/source}"
 FX_EXPORT="${FX_EXPORT:-$FX_ROOT/exports/atlas_v1/tinyllama/atlas_v1_awq}"
 FX_MODEL="${FX_MODEL:?set the absolute original TinyLlama configuration/checkpoint directory}"
