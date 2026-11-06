@@ -1,0 +1,75 @@
+# Tile-aware quantization: results summary for presentation
+
+Status date: 2026-11-06. Branch `tile-aware` (PR https://github.com/ucb-ee290c/atlas-torchao/pull/5). Every number below names its source. Items marked PENDING were still being produced when this was written; replace them or delete them before presenting.
+
+## 1. What changed
+
+| | Before (`atlas_v1_awq`) | Tile-aware |
+|---|---|---|
+| Weight exponent | one per output channel | one per 32 output channels, constant over all of K |
+| Activation exponent | one per token, run-time | one per 32-token block, or one static value per site |
+| Applied by hardware | not natively: needs extra vector multiplies around the matrix multiply | once, at pop: weight and activation exponents fold into one scale |
+| Exponent entries (TinyLlama) | 394,240 | 12,320 |
+
+Why: the matrix unit multiplies unscaled E4M3 and accumulates in BF16 across K tiles; a power-of-two scale can only be applied when a tile is popped, packed or unpacked, so only exponents constant along K are hardware-native. (`docs/algos/tile-aware.md`)
+
+## 2. Deliverables
+
+- Flow: `w=panel`, `a=block`, `attn=block`; recipes `atlas_v1_awq_tile`, `atlas_v1_tile`, `atlas_v1_awq_tile_static`.
+- Verifier for the tile contract (export and replay) and an independent bundle checker (`scripts/tile_flow/verify_bundle.py`, 25 checks).
+- How-to from any model to the FX graph: `docs/algos/howto-model-to-fx-graph.md`; artifact page https://claude.ai/artifact/CXCiae1VpYf6UsqsoD7QJp (private).
+- Verified native FP8 FX bundles under `/scratch2/lorenhung/atlas-fp8/exports-tile/`: TinyLlama (2 recipes), SmolVLA, Multi-Task DiT, Pi0.
+
+## 3. Verified results
+
+### Native FP8 graph (source: each bundle's `verify_bundle.json` and `fx/graph_inspection.json`)
+
+| Model | qlinear | qconv2d | qk / pv matmul each | Dynamic Linear sites | Checker |
+|---|---|---|---|---|---|
+| TinyLlama (static and dynamic) | 154 | 0 | 22 | 0 / 154 | 25 of 25 |
+| SmolVLA (static) | 302 | 1 | 36 | 1 (unused `lm_head`, declared) | stored file missing, rerun reported by the how-to |
+| Multi-Task DiT (static) | 179 | 0 | 24 | 0 | 25 of 25 after the verifier fix |
+| Pi0 (static) | 420 | 0 | 63 | 0 | 25 of 25 after the verifier fix |
+
+All contractions are native FP8 operations except declared exceptions: `lm_head`, patch-embedding convolutions kept BF16 by `keep_bf16:rule=input_conv`, and the RoPE outer product. DiT's own six attention blocks were plain BF16 in this bundle (see 5).
+
+### Quality, TinyLlama (sources: `exports-tile/tinyllama/*/ppl_w16x512.json`, `quality.json`)
+
+| Export | Perplexity (BF16 12.756) | Final-logits relative L2 | Logit KL | Top-1 agreement |
+|---|---|---|---|---|
+| Previous `atlas_v1_awq` (tl_E0, GPU-calibrated, unrecorded code) | 12.845 | 0.0579 | 0.0185 | 0.936 |
+| Tile static | 12.898 | 0.0536 | 0.0128 | 0.951 |
+| Tile dynamic | 12.829 | 0.0522 | 0.0121 | 0.934 |
+
+The previous export has a different calibration provenance, so the comparison is not controlled. Controlled ablation: PENDING (`docs/algos/tinyllama-ablation.md`).
+
+Accumulation model on nine isolated layers (static export): relative L2 against BF16 is 0.034 to 0.095 for exact float32, 0.035 to 0.096 for MXU1 (`ipt`), 0.047 to 0.117 for MXU0 (`sa`). No RTL run.
+
+### Metadata size (source: `tile_vs_nontile_comparison.json`)
+12,320 groups versus 394,240 rows. Stored bytes are identical today (int32 `[out,1]`, 1,576,960 B); compacted to one E8M0 byte per group it would be 12,320 B.
+
+## 4. Findings
+
+1. **AWQ with panel exponents damages salient rows** (Pi0). Gemma layer-9 q-input relative L2: 0.1273 (tile export) versus 0.0252 (previous export). Swapping the one Gemma layer-0 `up_proj` tensor from a per-channel export gives 0.0230. About 53 of 16384 rows are damaged. Ruled out: missing norm fold, activations, calibration frames, shape bugs. (`docs/algos/tile-pi0-awq-diag.md`, commit 57298dd)
+   - Mitigation, tile-native: GPTQ on the panel grid with AWQ off gives layer 9 at 0.0237 and layer 17 at 0.0207. Full bundle: PENDING (`docs/algos/pi0-gptq-panel-noawq.md`).
+   - Fix: producer-aware AWQ search, branch `tile-awq-producer`, validation PENDING (`docs/algos/awq-producer-aware.md`).
+   - TinyLlama check for the same damage: PENDING.
+2. **Compiler pack range 122..128.** Static activation sites outside the range: TinyLlama 114 of 176, SmolVLA 244 of 316, DiT 88 of 203, Pi0 127 of 483 (`docs/algos/pack-range-options.md`, `pack-plan-census.md`). A power-of-two fold into the producer is exact: 0 differing FP8 bytes over 116,654,080 elements at the 92 out-of-range TinyLlama Linear inputs. Clamping instead changes quantization (TinyLlama perplexity 12.8756 clamp all, 12.8609 Linear only, 12.9027 `p` only, 12.8980 unclamped). Sites where the fold costs no added instruction: 92 / 221 / 24 / 61. Attention `p` needs one multiply per head and 32-row block. Exporter now records a per-site plan (`pack_plan` in `policy.json`, informational; `--require-pack-range` to enforce). Not run on RTL or hardware.
+3. **Reporting defects fixed** (commit 09ef1df): uncalibrated Linears under a static recipe are declared and not marked tile-native; dynamic admission reads `not_checked_dynamic`; declared-versus-unexpected contractions in the verifier; Pi0 manifest crash fixed.
+4. **Hardware findings from the peer harness** (not measured by us): variants `c` (one scalar per 32-column tile) +0.02% to +0.18% cycles, `cb` (one scalar per 32x32 output tile) +0.23% (`/scratch2/lorenhung/atlas-bringup/work/asis-layers/tile/results.md`).
+
+## 5. Limits
+
+- DiT and Pi0 graphs are partial: DiT is one noise-predictor call; Pi0 is a one-step sampler captured non-strict under torch 2.7.1 with three cameras stacked into one SigLIP call (bitwise equal to three calls on a tiny Pi0 and a real-width two-layer SigLIP; real checkpoint not run). No Pi0 or DiT boundary spec exists from the compilers team. (`docs/algos/dit-pi0-full-graph-plan.md`)
+- DiT's own attention: patch written and unit-tested (branch `tile-dit-attn`); re-exported bundle PENDING (`docs/algos/dit-own-attention.md`). Attention matrices have 24 tokens, a partial tile.
+- No quality numbers for SmolVLA, DiT or Pi0.
+- No hardware equivalence claim: exact float32 accumulation plus `sa`/`ipt` models on nine isolated TinyLlama layers; no RTL run by us.
+- Last full-suite run: 810 passed, 1 failure in a new test that was then fixed; no clean full-suite rerun after the final merges.
+
+## 6. Decisions needed (full list in `/scratch2/lorenhung/atlas-fp8/tile-aware-checkin.md`)
+
+1. Compiler owner: widen the pack range, or accept exporter folds (recommended order: exact folds, compiler expansion as fallback, widening after RTL tests).
+2. Pi0: ship with AWQ off now, or wait for the producer-aware AWQ fix.
+3. DiT and Pi0 full graphs: about three days of work for the blocking items; confirm what boundary the compilers team wants.
+4. Matrix unit for projections (MXU0 versus MXU1), `nc` versus reference rule, bias handling, `lm_head`, BF16 opt-out list, `panel` naming.
+5. Hardware team: rescale path (H1), exponent derivation on chip (H2), K-varying scales (H3), pop saturation hole, FP8 maximum 448 versus 240.
