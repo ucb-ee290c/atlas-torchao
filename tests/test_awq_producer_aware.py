@@ -150,3 +150,16 @@ def test_awq_gptq_end_to_end_with_producer_aware_on_panel_grid():
     assert rep["algo"]["gptq_awq"]["producer_aware"] is True
     with torch.no_grad():
         assert torch.isfinite(model(batches[0]).logits.float()).all()
+
+
+def test_diagonal_h_and_identity_producer_hessian_match_the_dense_forms():
+    """The weights-only proxy used by scripts/tile_diag/awq_producer_validate.py: a 1-D H is the diagonal of the
+    dense H, and a producer H of None is the identity."""
+    Wu, Wd, Hp, Hd, sx = _pair(seed=1)
+    dense = torch.diag(sx ** 2) * 512 / 3
+    c = ga.producer_row_weights(Wu, None, Wd, sx ** 2 * 512 / 3)
+    c_dense = ga.producer_row_weights(Wu, torch.eye(Wu.shape[1]), Wd, torch.diag(dense))
+    assert torch.allclose(c, c_dense, rtol=1e-6)
+    a = ga.awq_search([Wd], dense, sx, 8, PANEL, producer={"W": Wu, "H": torch.eye(Wu.shape[1]), "c": c, "exp_fn": PANEL})
+    b = ga.awq_search([Wd], sx ** 2 * 512 / 3, sx, 8, PANEL, producer={"W": Wu, "H": None, "c": c, "exp_fn": PANEL})
+    assert a[1] == b[1] and torch.equal(a[0], b[0]) and abs(a[2] - b[2]) <= 1e-4 * abs(a[2])
