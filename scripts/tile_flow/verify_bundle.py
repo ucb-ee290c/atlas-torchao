@@ -188,6 +188,23 @@ def pack_plan_report(policy, export, fx):
             "sites_with_recorded_plan": sum(1 for r in recorded.values() if r is not None)}, recorded
 
 
+def pack_fold_report(policy, plan_report):
+    """INFORMATIONAL (never a failing check): the pack fold recorded in the export policy (src/pack_fold.py) next to the sites
+    that are STILL outside the admitted range according to the recomputed plan, by producer class and plan cost."""
+    rec = plan_report["recomputed"]
+    out = {"informational": True, "folded": "pack_fold_summary" in policy,
+           "sites_still_out_of_range": rec.get("sites_outside"), "static_sites": rec.get("static_sites"),
+           "still_out_of_range_by_class": rec.get("outside_by_class"), "still_out_of_range_by_cost": rec.get("outside_by_cost"),
+           "admitted_range": rec.get("admitted_range")}
+    s = policy.get("pack_fold_summary")
+    if s:
+        out.update({"sites_folded": s["sites_folded"], "outside_before_fold": s["outside_before"],
+                    "outside_after_fold_recorded": s["outside_after"], "folded_by_class": s["folded_by_class"],
+                    "recorded_matches_recomputed": s["outside_after"] == rec.get("sites_outside"),
+                    "pv_pop_shift_sites": sorted(n for n, x in policy["sites"].items() if x.get("pv_pop_shift"))})
+    return out
+
+
 def run(export, fx, out, allow_fallback=False, allow_unquantized_attention=True, require_pack_range=False):
     policy = json.loads((export / "policy.json").read_text())
     res = {"export_dir": str(export), "fx_dir": str(fx), "checks": {}}
@@ -456,6 +473,7 @@ def run(export, fx, out, allow_fallback=False, allow_unquantized_attention=True,
         "static_sites_checked": adm.get("sites_checked"), "static_sites_outside": adm.get("sites_outside"),
         "dynamic_fixture": {k: v for k, v in dyn_adm.items() if k != "codes"} if isinstance(dyn_adm, dict) else dyn_adm}
     res["pack_plan"], recorded_plan = pack_plan_report(policy, export, fx)      # informational, never a failing check
+    res["pack_fold"] = pack_fold_report(policy, res["pack_plan"])               # informational: sites still out of range
     if require_pack_range:
         exps = pack_plan.static_sites(policy)
         lo, hi = pack_plan.PACK_ADMISSION
@@ -474,7 +492,9 @@ def run(export, fx, out, allow_fallback=False, allow_unquantized_attention=True,
     out.write_text(json.dumps(res, indent=1))
     print(json.dumps({"ok": res["ok"], "failed": fails, "weights": res["weights"], "graph_atlas": res["graph"]["call_function_targets_atlas"],
                       "unquantized_attention": res["graph"]["unquantized_attention"]["count"],
-                      "uncalibrated_fallback": len(fb_sites)}, indent=1))
+                      "uncalibrated_fallback": len(fb_sites),
+                      "pack_range_sites_still_outside": res["pack_fold"]["sites_still_out_of_range"],
+                      "pack_fold_applied": res["pack_fold"]["folded"]}, indent=1))
     return res
 
 

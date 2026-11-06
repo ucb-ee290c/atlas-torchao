@@ -46,15 +46,17 @@ from algos import base as algo_hooks
 ATTN_KEY = "atlas_ref"
 
 
-def _mm(fm, a_q, a_s, b_q, b_s, dtype_out=torch.float32, role=None):
+def _mm(fm, a_q, a_s, b_q, b_s, dtype_out=torch.float32, role=None, pop_shift=0):
     """a [..., M, K] times b [..., N, K]^T on cast operands; result * 2^(sa+sb) in float32.
     `role` ("qk" or "pv") names the matmul for fx_export's native-FP8 capture, which swaps `_cast` and
-    `_mm`; it does not change the result."""
+    `_mm`; it does not change the result. `pop_shift` (NEW, default 0, only the pv matmul of a folded attention
+    site passes it; docs/algos/pack-fold.md): the result is multiplied by 2^pop_shift (exact in float32)."""
     if fm is not None:
         y = fm(rn.e4m3_unpack(a_q), rn.e4m3_unpack(b_q), None)
-        return y * torch.exp2((a_s + b_s).float())
+        return y * torch.exp2((a_s + b_s + int(pop_shift)).float())
     # NEW: reference profile without an MXU model: matmul on the dequantized operands in float32.
-    return rn.dq_matmul_nt(a_q, a_s, b_q, b_s)
+    y = rn.dq_matmul_nt(a_q, a_s, b_q, b_s)
+    return y if not pop_shift else y * (2.0 ** int(pop_shift))
 
 
 def _cast(algo, site, operand, x, dims):
@@ -131,8 +133,13 @@ def ref_attention(q, k, v, scaling, mask=None, fm_qk=None, fm_av=None, variant="
     p_q, s_p = _cast(algo, site, "p", p, hd)                                       # 689
     v_q, s_v = _cast(algo, site, "v", v, hd)                                       # 690
     v_t_q = v_q.transpose(-1, -2)                                                  # v_norm.T (696)
+    pv_shift = algo_hooks.attn_pv_shift(algo, site)         # NEW: folded pack exponent of the o_proj input (0 = unchanged)
     if two_term == "qp":
         out = _mm_two_term(fm_av, p, p_q, s_p, v_t_q, s_v, algo, site, "p", hd)
+        if pv_shift:
+            out = out * (2.0 ** pv_shift)                   # exact: power of two on a BF16 value
+    elif pv_shift:
+        out = _mm(fm_av, p_q, s_p, v_t_q, s_v, role="pv", pop_shift=pv_shift)
     else:
         out = _mm(fm_av, p_q, s_p, v_t_q, s_v, role="pv")                          # 696
     return out.to(torch.bfloat16)                                                  # 696-698

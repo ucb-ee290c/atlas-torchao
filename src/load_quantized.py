@@ -59,6 +59,10 @@ class PolicyAlgo(Algo):
         exp = self.tensors[s["scale_exp"]].to(w.device)
         return Scale(exp, s["granularity"], block=int(s.get("block", 0)), dynamic=False)
 
+    def pv_pop_shift(self, name):
+        """Folded pack exponent of the attention output (docs/algos/pack-fold.md); 0 when the export has no fold."""
+        return int((self.sites.get(name) or {}).get("pv_pop_shift", 0))
+
     def residual_passes(self, name, kind):
         r = self._site(name).get("residual_passes")
         return r["kind"] if r else None
