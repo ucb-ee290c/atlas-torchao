@@ -258,7 +258,14 @@ def run(export, fx, out, allow_fallback=False, allow_unquantized_attention=True,
     # inventory (lifted buffers, scopes, operand wiring) and cross-checked with the bundle's declarations.
     prog = torch.export.load(fx / "model.pt2")
     gi = json.loads((fx / "graph_inspection.json").read_text())
-    bufs = dict(prog.named_buffers())
+    bufs_all = dict(prog.named_buffers())
+    # a non-strict export lifts the buffers of never-called modules as inputs that no node reads: a buffer counts as held by
+    # the graph only when a node consumes its placeholder (a strict export has none of those, so nothing changes there)
+    placeholder_users = {sp.target: bool(next(n for n in prog.graph.nodes if n.name == sp.arg.name).users)
+                         for sp in prog.graph_signature.input_specs
+                         if sp.kind.name == "BUFFER" and hasattr(sp.arg, "name") and isinstance(sp.target, str)}
+    bufs = {k: v for k, v in bufs_all.items() if placeholder_users.get(k, True)}
+    lifted_unused_buffers = sorted(set(bufs_all) - set(bufs))
     code_stems = _wrapper_stems(bufs, "weight_codes")
     exp_stems = _wrapper_stems(bufs, "weight_scale_exp")
     in_graph = {n for n in sites if n in code_stems}
@@ -273,7 +280,16 @@ def run(export, fx, out, allow_fallback=False, allow_unquantized_attention=True,
                               "sites_in_graph_by_buffers": len(in_graph), "unused_in_graph_derived": unused_derived,
                               "unused_declared_by_bundle": unused_declared, "derived_equals_declared": unused_agree}
 
-    attn_policy = sorted(n for n, s in policy["sites"].items() if s["kind"] == "attention" and s["status"] == "quantized")
+    attn_all = sorted(n for n, s in policy["sites"].items() if s["kind"] == "attention" and s["status"] == "quantized")
+    # Attention sites a per-phase graph does not hold (the boundary never calls them): derived from the graph as "no
+    # quantize_act tagged '<site>:<operand>'" and cross-checked with graph_inspection.unused_attention_modules. A bundle
+    # whose quantize_act nodes carry no tag (saved before tags) has no such sites.
+    act_tags = {str(n.args[6]).rpartition(":")[0] for n in prog.graph.nodes if n.op == "call_function"
+                and str(n.target) == "atlas.quantize_act.default" and len(n.args) > 6 and ":" in str(n.args[6])}
+    absent_derived = sorted(a for a in attn_all if a not in act_tags) if act_tags else []
+    absent_declared = sorted(r["site"] for r in gi.get("unused_attention_modules", []))
+    absent_agree = absent_derived == absent_declared
+    attn_policy = [a for a in attn_all if a not in absent_derived]
     qk_nodes = [n for n in prog.graph.nodes if n.op == "call_function" and str(n.target) == "atlas.qk_matmul.default"]
     pv_nodes = [n for n in prog.graph.nodes if n.op == "call_function" and str(n.target) == "atlas.pv_matmul.default"]
     scoped = {k: collections.Counter() for k in ("qk", "pv")}
@@ -292,11 +308,12 @@ def run(export, fx, out, allow_fallback=False, allow_unquantized_attention=True,
     scopeless_expected = sum(rec_pairs.get(a, 0) for a in scopeless_sites)
     per_site_ok = all(scoped["qk"][a] == scoped["pv"][a] and (scoped["qk"][a] == rec_pairs.get(a, scoped["qk"][a]))
                       for a in attn_policy if a not in scopeless_sites)
-    attn_ok = (per_site_ok and unscoped["qk"] == unscoped["pv"] == scopeless_expected
+    attn_ok = (absent_agree and per_site_ok and unscoped["qk"] == unscoped["pv"] == scopeless_expected
                and all(rec_pairs.get(a, 0) >= 1 for a in scopeless_sites)
                and (bool(scopeless_sites) or unscoped["qk"] == 0))
     pairs_expected = sum(scoped["qk"].values()) + scopeless_expected
-    res["graph_attention"] = {"policy_sites": len(attn_policy), "scoped_pairs": sum(scoped["qk"].values()),
+    res["graph_attention"] = {"policy_sites": len(attn_all), "sites_in_graph": len(attn_policy),
+                              "absent_sites_derived": absent_derived, "absent_sites_declared": absent_declared, "scoped_pairs": sum(scoped["qk"].values()),
                               "scope_less_pairs": unscoped["qk"], "scope_less_sites": scopeless_sites,
                               "scope_less_pairs_declared": scopeless_expected,
                               "pairs_by_site": {a: (scoped["qk"][a] or rec_pairs.get(a, 0)) for a in attn_policy}}
@@ -374,16 +391,30 @@ def run(export, fx, out, allow_fallback=False, allow_unquantized_attention=True,
     n_q = len(used)                      # quantized Linear + Conv2d sites the graph holds (policy sites minus never-called ones)
     n_attn = len(attn_policy)
     cnt = lambda t: targets.get(f"atlas.{t}.default", 0)  # noqa: E731
+    # A module the boundary calls N times is one policy site and N qlinear / qconv2d nodes on the same buffer pair. The node
+    # count per site is read from the graph (nodes whose weight-code operand is the site's placeholder) and must equal the
+    # `calls` the inspection records (1 when absent: bundles saved before call counting).
+    placeholder_of = {sp.target: sp.arg.name for sp in prog.graph_signature.input_specs
+                      if sp.kind.name == "BUFFER" and hasattr(sp.arg, "name") and isinstance(sp.target, str)}
+    nodes_on_codes = collections.Counter(getattr(n.args[2], "name", None) for n in prog.graph.nodes if n.op == "call_function"
+                                         and str(n.target) in ("atlas.qlinear.default", "atlas.qconv2d.default"))
+    calls_derived = {n: nodes_on_codes.get(placeholder_of.get(code_stems[n]), 0) for n in used}
+    calls_declared = {r["site"]: r.get("calls", 1) for r in gi["weight_site_bindings"]}
+    n_lin_nodes = sum(c for n, c in calls_derived.items() if used[n]["kind"] == "linear")
+    n_conv_nodes = sum(c for n, c in calls_derived.items() if used[n]["kind"] == "conv2d")
+    multi_call = {n: c for n, c in calls_derived.items() if c != 1}
     check("graph_qlinear_count_equals_quantized_linears",
-          cnt("qlinear") == n_lin_used and cnt("qconv2d") == n_conv_used and unused_agree,
-          {"qlinear": cnt("qlinear"), "policy_linear_in_graph": n_lin_used, "qconv2d": cnt("qconv2d"),
-           "policy_conv2d_in_graph": n_conv_used, "policy_sites_not_in_graph": unused_derived,
-           "declared_unused": unused_declared})
+          cnt("qlinear") == n_lin_nodes and cnt("qconv2d") == n_conv_nodes and unused_agree
+          and all(c >= 1 for c in calls_derived.values()) and calls_derived == {n: calls_declared.get(n, 1) for n in used},
+          {"qlinear": cnt("qlinear"), "policy_linear_in_graph": n_lin_used, "qlinear_nodes_derived": n_lin_nodes,
+           "qconv2d": cnt("qconv2d"), "policy_conv2d_in_graph": n_conv_used, "qconv2d_nodes_derived": n_conv_nodes,
+           "sites_called_more_than_once": multi_call,
+           "policy_sites_not_in_graph": unused_derived, "declared_unused": unused_declared})
     check("graph_qk_pv_counts_equal_attention_sites",
           cnt("qk_matmul") == pairs_expected and cnt("pv_matmul") == pairs_expected and attn_ok,
           {"qk": cnt("qk_matmul"), "pv": cnt("pv_matmul"), "expected_pairs": pairs_expected, "policy_sites": n_attn,
            **{k: v for k, v in res["graph_attention"].items() if k != "pairs_by_site"}})
-    act_expected = n_q + 4 * pairs_expected
+    act_expected = n_lin_nodes + n_conv_nodes + 4 * pairs_expected
     check("graph_quantize_act_count",
           cnt("quantize_act") == act_expected and set(cons_count) <= {"qlinear", "qconv2d", "qk_matmul", "pv_matmul"}
           and cons_count["qlinear"] == cnt("qlinear") and cons_count["qconv2d"] == cnt("qconv2d")
