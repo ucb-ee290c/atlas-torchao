@@ -15,7 +15,13 @@ import reference.ref_numerics as rn
 import torch
 import torch.nn.functional as F
 from test_export import _quantize_export, _reload
+from test_fx_export import PINNED_TORCH
 from test_ladder import FAST
+
+# Same guard as tests/test_fx_export.py: older torch cannot torch.export these captures.
+pytestmark = pytest.mark.skipif(torch.__version__ < PINNED_TORCH,
+                                reason=f"torch.export captures need the pinned torch {PINNED_TORCH} "
+                                       f"(found {torch.__version__})")
 
 STORAGES = ["uint8", "float8_e4m3fn"]
 INPUTS = [(torch.arange(8, dtype=torch.long).reshape(1, 8),),
@@ -191,6 +197,8 @@ def test_tiny_llama_native_capture(tmp_path, spec, storage):
                                   native_fp8=storage)
     assert report["status"] == "passed" and report["weight_sites_verified"] == 7
     assert report["fresh_process_reload"]["atlas_qlinear_nodes"] == 7
+    assert report["fresh_process_reload"]["atlas_qk_matmul_nodes"] == 1
+    assert report["fresh_process_reload"]["atlas_pv_matmul_nodes"] == 1
     assert report["fresh_process_reload"]["model_replay_modules_imported"] == []
     detail = report["native_fp8_detail"]
     assert len(detail["sites"]) == 7 and detail["outputs_identical_to_decode_graph"]
@@ -198,12 +206,16 @@ def test_tiny_llama_native_capture(tmp_path, spec, storage):
     inspection = json.loads((tmp_path / "fx" / "graph_inspection.json").read_text())
     rows = inspection["weight_site_bindings"]
     assert len(rows) == 7 and all(row["native"] for row in rows)
-    emulated = inspection["still_emulated"]["emulated_modules"]
-    # exactly the attention operand quantization remains emulated: Q.K and P.V contractions
-    assert list(emulated) == ["model.model.layers.0.self_attn"]
-    assert emulated["model.model.layers.0.self_attn"]["kind"] == "attention"
-    assert len(emulated["model.model.layers.0.self_attn"]["contractions"]) == 2
-    assert emulated["model.model.layers.0.self_attn"]["scale_derivation"]
+    # attention is native too: nothing is left emulated; Q.K and P.V are atlas ops around BF16 softmax nodes
+    assert inspection["still_emulated"]["emulated_modules"] == {}
+    (attention,) = inspection["native_fp8_attention_modules"]
+    assert attention["module"] == "model.model.layers.0.self_attn" and attention["pairs"] == 1
+    assert len(attention["quantize_act"]) == 4
+    assert {"aten._softmax.default", "aten.softmax.int"} & set(attention["remaining_nodes_in_module_by_target"])
+    assert not any(t.endswith(("frexp.Tensor", "exp2.default", "matmul.default", "bitwise_and.Tensor"))
+                   for t in attention["remaining_nodes_in_module_by_target"])
+    assert [row["site"] for row in inspection["bf16_by_policy"]] == ["lm_head"]
+    assert inspection["bf16_by_policy"][0]["weight_dtype"] == "bfloat16"
     # outputs against eager and the saved decode graph on both inputs
     saved = torch.export.load(tmp_path / "fx" / "model.pt2").module()
     with torch.no_grad():
@@ -261,7 +273,7 @@ def test_frozen_activation_input_is_refused_in_native_graph(linear_replay):
     module, policy, cases = linear_replay
     layer = module[0]
     layer.register_buffer("frozen_input", cases[0][0].clone())
-    with fx_export._native_linears(module, policy, "uint8") as rules:
+    with fx_export._native_sites(module, policy, "uint8") as plan:
         def frozen(x):
             codes, scale = torch.ops.atlas.quantize_act(layer.frozen_input, "dynamic", "token", "nc", None, "uint8")
             return torch.ops.atlas.qlinear(codes, scale, layer.weight_codes, layer.weight_scale_exp, layer.bias,
@@ -269,16 +281,16 @@ def test_frozen_activation_input_is_refused_in_native_graph(linear_replay):
         layer.forward = frozen
         program = torch.export.export(module, cases[0], strict=True)
     with pytest.raises(fx_export.FXVerificationError, match="does not depend on the graph input"):
-        fx_export.inspect_graph(program, module, policy, rules, "uint8")
+        fx_export.inspect_graph(program, module, policy, plan, "uint8")
 
 
 def test_wrong_activation_rule_is_refused_in_native_graph(linear_replay):
     module, policy, cases = linear_replay
-    with fx_export._native_linears(module, policy, "uint8") as rules:
+    with fx_export._native_sites(module, policy, "uint8") as plan:
         program = torch.export.export(module, cases[0], strict=True)
     with pytest.raises(fx_export.FXVerificationError, match="differ from the policy rule"):
-        fx_export.inspect_graph(program, module, policy, {"0": ("dynamic", "tensor", "ref", None)}, "uint8")
-    assert rules == {"0": ("dynamic", "token", "nc", None)}
+        fx_export.inspect_graph(program, module, policy, {**plan, "linear": {"0": ("dynamic", "tensor", "ref", None)}}, "uint8")
+    assert plan["linear"] == {"0": ("dynamic", "token", "nc", None)}
 
 
 def test_block_scaled_linear_stays_on_the_decode_path(tmp_path):
@@ -290,3 +302,273 @@ def test_block_scaled_linear_stays_on_the_decode_path(tmp_path):
     # the default decode-based capture of the same layer is unaffected
     assert fx_export.capture_fx(module, cases, tmp_path / "ok", policy=policy,
                                 fresh_process=False)["status"] == "passed"
+
+
+# ---- attention -----------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("reduce", ["head", "token"])
+def test_attention_ops_equal_ref_attention_mm_and_cast(reduce):
+    import reference.ref_attention as ra
+
+    torch.manual_seed(3)
+    q = torch.randn(2, 4, 5, 16, dtype=torch.bfloat16)
+    k = torch.randn(2, 4, 7, 16, dtype=torch.bfloat16)
+    p = torch.softmax(torch.randn(2, 4, 5, 7), dim=-1).to(torch.bfloat16)
+    v = torch.randn(2, 4, 7, 16, dtype=torch.bfloat16)
+    dims = {"head": (-2, -1), "token": (-1,)}[reduce]
+    with torch.no_grad():
+        q_q, s_q = torch.ops.atlas.quantize_act(q, "dynamic", reduce, "nc", None, "uint8")
+        assert torch.equal(s_q, __import__("algos.granularity", fromlist=["x"]).scale_exp(q, dims, "nc"))
+        assert list(s_q.shape) == ([2, 4, 1, 1] if reduce == "head" else [2, 4, 5, 1])
+        k_q, s_k = torch.ops.atlas.quantize_act(k, "dynamic", "head", "nc", None, "uint8")
+        assert torch.equal(torch.ops.atlas.qk_matmul(q_q, s_q, k_q, s_k), ra._mm(None, q_q, s_q, k_q, s_k))
+        p_q, s_p = torch.ops.atlas.quantize_act(p, "dynamic", reduce, "ref", None, "float8_e4m3fn")
+        v_q, s_v = torch.ops.atlas.quantize_act(v, "dynamic", "head", "ref", None, "float8_e4m3fn")
+        vt = v_q.transpose(-1, -2)
+        assert torch.equal(torch.ops.atlas.pv_matmul(p_q, s_p, vt, s_v), ra._mm(None, p_q, s_p, vt, s_v))
+        # the reference cast is the same code path as rn.quantize with dims
+        ref_q, ref_s = rn.quantize(q, (-2, -1))
+        head_q, head_s = torch.ops.atlas.quantize_act(q, "dynamic", "head", "ref", None, "uint8")
+        assert torch.equal(ref_q, head_q) and torch.equal(ref_s, head_s)
+
+
+def test_attention_native_ops_have_fake_implementations():
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode():
+        q = torch.empty(2, 4, 5, 16, dtype=torch.bfloat16)
+        codes, s = torch.ops.atlas.quantize_act(q, "dynamic", "head", "nc", None, "uint8")
+        assert list(s.shape) == [2, 4, 1, 1]
+        scores = torch.ops.atlas.qk_matmul(codes, s, torch.empty(2, 4, 7, 16, dtype=torch.uint8), s)
+        assert scores.shape == (2, 4, 5, 7) and scores.dtype == torch.float32
+        out = torch.ops.atlas.pv_matmul(torch.empty(2, 4, 5, 7, dtype=torch.uint8), s,
+                                        torch.empty(2, 4, 16, 7, dtype=torch.uint8), s)
+        assert out.shape == (2, 4, 5, 16)
+
+
+def _tiny_native(tmp_path, spec, storage="uint8", fresh=True):
+    eager, directory, _, options = _quantize_export(tmp_path, spec, layers=1)
+    loaded = fx_export.CausalLogits(_reload(directory, "ref_conv", options, layers=1)).eval()
+    policy = json.loads((directory / "policy.json").read_text())
+    report = fx_export.capture_fx(loaded, INPUTS, tmp_path / "fx", policy=policy, fresh_process=fresh,
+                                  native_fp8=storage)
+    return eager, report, json.loads((tmp_path / "fx" / "graph_inspection.json").read_text())
+
+
+def test_token_attention_rule_and_float8_storage_are_native(tmp_path):
+    eager, report, inspection = _tiny_native(tmp_path, "granularity:w=channel,a=token,rule=nc,attn=token",
+                                             "float8_e4m3fn")
+    (attention,) = inspection["native_fp8_attention_modules"]
+    assert {op: rule["reduce"] for op, rule in attention["operand_rules"].items()} == \
+        {"q": "token", "k": "head", "p": "token", "v": "head"}
+    assert report["native_fp8_detail"]["outputs_identical_to_decode_graph"]
+    saved = torch.export.load(tmp_path / "fx" / "model.pt2").module()
+    with torch.no_grad():
+        for (ids,) in INPUTS:
+            assert torch.equal(saved(ids), eager(ids, use_cache=False).logits)
+    targets = [str(n.target) for n in torch.export.load(tmp_path / "fx" / "model.pt2").graph.nodes
+               if n.op == "call_function"]
+    assert targets.count("atlas.qk_matmul.default") == 1 and targets.count("atlas.pv_matmul.default") == 1
+    assert targets.count("atlas.quantize_act.default") == 7 + 4
+
+
+def test_attention_softmax_stays_a_visible_node_between_the_matmuls(tmp_path):
+    _, _, inspection = _tiny_native(tmp_path, "atlas_v1_awq", fresh=False)
+    program = torch.export.load(tmp_path / "fx" / "model.pt2")
+    nodes = list(program.graph.nodes)
+    qk = next(n for n in nodes if n.target == torch.ops.atlas.qk_matmul.default)
+    pv = next(n for n in nodes if n.target == torch.ops.atlas.pv_matmul.default)
+    softmax = [n for n in nodes if "softmax" in str(n.target)]
+    assert len(softmax) == 1 and nodes.index(qk) < nodes.index(softmax[0]) < nodes.index(pv)
+    assert qk in fx_export._ancestors(softmax[0]) and softmax[0] in fx_export._ancestors(pv)
+    remaining = inspection["native_fp8_attention_modules"][0]["remaining_nodes_in_module_by_target"]
+    assert remaining["aten.softmax.int"] == 1 and "aten.frexp.Tensor" not in remaining
+
+
+def test_attention_native_refuses_frozen_operand_and_wrong_rule(tmp_path):
+    eager, directory, _, options = _quantize_export(tmp_path, "atlas_v1_awq", layers=1)
+    wrapped = fx_export.CausalLogits(_reload(directory, "ref_conv", options, layers=1)).eval()
+    policy = json.loads((directory / "policy.json").read_text())
+    import reference.ref_attention as ra
+
+    with fx_export._meta_placeholders(wrapped), fx_export._native_sites(wrapped, policy, "uint8") as plan:
+        program = torch.export.export(wrapped, INPUTS[0], strict=True)
+    fx_export.inspect_graph(program, wrapped, policy, plan, "uint8")          # the genuine capture passes
+    wrong = {**plan, "attention": {**plan["attention"], "sites": {
+        site: {**rules, "p": ("dynamic", "token", "nc", None)} for site, rules in plan["attention"]["sites"].items()}}}
+    with pytest.raises(fx_export.FXVerificationError, match="differ from the policy rule"):
+        fx_export.inspect_graph(program, wrapped, policy, wrong, "uint8")
+    original = ra._cast
+    with fx_export._meta_placeholders(wrapped), fx_export._native_sites(wrapped, policy, "uint8") as plan:
+        native_cast = ra._cast
+        frozen = torch.randn(1, 4, 8, 16, dtype=torch.bfloat16)
+
+        def cast_frozen_k(algo, site, operand, x, dims):
+            return native_cast(algo, site, operand, frozen if operand == "k" else x, dims)
+        ra._cast = cast_frozen_k
+        program = torch.export.export(wrapped, INPUTS[0], strict=True)
+    assert ra._cast is original
+    # a constant tensor is not a graph input, so the k exponent no longer depends on the input
+    with pytest.raises(fx_export.FXVerificationError, match="does not depend on the graph input"):
+        fx_export.inspect_graph(program, wrapped, policy, plan, "uint8")
+
+
+def test_native_capture_restores_ref_attention_functions(tmp_path):
+    import reference.ref_attention as ra
+
+    cast, mm = ra._cast, ra._mm
+    _tiny_native(tmp_path, "none", fresh=False)
+    assert ra._cast is cast and ra._mm is mm
+
+
+# ---- Conv2d and BF16-by-policy sites --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("spec", ["granularity:w=channel,a=token,rule=nc", "none"])
+def test_conv2d_native_capture(tmp_path, spec):
+    from test_ladder import ConvNet
+
+    torch.manual_seed(0)
+    module = ConvNet().to(torch.bfloat16).eval()
+    algo = algos.make(spec)
+    report = algos.quantize(module, "ref_conv", options=dict(FAST), algo=algo)
+    policy = quant_export.build_policy(module, "ref_conv", report, algo, dict(FAST), [], [], {}, {})
+    x = torch.randn(2, 3, 8, 8, dtype=torch.bfloat16)
+    cases = [(x,), (x * 4,)]
+    result = fx_export.capture_fx(module, cases, tmp_path / "fx", policy=policy, fresh_process=True,
+                                  native_fp8="uint8")
+    assert result["status"] == "passed" and result["fresh_process_reload"]["atlas_qconv2d_nodes"] == 1
+    inspection = json.loads((tmp_path / "fx" / "graph_inspection.json").read_text())
+    assert inspection["native_fp8_conv2d_sites"] == 1 and inspection["native_fp8_linear_sites"] == 1
+    conv_row = next(row for row in inspection["weight_site_bindings"] if row["kind"] == "conv2d")
+    assert len(conv_row["im2col_nodes"]) == 1 and conv_row["code_dtype"] == "uint8"
+    assert inspection["still_emulated"]["emulated_modules"] == {}
+    program = torch.export.load(tmp_path / "fx" / "model.pt2")
+    targets = [str(n.target) for n in program.graph.nodes if n.op == "call_function"]
+    assert targets.count("atlas.qconv2d.default") == 1 and targets.count("aten.im2col.default") == 1
+    codes = dict(program.named_buffers())["conv.weight_codes"]
+    assert codes.shape == (8, 27) and codes.dtype == torch.uint8            # flattened [out, in*kh*kw]
+    decode = torch.export.export(module, cases[0], strict=True)
+    with torch.no_grad():
+        for args in cases:
+            assert torch.equal(program.module()(*args), module(*args))
+            assert torch.equal(program.module()(*args), decode.module()(*args))
+
+
+def test_conv2d_geometry_mismatch_keeps_the_decode_path(tmp_path):
+    from test_ladder import ConvNet
+
+    torch.manual_seed(0)
+    module = ConvNet().to(torch.bfloat16).eval()
+    algo = algos.make("granularity:w=channel,a=token,rule=nc")
+    report = algos.quantize(module, "ref_conv", options=dict(FAST), algo=algo)
+    policy = quant_export.build_policy(module, "ref_conv", report, algo, dict(FAST), [], [], {}, {})
+    policy["sites"]["conv"]["conv"]["stride"] = [2, 2]
+    assert list(fx_export.native_candidates(module, policy)) == ["fc"]
+
+
+def test_dit_patch_embedding_exception_stays_a_visible_bf16_conv(tmp_path):
+    from test_algo_atlas_v1 import DIT_PATCH, TinyDiT, dit_calib
+
+    torch.manual_seed(21)
+    module = TinyDiT()
+    algo = algos.make("atlas_v1+keep_bf16:rule=input_conv")
+    report = algos.quantize(module, "ref_conv", options=dict(FAST), algo=algo, calib=dit_calib())
+    policy = quant_export.build_policy(module, "ref_conv", report, algo, dict(FAST), [],
+                                       report["algo"]["bf16_opt_out"], {}, {})
+    x = torch.randn(2, 3, 4, 4, dtype=torch.bfloat16)
+    result = fx_export.capture_fx(module, [(x,), (x * 3,)], tmp_path / "fx", policy=policy,
+                                  fresh_process=True, native_fp8="uint8")
+    assert result["status"] == "passed"
+    inspection = json.loads((tmp_path / "fx" / "graph_inspection.json").read_text())
+    (row,) = inspection["bf16_by_policy"]
+    assert row["site"] == DIT_PATCH and row["status"] == "host" and row["in_graph"]
+    assert row["weight_dtype"] == "bfloat16" and row["contraction_nodes"]
+    assert inspection["native_fp8_conv2d_sites"] == 1 and inspection["native_fp8_linear_sites"] == 1
+    assert row["module"] not in {r["module"] for r in inspection["weight_site_bindings"]}
+    program = torch.export.load(tmp_path / "fx" / "model.pt2")
+    patch_nodes = [n for n in program.graph.nodes if n.op == "call_function"
+                   and list((n.meta.get("nn_module_stack") or {"": ("",)}).values())[-1][0] == DIT_PATCH]
+    assert [str(n.target) for n in patch_nodes if "atlas" in str(n.target)] == []
+    assert any("conv" in str(n.target) for n in patch_nodes)
+    assert not program.state_dict[DIT_PATCH + ".weight"].is_meta
+    with torch.no_grad():
+        assert torch.equal(program.module()(x), module(x))
+
+
+def test_default_capture_also_reports_bf16_by_policy(tmp_path):
+    eager, directory, _, options = _quantize_export(tmp_path, "atlas_v1_awq", layers=1)
+    wrapped = fx_export.CausalLogits(_reload(directory, "ref_conv", options, layers=1)).eval()
+    policy = json.loads((directory / "policy.json").read_text())
+    fx_export.capture_fx(wrapped, INPUTS, tmp_path / "fx", policy=policy, fresh_process=False)
+    inspection = json.loads((tmp_path / "fx" / "graph_inspection.json").read_text())
+    assert [(r["site"], r["status"]) for r in inspection["bf16_by_policy"]] == [("lm_head", "skipped")]
+    assert "still_emulated" not in inspection
+
+
+class _OneOfTwo(torch.nn.Module):
+    """A quantized layer the boundary never calls (like SmolVLA's VLM lm_head)."""
+
+    def __init__(self):
+        super().__init__()
+        self.used = torch.nn.Linear(8, 4)
+        self.idle = torch.nn.Linear(8, 4)
+
+    def forward(self, x):
+        return self.used(x)
+
+
+@pytest.mark.parametrize("native", [None, "uint8"])
+def test_quantized_layer_the_boundary_never_calls_is_recorded(tmp_path, native):
+    torch.manual_seed(5)
+    module = _OneOfTwo().to(torch.bfloat16).eval()
+    algo = algos.make("granularity:w=channel,a=token,rule=nc")
+    report = algos.quantize(module, "ref_conv", options=dict(FAST), algo=algo)
+    policy = quant_export.build_policy(module, "ref_conv", report, algo, dict(FAST), [], [], {}, {})
+    x = torch.randn(2, 8, dtype=torch.bfloat16)
+    result = fx_export.capture_fx(module, [(x,), (x * 2,)], tmp_path / "fx", policy=policy, fresh_process=True,
+                                  native_fp8=native)
+    assert result["status"] == "passed" and result["unused_quantized_modules"] == ["idle"]
+    inspection = json.loads((tmp_path / "fx" / "graph_inspection.json").read_text())
+    assert inspection["unused_quantized_modules"] == [{"site": "idle", "module": "idle"}]
+    assert inspection["weight_sites_verified"] == 1
+    inventory = json.loads((tmp_path / "fx" / "buffer_inventory.json").read_text())
+    assert sorted(inventory) == ["used.weight_codes", "used.weight_scale_exp"]
+
+
+class _InPlaceRotate(torch.nn.Module):
+    """SmolVLA's apply_rope fills `empty_like(x)` through slice assignments: the data flow is real but there is
+    no FX edge from x to the buffer's later uses."""
+
+    def __init__(self, features, frozen=False):
+        super().__init__()
+        self.proj = torch.nn.Linear(features, 4)
+        self.frozen = frozen
+        self.register_buffer("constant", torch.ones(2, features, dtype=torch.bfloat16))
+
+    def forward(self, x):
+        half = x.shape[-1] // 2
+        source = self.constant if self.frozen else x
+        res = torch.empty_like(x)
+        res[..., :half] = source[..., half:]
+        res[..., half:] = source[..., :half]
+        return self.proj(res)
+
+
+def _in_place_capture(tmp_path, frozen):
+    torch.manual_seed(7)
+    module = _InPlaceRotate(8, frozen).to(torch.bfloat16).eval()
+    algo = algos.make("granularity:w=channel,a=token,rule=nc")
+    report = algos.quantize(module, "ref_conv", options=dict(FAST), algo=algo)
+    policy = quant_export.build_policy(module, "ref_conv", report, algo, dict(FAST), [], [], {}, {})
+    x = torch.randn(2, 8, dtype=torch.bfloat16)
+    return fx_export.capture_fx(module, [(x,), (x * 2,)], tmp_path / "fx", policy=policy, fresh_process=False,
+                                native_fp8="uint8")
+
+
+def test_in_place_filled_buffer_counts_as_input_dependent(tmp_path):
+    assert _in_place_capture(tmp_path, frozen=False)["status"] == "passed"
+
+
+def test_in_place_filled_buffer_from_a_constant_is_still_refused(tmp_path):
+    with pytest.raises(fx_export.FXVerificationError, match="does not depend on the graph input"):
+        _in_place_capture(tmp_path, frozen=True)
