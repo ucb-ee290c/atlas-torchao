@@ -126,7 +126,8 @@ def _dit_cached():
 @pytest.mark.slow
 @pytest.mark.skipif(not _dit_cached(), reason="Multi-Task DiT checkpoint not in HF_HOME")
 def test_dit_checkpoint_loads_completely(monkeypatch):
-    pytest.importorskip("lerobot")
+    pytest.importorskip("lerobot.policies.factory")          # eval_policy.load_policy
+    pytest.importorskip("lerobot.policies.multi_task_dit")   # the policy class it resolves
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
     from safetensors import safe_open
 

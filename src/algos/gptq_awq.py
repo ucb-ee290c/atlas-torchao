@@ -55,6 +55,7 @@ column order would have to respect the blocks, which is not implemented here.
 from __future__ import annotations
 
 import hashlib
+import time
 import weakref
 
 import torch
@@ -70,6 +71,7 @@ NORM_GROUPS = {
     "post_attention_layernorm": ("mlp.gate_proj", "mlp.up_proj"),
     "pre_feedforward_layernorm": ("mlp.gate_proj", "mlp.up_proj"),
 }
+SUBSAMPLE_TOKENS = 512        # NEW (awq_loss=cast): calibration tokens kept per fold group
 FOLD_TOL = 2.0 ** -6          # NEW: relative tolerance of the fold self-check (BF16 gamma rounding)
 
 
@@ -166,6 +168,53 @@ def awq_search(Ws, H, sx, grid=20, exp_fn=None):
     return best[1], best[2], best[0]
 
 
+def act_cast_nc(x: torch.Tensor) -> torch.Tensor:
+    """NEW: the stack's run-time per-token activation cast (granularity a=token, rule=nc), dequantized:
+    x_hat = dq(vpack(bf16(x), s_token)). x is [T, K]; float32 result. Reuses algos.granularity."""
+    from algos.granularity import scale_exp
+
+    xb = x.to(torch.bfloat16)
+    exp = scale_exp(xb, (-1,), "nc")
+    return rn.dequantize(rn.e4m3_vpack(xb, exp), exp).float()
+
+
+# the activation cast used by awq_loss=cast and calib=chip (tests replace it, e.g. by the identity)
+ACT_CAST = act_cast_nc
+
+
+@torch.no_grad()
+def awq_search_cast(Ws, X, sx, grid=20, exp_fn=None, cast=None, weight_H=None):
+    """NEW (awq_loss=cast): (s, alpha, loss, weight_only_alpha) minimizing the layer OUTPUT error through
+    the run-time casts, sum over the group's Linears of || W X^T - dq(Q_w(W s)) dq(Q_a(X / s))^T ||^2,
+    X [T, K] the calibration-token subsample of the group's shared input, float32 accumulation. Same
+    alpha grid and normalization of s as awq_search. If weight_H is given, the weight-only loss of
+    awq_search is evaluated too and the alpha it picks is returned (for the report)."""
+    exp_fn = exp_fn or rn.po2_scale_exp
+    cast = cast or ACT_CAST
+    X = X.float()
+    refs = [X @ W.float().T for W in Ws]
+    best = (float("inf"), None, None)
+    wbest = (float("inf"), None)
+    for i in range(grid):
+        a = i / grid
+        s = sx.float().pow(a).clamp(min=1e-4)
+        s = s / (s.max() * s.min()).sqrt()
+        xh = cast((X / s.to(X.device)).to(torch.bfloat16))          # the producer emits x / s in BF16
+        loss, wloss = 0.0, 0.0
+        for W, ref in zip(Ws, refs):
+            Wsc = (W.float() * s).to(W.dtype).float()
+            Wq = qdq(Wsc, exp_fn(Wsc))
+            loss += float(((xh @ Wq.T - ref) ** 2).sum())
+            if weight_H is not None:
+                dW = (Wq - Wsc) / s
+                wloss += float(((dW @ weight_H) * dW).sum())
+        if loss < best[0]:
+            best = (loss, s, a)
+        if wloss < wbest[0]:
+            wbest = (wloss, a)
+    return best[1], best[2], best[0], wbest[1]
+
+
 def _fingerprint(w: torch.Tensor) -> str:
     t = w.detach().contiguous().cpu().reshape(-1)
     return (hashlib.blake2b(t.view(torch.uint8).numpy().tobytes(), digest_size=16).hexdigest()
@@ -185,7 +234,7 @@ class GptqAwq(Algo):
         self.method = str(params.get("method", "gptq"))
         if self.method not in METHODS:
             raise ValueError(f"gptq_awq: method={self.method!r}; choose from {METHODS}")
-        unknown = set(params) - {"method", "actorder", "damp", "block", "grid", "hessians"}
+        unknown = set(params) - {"method", "actorder", "damp", "block", "grid", "hessians", "awq_loss", "calib", "target"}
         if unknown:
             raise ValueError(f"gptq_awq: unknown parameters {sorted(unknown)}")
         self.actorder = bool(params.get("actorder", True))
@@ -195,6 +244,21 @@ class GptqAwq(Algo):
         self.hessians = str(params.get("hessians", "cpu"))
         if self.hessians not in ("cpu", "device"):
             raise ValueError(f"gptq_awq: hessians={self.hessians!r}; choose cpu or device")
+        # NEW opt-in (default off): hardware-aware calibration, see docs/algos/gptq-awq.md
+        self.awq_loss = str(params.get("awq_loss", "weight"))
+        self.calib = str(params.get("calib", "bf16"))
+        self.target = str(params.get("target", "bf16"))
+        for k, v, ok in (("awq_loss", self.awq_loss, ("weight", "cast")), ("calib", self.calib, ("bf16", "chip")),
+                         ("target", self.target, ("bf16", "fp"))):
+            if v not in ok:
+                raise ValueError(f"gptq_awq: {k}={v!r}; choose from {ok}")
+        if self.target == "fp" and self.calib != "chip":
+            raise ValueError("gptq_awq: target=fp needs calib=chip")
+        self.subsample = {}                         # owner fqn -> [T, K] CPU token subsample
+        self.Hhat, self.Cxx = {}, {}                # calib=chip: sum x_hat x_hat^T, sum x x_hat^T
+        self.alpha_picks = {}                       # fold group -> {"weight": a, "cast": a}
+        self.timing = {}                            # stage -> seconds (calibration, awq, chip_pass, gptq)
+        self._batches = self._run = None
         self._calib_key = None
         self.H, self.sx, self.owner = {}, {}, {}     # owner: fqn -> fqn whose H it shares
         self.fold_checks = {}                       # norm / mlp fqn -> verified consumer info
@@ -226,6 +290,12 @@ class GptqAwq(Algo):
         if key == self._calib_key:
             return {"reused": True, **self._calib_summary()}
         self._calib_key = key
+        t_start = time.time()
+        self._batches, self._run = batches, run
+        self.subsample = {}
+        self.Hhat, self.Cxx = {}, {}
+        sub_gen = torch.Generator().manual_seed(0)
+        quota = -(-SUBSAMPLE_TOKENS // max(1, len(batches)))
         self.H, self.sx, self.owner, self.fold_checks = {}, {}, {}, {}
         self._gptq_cache = {}
         n_tok = {}
@@ -267,6 +337,10 @@ class GptqAwq(Algo):
             else:
                 self.H[n] += (x2.T @ x2).to(self.H[n].device)
             self.sx[n] += x2.abs().sum(0)
+            if self.awq_loss == "cast":
+                take = min(quota, x2.shape[0])
+                idx = torch.randperm(x2.shape[0], generator=sub_gen)[:take].to(x2.device)
+                self.subsample.setdefault(n, []).append(x2[idx].cpu())
             n_tok[n] += x2.shape[0]
             if first["on"] and n.endswith("mlp.down_proj"):
                 mlp_io.setdefault(n[: -len(".down_proj")], {})["down_in"] = x.detach()[..., :]
@@ -301,6 +375,8 @@ class GptqAwq(Algo):
                 h.remove()
         for n in self.sx:
             self.sx[n] /= max(n_tok[n], 1)
+        self.subsample = {n: torch.cat(v)[:SUBSAMPLE_TOKENS] for n, v in self.subsample.items()}
+        self.timing["calibration"] = time.time() - t_start
         self.n_tok = n_tok
         self._check_norms(model, norms, norm_in, consumers)
         return self._calib_summary()
@@ -374,7 +450,9 @@ class GptqAwq(Algo):
     def prepare(self, model, mode):
         self.awq_scale = {}
         self.layers = {}
+        self.alpha_picks = {}
         if not self.uses_awq:
+            self._chip_pass(model)
             return None
         mods = dict(model.named_modules())
         folded, refused = [], {}
@@ -390,7 +468,16 @@ class GptqAwq(Algo):
                 refused[key] = "no calibration statistics"
                 continue
             Ws = [mods[c].weight.detach() for c in cons]
-            s, alpha, _ = awq_search(Ws, H, sx, self.grid, self._grid_exp_fn(cons[0]))
+            t_awq = time.time()
+            own = self.owner.get(cons[0], cons[0])
+            if self.awq_loss == "cast" and own in self.subsample:
+                s, alpha, _, a_w = awq_search_cast(Ws, self.subsample[own].to(Ws[0].device), sx, self.grid,
+                                                   self._grid_exp_fn(cons[0]), weight_H=H.float().to(Ws[0].device))
+                self.alpha_picks[key] = {"weight": a_w, "cast": alpha}
+            else:
+                s, alpha, _ = awq_search(Ws, H, sx, self.grid, self._grid_exp_fn(cons[0]))
+                self.alpha_picks[key] = {"weight": alpha}
+            self.timing["awq"] = self.timing.get("awq", 0.0) + time.time() - t_awq
             prod = mods[chk["producer"]]
             if chk["rows"]:
                 prod.weight.copy_((prod.weight.float() / s.unsqueeze(1).to(prod.weight.device)).to(prod.weight.dtype))
@@ -411,7 +498,47 @@ class GptqAwq(Algo):
                     None, getattr(cfg, "num_attention_heads", None))
                 refused[n] = ("unscaled: producer is attention; under GQA v_proj has fewer output rows "
                               "than o_proj has inputs" if gqa else "unscaled: v_proj -> o_proj fold not implemented")
-        return {"method": self.method, "awq_folded": folded, "awq_unscaled": refused}
+        self._chip_pass(model)
+        return {"method": self.method, "awq_folded": folded, "awq_unscaled": refused,
+                "alpha_picks": dict(self.alpha_picks)}
+
+    @torch.no_grad()
+    def _chip_pass(self, model):
+        """NEW (calib=chip): second calibration pass on the (folded) model: every Linear input that owns
+        a Hessian is cast like the MXU operand, x_hat = dq(Q_a(x)); H_hat = sum x_hat x_hat^T and, for
+        target=fp, C = sum x x_hat^T (x: the folded model's own input). Statistics come from this
+        model's calibration batches."""
+        self.Hhat, self.Cxx = {}, {}
+        if self.calib != "chip" or self._batches is None:
+            return
+        t0 = time.time()
+        linears = {n: m for n, m in model.named_modules() if isinstance(m, nn.Linear) and n in self.H}
+        handles = []
+
+        def pre(mod, args, n):
+            if not args or not torch.is_tensor(args[0]):
+                return
+            x2 = args[0].detach().reshape(-1, args[0].shape[-1]).float()
+            xh = ACT_CAST(x2)
+            if n not in self.Hhat:
+                hdev = "cpu" if self.hessians == "cpu" else x2.device
+                self.Hhat[n] = torch.zeros(x2.shape[1], x2.shape[1], device=hdev)
+                if self.target == "fp":
+                    self.Cxx[n] = torch.zeros(x2.shape[1], x2.shape[1], device=hdev)
+            dev = self.Hhat[n].device
+            self.Hhat[n] += (xh.T @ xh).to(dev)
+            if self.target == "fp":
+                self.Cxx[n] += (x2.T @ xh).to(dev)
+
+        for n, m in linears.items():
+            handles.append(m.register_forward_pre_hook(lambda mod, a, n=n: pre(mod, a, n)))
+        try:
+            for b in self._batches:
+                self._run(model, b)
+        finally:
+            for h in handles:
+                h.remove()
+        self.timing["chip_pass"] = time.time() - t0
 
     # -- (a, b) weights ----------------------------------------------------------------------------
     def _grid(self, name, w, kind):
@@ -439,17 +566,28 @@ class GptqAwq(Algo):
         if not self.uses_gptq:
             self.layers[name] = "awq" if name in self.awq_scale else "rtn"
             return w
-        s0, gran = self._grid(name, w, kind)
-        H = self.H.get(self.owner.get(name, name))
+        own = self.owner.get(name, name)
+        H = self.H.get(own)
         if H is None:
             self.layers[name] = "rtn: not reached by the calibration data"
             return w
         D = self.awq_scale.get(name)
+        chip = self.calib == "chip" and own in self.Hhat
+        fp = chip and self.target == "fp" and own in self.Cxx
+        if fp:      # NEW target=fp: W' = W C H_hat^-1 minimizes ||W x - W' x_hat||^2 (damped as GPTQ)
+            Hh = self.Hhat[own].double()
+            Hd = Hh + self.damp * torch.mean(torch.diag(Hh)) * torch.eye(Hh.shape[0], dtype=Hh.dtype)
+            WC = w.double().cpu() @ self.Cxx[own].double()
+            w = torch.linalg.solve(Hd, WC.T).T.to(device=w.device, dtype=w.dtype)
+        s0, gran = self._grid(name, w, kind)
         key = (name, self.method, self.actorder, self.damp, self.block, _fingerprint(w),
-               _fingerprint(s0.contiguous()))
+               _fingerprint(s0.contiguous()), chip, fp)
         if key not in self._gptq_cache:
+            t_gptq = time.time()
             dev = w.device                  # one layer's H moves to the weight's device (gptq())
-            if D is not None:                # rescaled in float64: AWQ's 1/s spans many binades
+            if chip:                         # H_hat is measured on the folded model: no 1/s rescale
+                Hn = self.Hhat[own]
+            elif D is not None:              # rescaled in float64: AWQ's 1/s spans many binades
                 Di = (1.0 / D.double()).to(H.device)
                 Hn = H.double() * Di.unsqueeze(0) * Di.unsqueeze(1)
             else:
@@ -459,6 +597,7 @@ class GptqAwq(Algo):
             if ginfo.get("damp", self.damp) != self.damp:
                 self.damp_raised[name] = ginfo["damp"]
             self._gptq_cache[key] = wq.to(device=w.device, dtype=w.dtype)
+            self.timing["gptq"] = self.timing.get("gptq", 0.0) + time.time() - t_gptq
         out = self._gptq_cache[key]
         if not torch.equal(qdq(out, s0), out.float()):
             raise RuntimeError(f"{name}: GPTQ weight is not representable at the pinned exponent")
@@ -479,6 +618,9 @@ class GptqAwq(Algo):
             counts[v] = counts.get(v, 0) + 1
         rec["weights"] = counts
         rec["damp_raised"] = dict(self.damp_raised)
+        rec["hw_aware"] = {"awq_loss": self.awq_loss, "calib": self.calib, "target": self.target,
+                           "alpha_picks": dict(self.alpha_picks),
+                           "timing_s": {k: round(v, 2) for k, v in self.timing.items()}}
         return rec
 
 

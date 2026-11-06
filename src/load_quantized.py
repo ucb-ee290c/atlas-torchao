@@ -27,6 +27,7 @@ import torch.nn as nn
 
 import algos
 import quant_modes
+import tile_native
 from algos.base import Algo, Scale
 
 
@@ -65,6 +66,10 @@ class PolicyAlgo(Algo):
     def act_scale(self, name, x, kind, dims=None):
         site = self._site(name)
         rule = site["operands"][kind.split(".", 1)[1]] if kind.startswith("attention.") else site["activation"]
+        if (not kind.startswith("attention.") and str(site["weight"].get("granularity", "")).startswith("per_panel")
+                and rule.get("reduce") not in ("token", "block32_or_token")):
+            from algos import granularity as gr      # same chip costing as the in-memory w=panel run
+            gr._count_tile_output(x, site["weight"]["scale_exp_shape"][0])
         return rule_scale(rule, x, kind, dims, self, name)
 
 
@@ -91,6 +96,15 @@ def rule_scale(rule, x, kind, dims, holder=None, name=""):
         return Scale(gr.scale_exp(x, None, rule["rule"]), rule["label"])
     if red == "reference_dims":
         return Scale(gr.scale_exp(x, dims, rule["rule"]), rule["label"])
+    if red == "block":                       # granularity a=block: tokens = flattened leading dims
+        k = x.shape[-1]
+        m = x.numel() // max(1, k)
+        gr._count_block_cast(m, k)
+        s = gr.row_group_scale_exp(x.reshape(m, k), int(rule.get("rows", 32)), rule["rule"])
+        return Scale(s.reshape(*x.shape[:-1], 1), rule["label"])
+    if red == "head_block":                  # granularity attn=block: row groups per (batch, head) matrix
+        gr._count_block_cast(x.numel() // max(1, x.shape[-1]), x.shape[-1])
+        return Scale(gr.row_group_scale_exp(x, int(rule.get("rows", 32)), rule["rule"]), rule["label"])
     if red == "block32_or_token" and x.shape[-1] % int(rule.get("block", 32)) == 0:
         return Scale(gr.block_scale_exp(x, rule["rule"], int(rule.get("block", 32))), rule["label"],
                      block=int(rule.get("block", 32)))
@@ -177,6 +191,7 @@ def apply_export(model, tensors, policy, device, mode=None, options=None):
         raise ValueError(f"load_quantized: mode {mode!r} quantizes {sorted(need)}; the export "
                          f"({policy['exported_mode']}) covers {sorted(have)}")
     sites = policy["sites"]
+    tile_native.verify_export(policy, tensors)      # fail loudly: panel-labeled exponents, reserved codes
     quant = {n for n, s in sites.items() if s["status"] == "quantized" and s["kind"] in ("linear", "conv2d")}
     qkeys = {f"{n}.weight" for n in quant}
     aliases = policy.get("aliases", {})

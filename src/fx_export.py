@@ -183,15 +183,100 @@ def _code_hazards(codes):
     return ((c & 0x7F) == 0x7F) | ((((c >> 3) & 0xF) == 0) & ((c & 7) != 0))
 
 
+class NativeRule(tuple):
+    """(mode, reduce, rule, static_exp) of one quantize_act call, plus `.rows` (NEW, the group size of
+    reduce='block' / 'head_block'; 32 otherwise). A 4-tuple, so it unpacks and compares as before."""
+
+    def __new__(cls, mode, reduce, rule, static_exp, rows=32):
+        obj = super().__new__(cls, (mode, reduce, rule, static_exp))
+        obj.rows = int(rows)
+        return obj
+
+
+BLOCK_REDUCES = ("block", "head_block")
+
+
+class ActStats:
+    """Observed quantize_act results of the eager capture cases, per site (NEW; informational): dynamic
+    exponent E8M0 code range, reserved codes, exponent-field-0 (flushed) fraction, and for block
+    reductions the constancy of the exponent within each group, the token split and the padding check."""
+
+    def __init__(self):
+        self.sites = {}
+
+    def record(self, label, x, rule, codes, exp):
+        import tile_native as tn
+
+        e = self.sites.setdefault(label, {"calls": 0, "e8m0_code_min": None, "e8m0_code_max": None,
+                                          "reserved_codes": 0, "flushed_fraction_sum": 0.0, "reduce": rule[1],
+                                          "mode": rule[0], "groups_constant": True, "token_splits": [],
+                                          "group_flush": None})
+        c = tn.code_range(exp)
+        e["calls"] += 1
+        e["e8m0_code_min"] = c["min"] if e["e8m0_code_min"] is None else min(e["e8m0_code_min"], c["min"])
+        e["e8m0_code_max"] = c["max"] if e["e8m0_code_max"] is None else max(e["e8m0_code_max"], c["max"])
+        raw = codes.view(torch.uint8)
+        e["reserved_codes"] += tn.reserved_code_count(raw)
+        e["flushed_fraction_sum"] += tn.flushed_fraction(raw)
+        if rule[1] in BLOCK_REDUCES:
+            g = tn.row_group_flush_summary(raw, rule.rows, per_matrix=rule[1] == "head_block")
+            e["group_flush"] = g if e["group_flush"] is None else {
+                "rows": g["rows"], "groups": e["group_flush"]["groups"] + g["groups"],
+                "min": min(e["group_flush"]["min"], g["min"]), "max": max(e["group_flush"]["max"], g["max"]),
+                "mean": (e["group_flush"]["mean"] * e["group_flush"]["groups"] + g["mean"] * g["groups"])
+                        / (e["group_flush"]["groups"] + g["groups"])}
+            layout = "per_matrix" if rule[1] == "head_block" else "flat"
+            chk = tn.check_constant_groups(exp, rule.rows, layout)
+            e["groups_constant"] = e["groups_constant"] and chk.ok
+            m = x.shape[-2] if layout == "per_matrix" else x.numel() // max(1, x.shape[-1])
+            split = tn.token_split_report(m, rule.rows)
+            split["padding_encodes_to_plus_zero"] = tn.padding_encodes_to_plus_zero(
+                min(int(x.shape[-1]), 64), rule.rows, int(exp.reshape(-1)[-1]))
+            e["token_splits"].append(split)
+
+    def summary(self):
+        out = {}
+        for label, e in sorted(self.sites.items()):
+            row = {k: v for k, v in e.items() if k not in ("flushed_fraction_sum", "token_splits", "group_flush")}
+            if e["group_flush"] is not None:
+                row["flushed_fraction_per_group"] = e["group_flush"]       # per group of `rows` rows, all calls
+            row["flushed_fraction_mean"] = e["flushed_fraction_sum"] / max(1, e["calls"])
+            if e["token_splits"]:
+                uniq = {json.dumps(t, sort_keys=True) for t in e["token_splits"]}
+                row["token_splits"] = [json.loads(t) for t in sorted(uniq)]
+                row["token_split_all_32_aligned"] = all(t["aligned_32"] for t in e["token_splits"])
+            out[label] = row
+        return out
+
+
+_ACT_RECORDER = None          # set by capture_fx for the eager statistics pass only
+
+
+def _qact(x, rule, storage, tag=None, label=None):
+    """torch.ops.atlas.quantize_act(x, *rule, storage[, tag]); `rows` is passed (after tag) only for the
+    block reductions, so every other call keeps its old argument list. With an active ActStats recorder
+    (eager pass only) the result is observed under `label`."""
+    mode, reduce, rule_name, exp = rule
+    if reduce in BLOCK_REDUCES:
+        out = torch.ops.atlas.quantize_act(x, mode, reduce, rule_name, exp, storage, tag or "", rule.rows)
+    elif tag is None:
+        out = torch.ops.atlas.quantize_act(x, mode, reduce, rule_name, exp, storage)
+    else:
+        out = torch.ops.atlas.quantize_act(x, mode, reduce, rule_name, exp, storage, tag)
+    if _ACT_RECORDER is not None and label is not None:
+        _ACT_RECORDER.record(label, x, rule, *out)
+    return out
+
+
 def native_rule(rule_or_site, in_features):
     """(mode, reduce, rule, static_exp) of a Linear / Conv2d site's activation rule (a site dict or its
     `activation` rule), or None when atlas::quantize_act does not express it (block scales, per-step
     exponents). `in_features` is K, the length of the reduced row."""
     rule = rule_or_site.get("activation", rule_or_site)
     if rule.get("source") == "reference":
-        return ("dynamic", "tensor", "ref", None)
+        return NativeRule("dynamic", "tensor", "ref", None)
     if rule["mode"] == "static":
-        return ("static", "tensor", "ref", int(rule["exp"]))
+        return NativeRule("static", "tensor", "ref", int(rule["exp"]))
     if rule["mode"] != "dynamic":
         return None
     reduce = rule["reduce"]
@@ -199,20 +284,22 @@ def native_rule(rule_or_site, in_features):
         if in_features % int(rule.get("block", 32)) == 0:
             return None
         reduce = "token"
-    return ("dynamic", reduce, rule["rule"], None) if reduce in ("tensor", "token") else None
+    return (NativeRule("dynamic", reduce, rule["rule"], None, rule.get("rows", 32))
+            if reduce in ("tensor", "token", "block") else None)
 
 
 def native_operand_rule(rule):
     """The same for an attention operand (q, k, p, v): the reference rule and `reference_dims` are one
     exponent per (batch, head) matrix ("head"); `token` is one per row."""
     if rule.get("source") == "reference":
-        return ("dynamic", "head", "ref", None)
+        return NativeRule("dynamic", "head", "ref", None)
     if rule["mode"] == "static":
-        return ("static", "tensor", "ref", int(rule["exp"]))
+        return NativeRule("static", "tensor", "ref", int(rule["exp"]))
     if rule["mode"] != "dynamic":
         return None
-    reduce = {"reference_dims": "head", "token": "token", "tensor": "tensor"}.get(rule["reduce"])
-    return ("dynamic", reduce, rule["rule"], None) if reduce else None
+    reduce = {"reference_dims": "head", "token": "token", "tensor": "tensor",
+              "head_block": "head_block"}.get(rule["reduce"])
+    return NativeRule("dynamic", reduce, rule["rule"], None, rule.get("rows", 32)) if reduce else None
 
 
 def _without(inventory, unused):
@@ -273,7 +360,7 @@ def native_attention(module, policy):
     return {"paths": {path: cfg.get("site") for path, cfg in paths.items()}, "sites": sites}
 
 
-REFERENCE_OPERAND = ("dynamic", "head", "ref", None)
+REFERENCE_OPERAND = NativeRule("dynamic", "head", "ref", None)
 
 
 @contextlib.contextmanager
@@ -292,7 +379,7 @@ def _native_sites(module, policy, storage, *, attention=True, conv=True):
     undo, patched = [], []
     plan = {"linear": {}, "conv2d": {}, "attention": native_attention(module, policy) if attention else None}
     try:
-        for path, (layer, (mode, reduce, rule, exp)) in candidates.items():
+        for path, (layer, nrule) in candidates.items():
             is_conv = type(layer).__name__ == "RefQuantConv2d"
             if is_conv and not conv:
                 continue
@@ -305,15 +392,15 @@ def _native_sites(module, policy, storage, *, attention=True, conv=True):
             undo.append((layer, layer._buffers["weight_codes"], "forward" in layer.__dict__))
             layer._buffers["weight_codes"] = layer.weight_codes.view(code_dtype)
             out_dtype = str(layer.weight.dtype).replace("torch.", "")
-            plan["conv2d" if is_conv else "linear"][path] = (mode, reduce, rule, exp)
+            plan["conv2d" if is_conv else "linear"][path] = nrule
 
-            def linear_forward(x, layer=layer, mode=mode, reduce=reduce, rule=rule, exp=exp, out_dtype=out_dtype):
+            def linear_forward(x, layer=layer, nrule=nrule, out_dtype=out_dtype):
                 x = x.to(layer.weight.dtype)
-                codes, scale = torch.ops.atlas.quantize_act(x, mode, reduce, rule, exp, storage)
+                codes, scale = _qact(x, nrule, storage, label=layer.layer_name)
                 return torch.ops.atlas.qlinear(codes, scale, layer.weight_codes, layer.weight_scale_exp,
                                                layer.bias, out_dtype, atlas_fx_ops.WEIGHT_FORMAT)
 
-            def conv_forward(x, layer=layer, mode=mode, reduce=reduce, rule=rule, exp=exp, out_dtype=out_dtype):
+            def conv_forward(x, layer=layer, nrule=nrule, out_dtype=out_dtype):
                 # RefQuantConv2d.forward up to the quantizer: im2col stays visible (aten.im2col, permute)
                 B, _, H, W = x.shape
                 oh = (H + 2 * layer.padding[0] - layer.dilation[0] * (layer.kernel_size[0] - 1) - 1) // layer.stride[0] + 1
@@ -321,7 +408,7 @@ def _native_sites(module, policy, storage, *, attention=True, conv=True):
                 cols = torch.nn.functional.unfold(x, kernel_size=layer.kernel_size, stride=layer.stride,
                                                   padding=layer.padding, dilation=layer.dilation)
                 x_flat = cols.permute(0, 2, 1).reshape(B * oh * ow, -1).to(layer.weight.dtype)
-                codes, scale = torch.ops.atlas.quantize_act(x_flat, mode, reduce, rule, exp, storage)
+                codes, scale = _qact(x_flat, nrule, storage, label=layer.layer_name)
                 return torch.ops.atlas.qconv2d(codes, scale, layer.weight_codes, layer.weight_scale_exp,
                                                layer.bias, out_dtype, atlas_fx_ops.WEIGHT_FORMAT, B, oh, ow)
             layer.forward = conv_forward if is_conv else linear_forward
@@ -330,8 +417,8 @@ def _native_sites(module, policy, storage, *, attention=True, conv=True):
             original_cast, original_mm = ref_attention._cast, ref_attention._mm
 
             def cast(algo, site, operand, x, dims):
-                mode, reduce, rule, exp = REFERENCE_OPERAND if algo is None else sites[site][operand]
-                return torch.ops.atlas.quantize_act(x, mode, reduce, rule, exp, storage, f"{site}:{operand}")
+                nrule = REFERENCE_OPERAND if algo is None else sites[site][operand]
+                return _qact(x, nrule, storage, f"{site}:{operand}", label=f"{site}:{operand}")
 
             def mm(fm, a_q, a_s, b_q, b_s, dtype_out=torch.float32, role=None):
                 if fm is not None or role not in ("qk", "pv"):
@@ -382,6 +469,10 @@ def _check_act(label, act, rule, storage, depends_on_input):
     if tuple(act.args[1:6]) != (*rule, storage):
         raise FXVerificationError(f"{label}: quantize_act arguments {act.args[1:6]} differ from the policy "
                                   f"rule {rule}")
+    rows = act.args[7] if len(act.args) > 7 else act.kwargs.get("rows", 32)   # absent in bundles saved before `rows`
+    if rule[1] in BLOCK_REDUCES and rows != getattr(rule, "rows", 32):
+        raise FXVerificationError(f"{label}: quantize_act rows={rows} differs from the policy rule's "
+                                  f"rows={getattr(rule, 'rows', 32)}")
 
 
 def _inspect_native_site(path, layer, site, rule, nodes, lifted, depends_on_input, storage):
@@ -587,7 +678,65 @@ def _emulated_report(nodes, module, native_paths):
     return {"emulated_modules": emulated, "other_nodes_outside_quantized_modules": other}
 
 
-def inspect_graph(program, module, policy, plan=None, storage="uint8", unused=()):
+def _tile_native_report(module, policy, native_paths, plan, act_stats):
+    """Per-site `tile_native` (NEW): true when the weight exponent table and the activation / attention
+    operand exponents are constant along K at 32-granularity (src/tile_native.py), with the reasons for every
+    site that is not (per-channel or per-token recipes, block32 along K). `native_fp8` says whether the site
+    is carried by atlas.qlinear / qconv2d / qk_matmul / pv_matmul in this graph."""
+    import tile_native as tn
+
+    rows, status = {}, {}
+    for path, layer in module.named_modules():
+        if not _is_quant_layer(layer):
+            continue
+        site = policy["sites"].get(layer.layer_name)
+        if site is None or site.get("status") != "quantized":
+            continue
+        w = site["weight"]
+        st = tn.linear_site_status(w["granularity"], layer.weight_scale_exp.detach().cpu(),
+                                   int(w.get("panel_rows") or 0), site["activation"])
+        if "block" in w and w["block"]:
+            st["tile_native"] = False
+        status[layer.layer_name] = st
+        rows[layer.layer_name] = {"module": path, "kind": site["kind"], "tile_native": st["tile_native"],
+                                  "reasons": st["reasons"], "weight_granularity": w["granularity"],
+                                  "activation": site["activation"].get("label") or site["activation"].get("mode"),
+                                  "native_fp8": path in native_paths}
+    attn_paths = (plan or {}).get("attention", {}) or {}
+    for name, site in policy["sites"].items():
+        if site.get("status") == "quantized" and site.get("kind") == "attention":
+            st = tn.attention_site_status(site["operands"])
+            status[name] = st
+            rows[name] = {"module": None, "kind": "attention", "tile_native": st["tile_native"],
+                          "reasons": st["reasons"],
+                          "operands": {op: r.get("label") or r.get("mode") for op, r in site["operands"].items()},
+                          "native_fp8": name in (attn_paths.get("sites") or {})}
+    report = {"sites": dict(sorted(rows.items())), **tn.tile_summary(status),
+              "fixtures": ("native-FP8 graph: eager capture cases (quantize_act outputs observed)"
+                           if act_stats else "not available (decode-based graph has no quantize_act)")}
+    if act_stats:
+        report["fixture_activation_stats"] = act_stats.summary()
+    return report
+
+
+def _admission_report(policy, act_stats):
+    """compiler_pack_scale_admission for graph_inspection.json: the policy's static exponents plus the
+    dynamic exponents observed in the capture cases (INFORMATIONAL; nothing is clamped)."""
+    import tile_native as tn
+
+    rep = dict(policy.get("compiler_pack_scale_admission") or {})
+    if act_stats:
+        dyn = {k: (v["e8m0_code_min"], v["e8m0_code_max"]) for k, v in act_stats.summary().items()
+               if v["mode"] == "dynamic"}
+        flags = tn.pack_admission_flags(dyn)
+        rep["dynamic_activation_scales"] = {
+            "source": "capture-case fixtures only (data dependent)", "sites_checked": flags["sites_checked"],
+            "sites_outside": flags["sites_outside"], "offending_sites": flags["offending_sites"],
+            "codes": {k: {"min": a, "max": b} for k, (a, b) in sorted(dyn.items())}}
+    return rep
+
+
+def inspect_graph(program, module, policy, plan=None, storage="uint8", unused=(), act_stats=None):
     """Verify real contraction dependencies, not buffer labels alone.
 
     plan: what `_native_sites` yielded ({"linear": {path: rule}, "conv2d": {path: rule}, "attention":
@@ -702,6 +851,8 @@ def inspect_graph(program, module, policy, plan=None, storage="uint8", unused=()
               "unused_parameters": unused_params,
               "unused_quantized_weight_storage": "meta placeholders; no serialized float weight payload",
               "scope": "reference-emulation FX; not native-FP8 MLIR or hardware compatibility"}
+    report["tile_native"] = _tile_native_report(module, policy, native_paths, plan, act_stats)
+    report["compiler_pack_scale_admission"] = _admission_report(policy, act_stats)
     if plan:
         native_rows = [row for row in rows if row.get("native")]
         native_modules = {row["module"] for row in native_rows} | {row["module"] for row in attention_rows}
@@ -792,6 +943,20 @@ def verify_saved(directory, device="cpu"):
                                               if name in sys.modules]}
 
 
+def _observe_acts(module, cases):
+    """Eager pass over the capture cases with the native quantize_act forwards installed, recording each
+    activation cast (ActStats). Run inside _native_sites; never under tracing."""
+    global _ACT_RECORDER
+    _ACT_RECORDER = stats = ActStats()
+    try:
+        with torch.no_grad():
+            for args in cases:
+                module(*args)
+    finally:
+        _ACT_RECORDER = None
+    return stats
+
+
 def capture_fx(module, cases, directory, *, policy, provenance=None, strict=True, fresh_process=True,
                native_fp8=None):
     """Capture fixed-shape reference replay, save, reload and fail closed on mismatch.
@@ -845,7 +1010,7 @@ def capture_fx(module, cases, directory, *, policy, provenance=None, strict=True
             before = _without(_inventory(module.named_buffers()), unused)
             if not before:
                 raise FXVerificationError("no quantized weight buffers at this boundary")
-            native_info, baseline = None, None
+            native_info, baseline, act_stats = None, None, None
             with _meta_placeholders(module):
                 if native_fp8:
                     if native_fp8 not in STORAGE_DTYPES:
@@ -857,6 +1022,7 @@ def capture_fx(module, cases, directory, *, policy, provenance=None, strict=True
                         if not (plan["linear"] or plan["conv2d"] or plan["attention"]):
                             raise FXVerificationError("--native-fp8: no Linear site can be carried natively")
                         held = _without(_inventory(module.named_buffers(), STORAGE_DTYPES[native_fp8]), unused)
+                        act_stats = _observe_acts(module, cases)
                         program = torch.export.export(module, cases[0], strict=strict)
                     # the held buffers are a bitcast: same bytes, so same hash and shape as the uint8 codes
                     if any(held[k]["sha256"] != before[k]["sha256"] or held[k]["shape"] != before[k]["shape"]
@@ -876,7 +1042,7 @@ def capture_fx(module, cases, directory, *, policy, provenance=None, strict=True
                         unused) != before:
                 raise FXVerificationError("capture changed code/exponent buffers")
             graph_report = inspect_graph(program, module, policy, plan if native_fp8 else None,
-                                         native_fp8 or "uint8", unused=unused)
+                                         native_fp8 or "uint8", unused=unused, act_stats=act_stats)
             if native_fp8:
                 for args, (outputs, spec) in zip(cases, expected):
                     _compare(program.module()(*args), _leaves(baseline.module()(*args))[0], spec)

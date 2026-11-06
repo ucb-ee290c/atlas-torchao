@@ -68,19 +68,38 @@ def _cast(algo, site, operand, x, dims):
     return q, s
 
 
-def ref_attention(q, k, v, scaling, mask=None, fm_qk=None, fm_av=None, variant="text", algo=None, site=""):
+def _mm_two_term(fm, x, x_q, x_s, b_q, b_s, algo, site, operand, dims):
+    """Two-term pass pair for the streamed operand x (Q or P; the resident K or V stays single-term).
+    x1 = dq(Q(x)) is the single-term cast already in (x_q, x_s); r = x - x1 (BF16 truncating vsub);
+    returns bf16 fm(x1, b) + fm(Q(r), b) (each pass carries its own 2^(sx+sb) rescale; BF16 vadd)."""
+    import hw_two_term as tt
+
+    x1 = rn.dequantize(x_q, x_s).to(torch.bfloat16)
+    r_q, r_s = _cast(algo, site, operand, tt.vsub(x, x1), dims)
+    y1 = _mm(fm, x_q, x_s, b_q, b_s).to(torch.bfloat16)
+    y2 = _mm(fm, r_q, r_s, b_q, b_s).to(torch.bfloat16)
+    return tt.vadd(y1, y2)
+
+
+def ref_attention(q, k, v, scaling, mask=None, fm_qk=None, fm_av=None, variant="text", algo=None, site="",
+                  two_term=None):
     """q [B, H, Sq, D], k [B, H, Skv, D], v [B, H, Skv, Dv] (GQA already expanded).
 
     mask: text variant - bool [B, Sq, Skv] or [B, 1|H, Sq, Skv] (True = attend), or an additive float
     mask of the same shapes; vision variant - additive float [B, 1|H, Sq, Skv] or None.
     Returns bf16 [B, H, Sq, Dv]. `algo` (src/algos; None under --algo none) gets the operand casts
     as act_cast(site, x, "attention.q|k|p|v"); with no hook they are the per-(b, h) casts below.
+    two_term (NEW, opt-in, hw_two_term): None (default, unchanged), "q" (S = fm(Q1,K) + fm(Q2,K)) or
+    "qp" (also O = fm(P1,V) + fm(P2,V)); K and V stay single-term.
     """
     q, k, v = q.to(torch.bfloat16), k.to(torch.bfloat16), v.to(torch.bfloat16)    # 649-651, 815-817
     hd = (-2, -1)
     q_q, s_q = _cast(algo, site, "q", q, hd)
     k_q, s_k = _cast(algo, site, "k", k, hd)
-    scores = _mm(fm_qk, q_q, s_q, k_q, s_k, role="qk") * scaling                              # 675-677
+    if two_term:
+        scores = _mm_two_term(fm_qk, q, q_q, s_q, k_q, s_k, algo, site, "q", hd).float() * scaling
+    else:
+        scores = _mm(fm_qk, q_q, s_q, k_q, s_k, role="qk") * scaling               # 675-677
     if variant == "vision":
         scores = scores.to(torch.bfloat16)                                         # 827-829
         if mask is not None:
@@ -112,7 +131,10 @@ def ref_attention(q, k, v, scaling, mask=None, fm_qk=None, fm_av=None, variant="
     p_q, s_p = _cast(algo, site, "p", p, hd)                                       # 689
     v_q, s_v = _cast(algo, site, "v", v, hd)                                       # 690
     v_t_q = v_q.transpose(-1, -2)                                                  # v_norm.T (696)
-    out = _mm(fm_av, p_q, s_p, v_t_q, s_v, role="pv")                                         # 696
+    if two_term == "qp":
+        out = _mm_two_term(fm_av, p, p_q, s_p, v_t_q, s_v, algo, site, "p", hd)
+    else:
+        out = _mm(fm_av, p_q, s_p, v_t_q, s_v, role="pv")                          # 696
     return out.to(torch.bfloat16)                                                  # 696-698
 
 
@@ -144,7 +166,7 @@ def _hf_attention(module, query, key, value, attention_mask, scaling=None, dropo
     k, v = _expand_kv(key, n_rep), _expand_kv(value, n_rep)
     scaling = scaling if scaling is not None else query.shape[-1] ** -0.5
     out = ref_attention(query, k, v, scaling, attention_mask, cfg["fm_qk"], cfg["fm_av"], cfg["variant"],
-                        cfg.get("algo"), cfg.get("site", ""))
+                        cfg.get("algo"), cfg.get("site", ""), cfg.get("two_term"))
     return out.to(query.dtype).transpose(1, 2).contiguous(), None                  # 852-853
 
 
@@ -173,7 +195,7 @@ def _smolvla_text_attention(self_inner, attention_mask, batch_size, head_dim,
     k = _expand_kv(key_states.transpose(1, 2), n_heads // n_kv)
     v = _expand_kv(value_states.transpose(1, 2), n_heads // n_kv)
     out = ref_attention(q, k, v, head_dim ** -0.5, attention_mask, cfg["fm_qk"], cfg["fm_av"], "text",
-                        cfg.get("algo"), cfg.get("site", ""))
+                        cfg.get("algo"), cfg.get("site", ""), cfg.get("two_term"))
     dv = out.shape[-1]
     return out.permute(0, 2, 1, 3).reshape(batch_size, -1, n_heads * dv)          # 723
 
@@ -252,7 +274,7 @@ def _pi0_gemma_eager(module, query, key, value, attention_mask, scaling, dropout
     n_rep = module.num_key_value_groups                                           # 925-926 repeat_kv
     k, v = _expand_kv(key, n_rep), _expand_kv(value, n_rep)
     out = ref_attention(query, k, v, scaling, attention_mask, cfg["fm_qk"], cfg["fm_av"], "pi0",
-                        cfg.get("algo"), cfg.get("site", ""))
+                        cfg.get("algo"), cfg.get("site", ""), cfg.get("two_term"))
     cfg["calls"]["gemma_eager"] = cfg["calls"].get("gemma_eager", 0) + 1
     return out.to(query.dtype).transpose(1, 2).contiguous(), None                  # 982-1005
 
@@ -265,7 +287,7 @@ def _pi0_siglip_eager(module, query, key, value, attention_mask, scaling, dropou
     if cfg is None:
         return _PI0_ORIG["siglip"](module, query, key, value, attention_mask, scaling, dropout, **kwargs)
     out = ref_attention(query, key, value, scaling, attention_mask, cfg["fm_qk"], cfg["fm_av"], "vision",
-                        cfg.get("algo"), cfg.get("site", ""))
+                        cfg.get("algo"), cfg.get("site", ""), cfg.get("two_term"))
     cfg["calls"]["siglip_eager"] = cfg["calls"].get("siglip_eager", 0) + 1
     return out.to(query.dtype).transpose(1, 2).contiguous(), None                  # 1151-1165
 
@@ -284,7 +306,7 @@ def _pi0_sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False,
         sq, skv = query.shape[-2], key.shape[-2]
         mask = torch.ones(sq, skv, dtype=torch.bool, device=query.device).tril()[None, None]
     out = ref_attention(query, key, value, scale, mask, cfg["fm_qk"], cfg["fm_av"], "pi0",
-                        cfg.get("algo"), cfg.get("site", ""))
+                        cfg.get("algo"), cfg.get("site", ""), cfg.get("two_term"))
     cfg["calls"]["sdpa"] = cfg["calls"].get("sdpa", 0) + 1
     return out.to(query.dtype)                                                     # 804
 

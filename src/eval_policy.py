@@ -17,13 +17,20 @@ Modes:
   torchao     stock TorchAO Float8DynamicActivationFloat8WeightConfig, per-tensor
               (native FP8; needs compute capability >= 8.9, e.g. L40 / H100)
 
+Normalization (src/policy_norm.py): --norm-stats checkpoint (default) uses the processors as saved;
+--norm-stats dataset (NEW) overrides their stats with the evaluated dataset's, as a lerobot fine-tune
+from the checkpoint would start. Either way a guard refuses processors that would leave a normalized
+feature unnormalized (lerobot/smolvla_base's saved processors do: SmolVLA results made before this
+protocol saw raw joint degrees and their ground-truth errors are invalid). --allow-unnormalized
+reproduces that historical behaviour, recorded as normalization: legacy-unverified.
+
 --dtype float32 loads the baseline in float32, as the reference author serves SmolVLA
 (smolVLA-quant smolvla_inout/serve_smolvla.py:68-69).
 
 Example:
   python src/eval_policy.py --policy lerobot/smolvla_base \
       --dataset lerobot/svla_so100_pickplace --modes bf16 atlas atlas_hw torchao \
-      --n-frames 200 --out out/smolvla_eval.json
+      --norm-stats dataset --n-frames 200 --out out/smolvla_eval.json
 """
 
 import argparse
@@ -40,6 +47,7 @@ import torch
 
 import algos
 import ckpt_keys
+import policy_norm
 from quant_modes import (ALL_MODES, add_profile_args, add_subset_compare_arg, finalize_report, ladder_deltas,
                          ladder_record, quantize, require_mode_supported, subset_compare_modes)
 
@@ -73,6 +81,16 @@ def load_policy(path, device, dtype):
     return policy, cfg
 
 
+def load_config(path, device):
+    """The checkpoint's policy config, without its weights."""
+    import lerobot.policies.factory  # noqa: F401  (registers the policy config classes)
+    from lerobot.configs.policies import PreTrainedConfig
+
+    cfg = PreTrainedConfig.from_pretrained(path)
+    cfg.device = device
+    return cfg
+
+
 def camera_rename_map(cfg, dataset, override=None):
     """Map the dataset's camera keys onto the checkpoint's (e.g. top/wrist -> camera1/camera2).
 
@@ -88,6 +106,58 @@ def camera_rename_map(cfg, dataset, override=None):
     if set(want) & set(have):
         return {}
     return dict(zip(have, want))
+
+
+def build_processors(cfg, args, rename, norm_stats=None):
+    """The saved pre/post pipelines, with the device / dtype / rename overrides and, for
+    --norm-stats dataset, lerobot_train's normalizer / unnormalizer stats overrides."""
+    from lerobot.policies.factory import make_pre_post_processors
+
+    # The saved pipelines pin device='cuda'; override it, and cast float inputs to the policy dtype.
+    pre = {"device_processor": {"device": args.device, "float_dtype": args.dtype},
+           "rename_observations_processor": {"rename_map": rename}}
+    post = {"device_processor": {"device": "cpu"}}
+    if norm_stats is not None:
+        npre, npost = policy_norm.overrides(cfg, norm_stats)
+        pre, post = policy_norm.merge_overrides(pre, npre), policy_norm.merge_overrides(post, npost)
+    return make_pre_post_processors(cfg, pretrained_path=args.policy,
+                                    preprocessor_overrides=pre, postprocessor_overrides=post)
+
+
+def setup_normalization(args, cfg, rename, ds, idx):
+    """Build the processors once, guard them, probe them on one evaluated frame and return
+    (norm record, dataset stats or None). Raises policy_norm.NormalizationError on refusal."""
+    norm_stats = None
+    if args.norm_stats == "dataset":
+        norm_stats, source = policy_norm.dataset_stats(args.dataset, rename)
+    else:
+        source = {"kind": "checkpoint", "id": args.policy}
+    preprocess, postprocess = build_processors(cfg, args, rename, norm_stats)
+    guard = policy_norm.check(preprocess, postprocess, cfg)
+    status = policy_norm.require(guard, args.norm_stats, args.allow_unnormalized)
+    act = cfg.output_features.get("action")
+    probe = policy_norm.probe(preprocess, postprocess, ds[idx[0]], to_batch, guard["required"], rename,
+                              tuple(act.shape) if act is not None else None, seed=args.seed)
+    if not probe["ok"] and status == policy_norm.VERIFIED:
+        raise policy_norm.NormalizationError(f"normalization probe failed: {json.dumps(probe)}")
+    norm = {"protocol": args.norm_stats, "status": status, "stats_source": source,
+            "stats_sha256": policy_norm.combined_sha256(guard),
+            "transform_sha256": policy_norm.chain_sha256(guard),
+            "guard": guard, "probe": probe,
+            "new": ("--norm-stats dataset is a NEW zero-shot evaluation protocol for a pretraining "
+                    "checkpoint (the stats a fine-tune would start from); the guard, the probe and "
+                    "--allow-unnormalized are NEW")}
+    print(f"normalization: {status} (--norm-stats {args.norm_stats}, transform sha256 "
+          f"{norm['transform_sha256']}, probe ok {probe['ok']})", flush=True)
+    return norm, norm_stats
+
+
+def require_guarded_normalization(mode, cfg, preprocess, postprocess, norm):
+    """Every mode rebuilds its processors; they must normalize exactly as the guarded ones did."""
+    guard = policy_norm.check(preprocess, postprocess, cfg)
+    same = policy_norm.chain_sha256(guard) == norm["transform_sha256"]
+    if not same or guard["problems"] != norm["guard"]["problems"]:
+        raise RuntimeError(f"{mode}: the processors' normalization differs from the guarded one")
 
 
 def make_data(policy_cfg, dataset, n_test_episodes, n_frames, seed):
@@ -298,6 +368,7 @@ def build_parser():
                     help="torch.use_deterministic_algorithms(True), cuDNN deterministic, cuBLAS "
                          "workspace config")
     ap.add_argument("--out", required=True)
+    policy_norm.add_args(ap)
     add_profile_args(ap)
     add_subset_compare_arg(ap)
     algos.add_args(ap, calib_sources=("non_eval_episodes",))
@@ -305,7 +376,7 @@ def build_parser():
     return ap
 
 
-def _calib_loader(cache, args, cfg, preprocess):
+def _calib_loader(cache, args, cfg, preprocess, norm=None):
     """(f) calibration frames from the episodes make_data does not hold out, loaded once per run;
     each is run under its own seed (calib_seed + i) as run_mode does for the evaluated frames."""
     def calib():
@@ -316,6 +387,9 @@ def _calib_loader(cache, args, cfg, preprocess):
                 cfg, args.dataset, args.n_test_episodes, args.seed,
                 args.calib_n or algo_calib.DEFAULT_N["policy"], args.calib_seed,
                 lambda sample: to_batch(sample, preprocess)))
+            if norm is not None:   # the evaluated frames' processors, so the same normalization
+                cache[0][1]["normalization"] = {k: norm[k] for k in ("protocol", "status", "stats_sha256",
+                                                                      "transform_sha256")}
         batches, rec = cache[0]
         seeds = {id(b): args.calib_seed + i for i, b in enumerate(batches)}
 
@@ -336,6 +410,7 @@ def main():
     if args.deterministic:
         make_deterministic()
     dtype = torch_dtype(args.dtype)
+    policy_norm.check_args(ap, args)
     for m in args.modes:
         try:
             require_mode_supported(m, args.device)  # fail early, before any model download
@@ -351,9 +426,17 @@ def main():
     if args.export_only:
         args.modes, added, args.rmse = [export_mode], [], False   # quantize, export, evaluate nothing
 
-    from lerobot.policies.factory import make_pre_post_processors
-
-    result = {"provenance": provenance(args), "determinism_state": determinism_state(), "modes": {},
+    cfg0 = load_config(args.policy, args.device)
+    rename = camera_rename_map(cfg0, args.dataset, args.rename_map)
+    ds, meta, test_eps, idx = make_data(cfg0, args.dataset, args.n_test_episodes, args.n_frames, args.seed)
+    try:
+        norm, norm_stats = setup_normalization(args, cfg0, rename, ds, idx)
+        if args.from_export:
+            policy_norm.check_export(json.loads((Path(args.from_export) / "manifest.json").read_text()), norm)
+    except policy_norm.NormalizationError as e:
+        raise SystemExit(f"error: {e}")
+    result = {"normalization": norm["status"], "normalization_protocol": norm,
+              "provenance": provenance(args), "determinism_state": determinism_state(), "modes": {},
               "subset_compare": {"enabled": bool(added) or None, "added_modes": added}}
     ref = None
     clean = None
@@ -362,20 +445,12 @@ def main():
     for mode in args.modes:
         policy, cfg = load_policy(args.policy, args.device, dtype)
         result["provenance"].setdefault("checkpoint_key_repair", policy.checkpoint_key_repair)
-        rename = camera_rename_map(cfg, args.dataset, args.rename_map)
-        # The saved pipelines pin device='cuda'; override it, and cast float inputs to the policy dtype.
-        preprocess, postprocess = make_pre_post_processors(
-            cfg, pretrained_path=args.policy,
-            preprocessor_overrides={
-                "device_processor": {"device": args.device, "float_dtype": args.dtype},
-                "rename_observations_processor": {"rename_map": rename}},
-            postprocessor_overrides={"device_processor": {"device": "cpu"}})
-        if ref is None and not args.export_only:
-            ds, meta, test_eps, idx = make_data(cfg, args.dataset, args.n_test_episodes,
-                                                args.n_frames, args.seed)
+        preprocess, postprocess = build_processors(cfg, args, rename, norm_stats)
+        require_guarded_normalization(mode, cfg, preprocess, postprocess, norm)
+        if not args.export_only:
             result["data"] = {"dataset": args.dataset, "test_episodes": test_eps,
                               "frames": len(idx), "fps": meta.fps}
-        calib = _calib_loader(calib_cache, args, cfg, preprocess)
+        calib = _calib_loader(calib_cache, args, cfg, preprocess, norm)
         if args.from_export and mode != "bf16":
             import load_quantized
 
@@ -395,11 +470,17 @@ def main():
                               "dtype": args.dtype, "checkpoint": quant_export.checkpoint_record(args.policy)},
                 calib_batches=calib_cache[0][0] if calib_cache else None,
                 calib_record=calib_cache[0][1] if calib_cache else None,
+                normalization=policy_norm.export_record(norm),
                 extra_provenance={"lerobot_dataset": args.dataset, "n_test_episodes": args.n_test_episodes,
                                   "eval_seed": args.seed})
             result["export"] = {"dir": args.export_dir, "mode": mode, "files": man["files"]}
             if args.export_only:
                 break
+        tt_rec = None
+        if getattr(args, "act_two_term", "off") != "off":
+            import hw_two_term
+
+            tt_rec = hw_two_term.apply(policy, mode, args.act_two_term)
         algo_rec = algos.entry_record(layers, mode, args.algo)
         eq = layers["ladder"].get("equivalent_to") if layers is not None else None
         if eq in result["modes"]:
@@ -425,7 +506,8 @@ def main():
                 rm.capture(run_clean)
         preds, gts, pads, times = run_mode(policy, ds, idx, preprocess, postprocess,
                                            args.seed, args.device, before_frame=before)
-        entry = {"layers": finalize_report(layers),
+        entry = {"normalization": norm["status"], "layers": finalize_report(layers),
+                 **({"hw_two_term": tt_rec} if tt_rec else {}),
                  "ladder": layers["ladder"] if layers is not None else ladder_record("bf16", {}, args),
                  "algo": algo_rec,
                  "added_by_subset_compare": mode in added,

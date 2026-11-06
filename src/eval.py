@@ -191,6 +191,12 @@ def main():
             result["export"] = {"dir": args.export_dir, "mode": mode, "files": man["files"]}
             if args.export_only:
                 break
+        if getattr(args, "act_two_term", "off") != "off":
+            import hw_two_term
+
+            rec = hw_two_term.apply(model, mode, args.act_two_term)
+            if rec is not None:
+                result.setdefault("hw_two_term", {})[mode] = rec
         result["algo"][mode] = algos.entry_record(result["layers"].get(mode), mode, args.algo)
         result["ladder"][mode] = (result["layers"][mode]["ladder"] if mode != "bf16"
                                   else ladder_record("bf16", {}, args))
