@@ -553,6 +553,10 @@ class GptqAwq(Algo):
         if Hp is None:
             return None
         Wp = mods[pname].weight.detach()
+        s_in = self.awq_scale.get(pname)       # the norm group (folded first) scaled Wp's columns by s_in
+        if s_in is not None:                   # and its input is now x / s_in: H' = D H D, as transform_weight does
+            Di = (1.0 / s_in.double()).to(Hp.device)
+            Hp = (Hp.double() * Di.unsqueeze(0) * Di.unsqueeze(1)).float()
         c = producer_row_weights(Wp, Hp, Ws[0], torch.diag(Hc.float()))
         return {"W": Wp, "H": Hp, "c": c, "exp_fn": self._grid_exp_fn(pname)}
 

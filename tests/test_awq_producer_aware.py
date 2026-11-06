@@ -164,3 +164,31 @@ def test_diagonal_h_and_identity_producer_hessian_match_the_dense_forms():
     a = ga.awq_search([Wd], dense, sx, 8, PANEL, producer={"W": Wu, "H": torch.eye(Wu.shape[1]), "c": c, "exp_fn": PANEL})
     b = ga.awq_search([Wd], sx ** 2 * 512 / 3, sx, 8, PANEL, producer={"W": Wu, "H": None, "c": c, "exp_fn": PANEL})
     assert a[1] == b[1] and torch.equal(a[0], b[0]) and abs(a[2] - b[2]) <= 1e-4 * abs(a[2])
+
+
+def test_producer_hessian_follows_the_norm_group_fold():
+    """prepare folds the norm group first (up_proj columns * s_in, input x / s_in): the producer term must use
+    H' = D H D with the folded weight, which equals the unfolded weight against the unfolded H."""
+    Wu, Wd, Hp, Hd, sx = _pair(seed=2)
+    g = torch.Generator().manual_seed(7)
+    s_in = torch.exp2(torch.randn(Wu.shape[1], generator=g) * 2)             # a strongly non-flat s_in
+    Wf = (Wu.float() * s_in).float()                                         # float weights: the fold is exact
+    Di = 1.0 / s_in.double()
+    Hf = (Hp.double() * Di[None, :] * Di[:, None]).float()
+    c0 = ga.producer_row_weights(Wu.float(), Hp, Wd, torch.diag(Hd))
+    c1 = ga.producer_row_weights(Wf, Hf, Wd, torch.diag(Hd))
+    assert torch.allclose(c0, c1, rtol=1e-3)
+    wrong = ga.producer_row_weights(Wf, Hp, Wd, torch.diag(Hd))              # the unfolded H against the folded weight
+    assert not torch.allclose(c0, wrong, rtol=1e-2)
+
+    class _Lin:
+        def __init__(self, w): self.weight = w
+    algo = algos.make("gptq_awq:method=awq,producer_aware=true")
+    algo.H = {"up": Hp.clone()}
+    algo.owner = {}
+    algo.awq_scale = {"up": s_in}
+    chk = {"rows": True, "producer": "up"}
+    term = algo._producer_term({"up": _Lin(Wf)}, chk, ["down"], [Wd], Hd)
+    assert torch.allclose(term["H"], Hf, rtol=1e-4, atol=0) and torch.allclose(term["c"], c1)
+    algo.awq_scale = {}                                                       # no norm fold: H untouched
+    assert torch.equal(algo._producer_term({"up": _Lin(Wu)}, chk, ["down"], [Wd], Hd)["H"], Hp)
