@@ -16,7 +16,8 @@ folded basis and is flushed or coarsely rounded; per-channel exponents absorb th
 For each alpha the search now also computes, for the group's producer rows, `e = s * (Q(W_p / s) - W_p / s)` where `Q` is the cast on the
 producer's weight grid (`weight_grid` of a stacked `granularity:w=panel`, else the per-tensor rule) applied to what the folded checkpoint holds
 (`bf16(W_p / s)`), and adds `sum_j c_j e_j H_p e_j^T` to the consumer loss (`src/algos/gptq_awq.py`, `awq_search(..., producer=)`).
-`H_p` is the Hessian of the producer's input (already collected). `c_j = ||W_down[:, j]||^2 * g_j`, `g_j = H_down[j, j] / (W_p[j] H_p W_p[j]^T)`
+`H_p` is the Hessian of the producer's input (already collected), rescaled `D H D` with `D = diag(1/s_in)` when the norm group was folded first (it scales
+the `up_proj` columns before this pair is searched; `transform_weight` does the same for GPTQ; `test_producer_hessian_follows_the_norm_group_fold`). `c_j = ||W_down[:, j]||^2 * g_j`, `g_j = H_down[j, j] / (W_p[j] H_p W_p[j]^T)`
 (`producer_row_weights`): the channel's second moment at the down input relative to the producer's alone, which carries the gate
 (`down_in = act(gate) * up`) without a new calibration pass. Same units as the consumer loss (squared output error summed over tokens). Assumptions:
 errors of different producer rows are uncorrelated (diagonal in `j`), and the gate is independent of the row's error. Only `up_proj -> down_proj`
@@ -40,7 +41,7 @@ whose `s_j` all differ widely. It is complementary and not implemented here.
 
 ## Validation
 
-Tests: `tests/test_awq_producer_aware.py` (9 passed with the reference submodules present; without them the end-to-end test skips via `need_refs`).
+Tests: `tests/test_awq_producer_aware.py` (10 tests: 9 passed with the reference submodules present; without them the end-to-end test skips via `need_refs`).
 Synthetic pair (I=64, K=48, three channels with 10^4x the activation magnitude): old search alpha 0.85 leaves 3 rows with 24-30% error on the
 panel grid (0 on a per-channel grid); new search alpha 0.55 leaves 0.
 
@@ -48,7 +49,8 @@ panel grid (0 on a per-channel grid); new search alpha 0.55 leaves 0.
 
 Stock Pi0 weights; `s_j` of the recorded tile export (`exports-tile/pi0/atlas_v1_awq_tile_static`) recovered from the export's `down_proj` columns
 (median of `|dq_down[i, j] / W_down[i, j]|`), the norm group's `s_in` from the `up_proj` columns (not searched here). Real activations are not
-recoverable without a Pi0 forward pass, so the search uses a **proxy**: `H_down = diag(sx^2)` with `sx = s^(1/alpha_recorded)`, `H_p = I`.
+recoverable without a Pi0 forward pass, so the search uses a **proxy**: `H_down = diag(sx^2)` with `sx = s^(1/alpha_recorded)`, `H_p = I` on the norm-folded
+`R` (the LM0 `s_in` is nearly flat, median 2^5.61, so the `s_in` rescale above would change this proxy little).
 Casts are RTN (`qdq`), no GPTQ. "Damaged" = producer row with `s_j * Q(R_j / s_j)` more than 10% (relative L2) from the norm-folded stock row `R_j`.
 `comp` = `||Dd Du - Wd R|| / ||Wd R||`. Panel = `rows=32, rule=nc`; control = per-channel exponents, same rule. Raw: `exports-tile-diag/pi0/results_producer/`.
 
