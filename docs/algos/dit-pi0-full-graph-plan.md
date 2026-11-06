@@ -13,7 +13,7 @@ in section 5. CPU rule followed: one job at a time, `taskset -a -c 0-15 nice -n 
 | What boundary do the compilers want? | No written pi0 / DiT boundary spec exists. Precedent: their op inventory is the **whole inference, loop unrolled, non-strict** (SmolVLA 10 denoise steps, TinyLlama prefill + decode steps); their device route is a **hand-written host graph that owns loop, cache and stop conditions**; our own SmolVLA FX handoff was a **single flow-loss forward with 1 camera, no loop, no KV cache**. Section 1. | decision, default below |
 | DiT SDPA sites | Doable by an instance-`forward` replacement on `RoPEAttention` (about 35 lines in `ref_attention.py`) plus a re-export to calibrate 6 new sites. No mask, not causal, RoPE is plain BF16 elementwise before SDPA, head_dim 64, T = 24. Section 3. | yes |
 | Pi0 strict export | `NativeRule` is real and fixable in 4 places in `fx_export.py`, but it is the 5th of 6 blockers found, and the next one (`while time >= -dt/2`, `pi0_pytorch.py:407`) is in openpi. openpi pins torch 2.7.1. The compilers' own export is non-strict. Section 4.1. | no (nice to have) |
-| Loop: 10 unrolled calls or one step graph x10? | Neither is possible today without a verifier change (measured refusal at 2 calls). Recommended: per-phase graphs (each module once) + a loop manifest now; verifier multi-call + unrolled graph second. DiT's 100 steps must not be unrolled. Section 4.2. | per-phase split and manifest: yes; unrolled: no |
+| Loop: 10 unrolled calls or one step graph x10? | Unrolled (a module called N times) is refused today (measured, found 2 / found 3). A single step graph or a per-phase graph is **also** refused today, because the verifier assumes every quantized module is called (three separate checks, measured). Recommended: per-phase graphs + a loop manifest, which needs one `capture_fx` change that also provides the multi-call counting; unrolled Pi0 graph second; DiT's 100 steps must not be unrolled. Section 4.2. | per-phase split (with the `fx_export.py` change) and manifest: yes; unrolled: no |
 | Action-expert attention sites | Already covered: the `sample_actions` graph has 27 SigLIP + 18 PaliGemma + 18 expert attention sites, one qk/pv pair each (measured from `graph_inspection.json`). Section 4.3. | closed |
 | Camera stacking | Measured bitwise equal to 3 separate SigLIP calls on a tiny Pi0 (quantized and BF16) and on a real-width SigLIP; a negative control (per-tensor dynamic scales) differs, so the test can fail. Section 5. | no (equivalence evidence done on tiny; real-weight run NOT RUN) |
 
@@ -116,7 +116,7 @@ Dynamo in torch 2.7.1 cannot unpack, index or slice it; 2.11.0 can. Measured on 
 | plain 4-tuple | OK | OK |
 
 Do **not** switch `NativeRule` to a NamedTuple: its docstring promises "a 4-tuple, so it unpacks and compares as before", and `(*rule, storage)` at
-`_check_act` (`:469`) and the indexing in `ActStats.record` (`:221`, `rule[1]`) would break (my own repro: a 5-field NamedTuple fails a 4-way unpack on both torch versions).
+`_check_act` (`:469`) and the indexing in `ActStats.record` (`:221`, `rule[1]`) would break (unpacking 5 values into 4 names raises `ValueError` in plain Python).
 
 Lowest-blast-radius fix: convert to plain values at closure-build time and keep `NativeRule` for verification code, which runs outside dynamo.
 Passing the `NativeRule` object through as an opaque argument is fine as long as it is not unpacked (measured OK on 2.7.1 and 2.11.0, `nr_repro3.py`).
@@ -125,7 +125,7 @@ Passing the `NativeRule` object through as an opaque argument is fine as long as
 * `_native_sites.cast` (`:419-421`): look up from a prebuilt `{site: {operand: (tuple(rule), rule.rows, rule)}}` instead of `sites[site][operand]`; `REFERENCE_OPERAND` (`:363`) likewise.
 About 15 changed lines, plus one test that runs `capture_fx(strict=True)` on the tiny Llama under both torch versions.
 
-It is necessary but not sufficient. First failures on a tiny random-weight Pi0 (`pi0_tiny.build`, `algo granularity:w=channel,a=token,rule=nc`, `sample_actions(num_steps=1)`, torch 2.7.1, `torch.export.export(strict=True)`), in the order met after removing each:
+The brief's diagnosis (strict fails on `NativeRule`) is not the first strict failure with the committed boundary: `pi0_fx.py`'s `SimpleNamespace` fails first, so the brief likely describes an earlier boundary version (the DiT copy of `policy_fx_capture.py` still carries a stale `Pi0FlowLoss` docstring). The `NativeRule` fix is necessary but not sufficient. First failures on a tiny random-weight Pi0 (`pi0_tiny.build`, `algo granularity:w=channel,a=token,rule=nc`, `sample_actions(num_steps=1)`, torch 2.7.1, `torch.export.export(strict=True)`), in the order met after removing each:
 1. Boundary `Pi0OneStepSampler.forward` builds a `types.SimpleNamespace`: "Dynamo does not know how to trace the function `<class 'types.SimpleNamespace'>`". Driver-only; a plain class works.
 2. Boundary assigns `model.embed_prefix = ...` inside `forward`: "Mutating module attribute embed_prefix during export". Driver-only; install it once before export.
 3. openpi `preprocess_observation_pytorch` calls `set(image_keys).issubset(...)` (`preprocessing_pytorch.py:31`): "Dynamo does not know how to trace method `issubset` of class `set`". openpi is pinned, so the driver must replace `_preprocess_observation` (identity for 224x224 eval inputs).
@@ -160,7 +160,17 @@ require `len(mine) == calls`, check each qlinear is fed by its own `quantize_act
 Options:
 * **Unrolled 10 steps** (the compilers' inventory precedent): faithful to the whole inference; needs the multi-call verifier; the expert part repeats 10x in one graph. For DiT, 100 unrolled steps with 99 noise inputs and host scheduler arithmetic is not sensible.
 * **One step graph called N times**: correct for the compiler's host-owned loop only if the encoder/prefix is not inside it (section 2). Therefore split.
-* **Phase graphs (recommended default)**: Pi0 `prefix` (3 cameras, SigLIP, PaliGemma prefix; outputs the 18 per-layer K and V tensors, plus prefix pad mask) and `denoise_step` (state, `x_t`, time, the 36 cache tensors, prefix pad mask in; `v_t` out; Euler update stays on the host or is a tiny extra node). DiT `encode` (observation to conditioning vector) and `denoise_step` (noisy actions, timestep, conditioning vec to epsilon). Each quantized module is called once per graph, so the existing verifier accepts it, the KV cache crosses the boundary as explicit tensors (consistent with "no KV cache objects" in the step-3 plan, risk 10), and the loop manifest (below) carries the control. Driver-only, about 120 lines for both models.
+* **Phase graphs (recommended default)**: Pi0 `prefix` (3 cameras, SigLIP, PaliGemma prefix; outputs the 18 per-layer K and V tensors, plus prefix pad mask) and `denoise_step` (state, `x_t`, time, the 36 cache tensors, prefix pad mask in; `v_t` out; Euler update stays on the host or is a tiny extra node). DiT `encode` (observation to conditioning vector) and `denoise_step` (noisy actions, timestep, conditioning vec to epsilon). Each quantized module is called at most once per graph, but **the existing verifier does not accept a graph that leaves quantized modules uncalled** (measured, table below), so this is not driver-only for Pi0. The KV cache crosses the boundary as explicit tensors (consistent with "no KV cache objects" in the step-3 plan, risk 10), and the loop manifest (below) carries the control.
+
+Measured on the tiny quantized Pi0 with the phase boundaries written as `prefix` (stacked `embed_prefix` + `paligemma_with_expert.forward(inputs_embeds=[prefix, None], use_cache=True)`, returns the pad mask and the per-layer K/V) and `denoise_step` (state, pad mask, `x_t`, time, K/V tensors rebuilt into a `DynamicCache`), `capture_fx(native_fp8="uint8", strict=False)` unchanged (`phase_probe.py`):
+
+| check that refused (first one hit, in order) | where | prefix graph | step graph |
+|---|---|---|---|
+| 1. unused quantized Linear/Conv2d whose code buffers are still lifted as graph inputs: "never called by the eager replay but present in the graph" | `inspect_graph`, `fx_export.py:777-779` | refused (expert q_proj) | refused (patch_embedding) |
+| 2. attention paths come from every module with `_atlas_ref_attn`, not from called ones: "attention site ... has no atlas.qk_matmul in the graph" | `_inspect_native_attention`, per-path loop (`native_attention` `:340-360` builds `paths`) | refused after check 1 was relaxed in a scratch copy | same |
+| 3. "saved code/exponent inventory differs": the reloaded program lists lifted buffers of uncalled modules, the saved inventory excludes them | `verify_saved` (`:879`) vs the `_without(..., unused)` inventory | refused after checks 1 and 2 were relaxed | same |
+
+Checks 1 and 2 were relaxed in a scratch copy of `fx_export.py` (not in the repo) to find check 3; nothing past check 3 was tested. The consistent fix is in `capture_fx`: derive a `calls: Counter` from the eager replay (the `called` set at `:992-1008`), treat 0-call modules and attention sites as absent from this graph (also in the policy-vs-graph comparisons and `verify_saved`), and expect exactly `calls[path]` nodes for the others; the same counter is the multi-call verifier of plan item 5. Estimated 30 to 60 `src` lines plus 60 test lines. A driver-only alternative for DiT (untested): a boundary that holds only `model.noise_predictor` (or only `model.observation_encoder`) under an empty `model` module, so the other half is not in the module tree. For Pi0 the phases share `paligemma_with_expert`, so that needs real surgery.
 
 Facts the denoise graph must preserve (read, not run): with `use_cache=False` openpi's replaced Gemma concatenates the cached K/V without mutating the cache (`transformers_replace/models/gemma/modeling_gemma.py:304-310`),
 so every step sees the same prefix K/V; the expert qk site therefore quantizes `K = cat(prefix K, suffix K)` with one per-head dynamic exponent over the full length every step, and that
@@ -248,7 +258,7 @@ def test_negative_control_per_tensor_rule_is_not_batch_independent():
     m, cfg = _model("granularity:w=tensor,a=tensor,rule=ref"); o = _obs(cfg, 0)
     assert not torch.equal(_embed(m, o, False)[0], _embed(m, o, True)[0])      # the test must be able to fail
 
-def test_policy_vision_sites_are_batch_independent(policy_json):                  # item 1; policy_json = fx/policy.json of the bundle
+def test_policy_vision_sites_are_batch_independent(policy_json):                  # item 1; needs a fixture returning json.load(open(<bundle>/fx/policy.json))
     for name, s in policy_json["sites"].items():
         if "vision_tower" not in name or s["status"] != "quantized":
             continue
@@ -269,20 +279,21 @@ Effort figures are estimates from the line counts above, not measurements. B = b
 |---|---|---|---|---|
 | 1 | DiT `RoPEAttention` policy sites (section 3): instance-forward replacement, variant `vision`; re-export 385 s, re-capture 266 s, verifier asserts 30 qk/pv pairs | `src/ref_attention.py` (+35), `tests/` (+60) | 0.5-1 day | **B** (otherwise 6 of 30 DiT attention blocks are BF16 SDPA, and the bundle reads as fully quantized) |
 | 2 | Loop manifest in `fx_manifest.json` / `bundle_manifest.json` (section 4.2 fields) and a one-paragraph boundary statement in the how-to | drivers, docs | 0.25 day | **B** (the manifests today do not say the graph is one step of 10 / 100) |
-| 3 | Per-phase graphs: DiT `encode` + `denoise_step`; Pi0 `prefix` (KV tensors out) + `denoise_step` (KV tensors in); re-capture both (Pi0 non-strict took 1,549 s for the current one-step graph) | drivers only (+120) | 1 day | **B** for a loop-faithful handoff; the current graphs stay valid as per-op inventory |
+| 3 | Per-phase graphs: DiT `encode` + `denoise_step`; Pi0 `prefix` (KV tensors out) + `denoise_step` (KV tensors in); needs the `capture_fx` uncalled-module handling (section 4.2, three checks); re-capture both (Pi0 non-strict took 1,549 s for the current one-step graph) | drivers (+120), `src/fx_export.py` (+30-60, shared with item 5), `tests/` (+60) | 1.5-2 days | **B** for a loop-faithful handoff; the current graphs stay valid as per-op inventory |
 | 4 | Equivalence evidence for stacking: add the section 5 tests; run the real-weight eager-unstacked vs fixtures check (item 4 there) | `tests/` (+60); one 2-case eager run of the real Pi0 | 0.25 day + run time | N, but needed to keep stacking in item 3 |
-| 5 | Multi-call verifier (`fx_export.py:495,521`, `called` counter at `:992-1008`, graph_inspection per-call rows, `verify_bundle.py` counts) | `src/fx_export.py` (+40-60), `tests/` (+60), `scripts/tile_flow/` | 0.5-1 day | N, **but** unlocks 6 and removes the stacking deviation; becomes B if the compilers ask for the whole inference in one graph |
+| 5 | Multi-call verifier (`fx_export.py:495,521`, `called` counter at `:992-1008`, graph_inspection per-call rows, `verify_bundle.py` counts) | `src/fx_export.py` (+40-60), `tests/` (+60), `scripts/tile_flow/` | 0.5-1 day | N as a feature, **but** the `calls` Counter is the same change as item 3, so do them together; unlocks 6 and removes the stacking deviation; becomes B if the compilers ask for the whole inference in one graph |
 | 6 | Unrolled `sample_actions(num_steps=10)` Pi0 graph (non-strict, python-unrolled host times); not for DiT | driver | 0.5 day + capture time (not measured; 10x the expert part) | N (matches the compilers' inventory precedent) |
 | 7 | `NativeRule` dynamo fix (section 4.1, 4 sites) + test under both torch versions | `src/fx_export.py` (+15), `tests/` | 0.25 day | N (robustness) |
 | 8 | Strict Pi0 under 2.7.1: item 7 + driver rewrite (no `SimpleNamespace`, no in-forward mutation, `_preprocess_observation` bypass, host-time loop) + isolate the decode-baseline `KeyError` | drivers, 1 `src` item | 1+ day, outcome uncertain | N |
 | 9 | Generalise `verify_bundle.py` (patch-embedding conv declared BF16/float32 by policy, parameters with no users in non-strict graphs, per-call counts, DiT SDPA row disappears after item 1) | `scripts/tile_flow/verify_bundle.py` | 0.25 day | N |
 | 10 | Decide the CLIP variant for the DiT bundle (`text` today, `vision` in `mtdit_inout`) | `ref_attention.py:237` or docs | 0.25 day, needs a decision | N (fidelity question) |
 
-Order: 1, 2, 3 in parallel (1 touches `src`, 2 and 3 only drivers/docs), then 4, then 5 and 6 as the second wave; 7 to 10 as capacity allows. Items 1 to 3 together are about 2 to 3 days including re-captures.
+Order: 1 and 3+5 both touch `src` (different files: `ref_attention.py` vs `fx_export.py`), 2 is docs/drivers; do 1, 2 and 3+5 in parallel, then 4, then 6; 7 to 10 as capacity allows. Items 1 to 3 together are about 3 days including re-captures.
 
 ## 7. Not verified here
 
 * No real-weight Pi0 or DiT forward was run; all experiments used the tiny random-weight Pi0, a 2-layer real-width SigLIP, or 10-line repros.
+* The three `capture_fx` refusals for phase graphs were measured on the tiny model with scratch relaxations; whether more checks follow check 3, and whether DiT strict (torch 2.11) prunes unused buffers differently, was not tested.
 * The decode-baseline strict `KeyError` (section 4.1, blocker 4) was not isolated, and blockers after the `while` loop were not reached.
 * Compiler-side acceptance (head_dim 72 SigLIP, Pi0 block masks, 24-row tiles, 10x repeated weights) is unchecked; only the kernel manifest values above were read.
 * The effort numbers, the unrolled-graph size and capture time, and the claim that the per-head K exponent can vary across denoise steps are estimates or inferences.
