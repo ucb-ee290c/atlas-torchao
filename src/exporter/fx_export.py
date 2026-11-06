@@ -2,6 +2,12 @@
 
 This is reference emulation, not native-FP8 MLIR or device code. No calibration
 or quantizer search runs here. The initial CLI boundary is causal-LM logits.
+
+Default: each quantized Linear is decoded (uint8 codes -> E4M3 value, times 2^exp) and contracted in
+BF16. With --native-fp8 each eligible Linear is instead two opaque nodes, atlas.quantize_act and
+atlas.qlinear (src/exporter/atlas_fx_ops.py), consuming the code and exponent buffers directly; attention
+operands, Conv2d and other sites stay decode-based and are listed in graph_inspection.json under
+still_emulated. A saved native bundle needs `import exporter.atlas_fx_ops` before torch.export.load.
 """
 
 from __future__ import annotations
@@ -10,6 +16,7 @@ import argparse
 import contextlib
 import hashlib
 import json
+import operator
 import os
 import subprocess
 import sys
@@ -19,6 +26,8 @@ import torch
 from torch.utils import _pytree
 
 SCHEMA = "atlas_torchao.fx_verification.v1"
+STORAGE_DTYPES = {"uint8": torch.uint8, "float8_e4m3fn": torch.float8_e4m3fn}
+RECOGNIZED_QUANT_MODULES = ("RefQuantLinear", "RefQuantConv2d")
 QUANT_BUFFERS = ("weight_codes", "weight_scale_exp", "weight_lo_codes", "weight_lo_scale_exp")
 BUNDLE_FILES = ("model.pt2", "fixtures.safetensors", "parity.json", "buffer_inventory.json",
                 "graph_inspection.json", "policy.json", "graph.txt", "graph_signature.txt")
@@ -62,12 +71,12 @@ def _file_record(path):
     return {"sha256": digest.hexdigest(), "bytes": Path(path).stat().st_size}
 
 
-def _inventory(items):
+def _inventory(items, code_dtype=torch.uint8):
     result = {}
     for name, value in items:
         suffix = name.rpartition(".")[2]
         if suffix in QUANT_BUFFERS:
-            required = torch.uint8 if suffix.endswith("codes") else torch.int32
+            required = code_dtype if suffix.endswith("codes") else torch.int32
             if value.dtype != required:
                 raise FXVerificationError(f"{name}: expected {required}, found {value.dtype}")
             result[name] = tensor_record(value)
@@ -132,8 +141,180 @@ def _meta_placeholders(module):
             layer.weight = original
 
 
-def inspect_graph(program, module, policy):
-    """Verify real contraction dependencies, not buffer labels alone."""
+def _scope(node):
+    """Innermost module path of a node (empty for nodes with no module stack)."""
+    stack = node.meta.get("nn_module_stack") or {}
+    return list(stack.values())[-1][0] if stack else ""
+
+
+def _code_hazards(codes):
+    """Codes where torch.float8_e4m3fn and ref_numerics.e4m3_unpack disagree: 0x7F / 0xFF (NaN vs
+    reserved) and the 14 exponent-field-0 non-zero codes (subnormal vs signed zero)."""
+    c = codes.to(torch.int32) & 0xFF
+    return ((c & 0x7F) == 0x7F) | ((((c >> 3) & 0xF) == 0) & ((c & 7) != 0))
+
+
+def native_rule(site, in_features):
+    """(mode, reduce, rule, static_exp) of a Linear site's activation rule, or None when
+    atlas::quantize_act does not express it (block scales, per-step exponents)."""
+    rule = site["activation"]
+    if rule.get("source") == "reference":
+        return ("dynamic", "tensor", "ref", None)
+    if rule["mode"] == "static":
+        return ("static", "tensor", "ref", int(rule["exp"]))
+    if rule["mode"] != "dynamic":
+        return None
+    reduce = rule["reduce"]
+    if reduce == "block32_or_token":
+        if in_features % int(rule.get("block", 32)) == 0:
+            return None
+        reduce = "token"
+    return ("dynamic", reduce, rule["rule"], None) if reduce in ("tensor", "token") else None
+
+
+def native_candidates(module, policy):
+    """{path: (layer, rule)} of the Linear sites that one atlas::qlinear node can carry; the rest
+    (Conv2d, per-block weight scales, residual passes, MXU models) stay on the decode path."""
+    result = {}
+    for path, layer in module.named_modules():
+        if type(layer).__name__ != "RefQuantLinear":
+            continue
+        site = policy["sites"].get(layer.layer_name)
+        if (site is None or site["status"] != "quantized" or layer.fm is not None
+                or getattr(layer, "residual", None) or layer.weight_block):
+            continue
+        rule = native_rule(site, layer.in_features)
+        if rule is not None and layer.weight_scale_exp.numel() in (1, layer.out_features):
+            result[path] = (layer, rule)
+    return result
+
+
+@contextlib.contextmanager
+def _native_linears(module, policy, storage):
+    """For the capture only: route each candidate Linear through atlas::quantize_act + atlas::qlinear
+    and, for float8 storage, hold its codes as a float8_e4m3fn bitcast of the same bytes. The
+    caller's forwards and buffers are restored afterwards."""
+    import exporter.atlas_fx_ops as atlas_fx_ops
+
+    code_dtype = STORAGE_DTYPES[storage]
+    candidates = native_candidates(module, policy)
+    undo = []
+    try:
+        for path, (layer, (mode, reduce, rule, exp)) in candidates.items():
+            if storage != "uint8":
+                bad = _code_hazards(layer.weight_codes)
+                if bool(bad.any()):
+                    raise FXVerificationError(
+                        f"{path}: {int(bad.sum())} weight codes (0x7F/0xFF or exponent-0 non-zero) decode "
+                        f"differently as {storage} than in ref_numerics; use --native-storage uint8")
+            undo.append((layer, layer._buffers["weight_codes"], "forward" in layer.__dict__))
+            layer._buffers["weight_codes"] = layer.weight_codes.view(code_dtype)
+            out_dtype = str(layer.weight.dtype).replace("torch.", "")
+
+            def forward(x, layer=layer, mode=mode, reduce=reduce, rule=rule, exp=exp, out_dtype=out_dtype):
+                x = x.to(layer.weight.dtype)
+                codes, scale = torch.ops.atlas.quantize_act(x, mode, reduce, rule, exp, storage)
+                return torch.ops.atlas.qlinear(codes, scale, layer.weight_codes, layer.weight_scale_exp,
+                                               layer.bias, out_dtype, atlas_fx_ops.WEIGHT_FORMAT)
+            layer.forward = forward
+        yield {path: rule for path, (_, rule) in candidates.items()}
+    finally:
+        for layer, codes, had_forward in undo:
+            layer._buffers["weight_codes"] = codes
+            if not had_forward:
+                layer.__dict__.pop("forward", None)
+
+
+ALLOWED_NATIVE_SCOPE_TARGETS = {operator.getitem, torch.ops.aten._to_copy.default, torch.ops.aten.to.dtype,
+                                torch.ops.aten.to.dtype_layout, torch.ops.aten._assert_tensor_metadata.default}
+
+
+def _inspect_native_site(path, layer, site, rule, nodes, lifted, depends_on_input, storage):
+    """One Linear = one atlas::qlinear node fed directly by the lifted code/exponent buffers and by
+    one atlas::quantize_act node whose input depends on the user input; nothing else in its scope."""
+    import exporter.atlas_fx_ops as atlas_fx_ops
+
+    prefix = path + "." if path else ""
+    code, exp = lifted.get(prefix + "weight_codes"), lifted.get(prefix + "weight_scale_exp")
+    placeholder, bias = lifted.get(prefix + "weight"), lifted.get(prefix + "bias")
+    if code is None or exp is None:
+        raise FXVerificationError(f"{layer.layer_name}: codes or exponents were not lifted")
+    if placeholder is not None and placeholder.users:
+        raise FXVerificationError(f"{layer.layer_name}: graph consumes the float placeholder")
+    mine = [n for n in nodes if n.op == "call_function" and n.target == torch.ops.atlas.qlinear.default
+            and n.args[2] is code and n.args[3] is exp]
+    if len(mine) != 1 or set(code.users) != set(mine) or set(exp.users) != set(mine):
+        raise FXVerificationError(f"{layer.layer_name}: expected exactly one atlas.qlinear consuming "
+                                  f"the code and exponent buffers directly, found {len(mine)}")
+    q = mine[0]
+    x_codes, x_exp, _, _, q_bias, out_dtype, weight_format = q.args
+    if (not isinstance(x_codes, torch.fx.Node) or x_codes.target is not operator.getitem or x_codes.args[1] != 0
+            or not isinstance(x_exp, torch.fx.Node) or x_exp.target is not operator.getitem
+            or x_exp.args[1] != 1 or x_codes.args[0] is not x_exp.args[0]):
+        raise FXVerificationError(f"{layer.layer_name}: qlinear is not fed by one atlas.quantize_act")
+    act = x_codes.args[0]
+    if act.target != torch.ops.atlas.quantize_act.default:
+        raise FXVerificationError(f"{layer.layer_name}: qlinear is not fed by one atlas.quantize_act")
+    mode, reduce, scale_rule, static_exp = rule
+    if not depends_on_input[act.args[0]]:
+        raise FXVerificationError(f"{layer.layer_name}: quantize_act input does not depend on the graph input")
+    if tuple(act.args[1:]) != (mode, reduce, scale_rule, static_exp, storage):
+        raise FXVerificationError(f"{layer.layer_name}: quantize_act arguments {act.args[1:]} differ from "
+                                  f"the policy rule {rule}")
+    if out_dtype != str(layer.weight.dtype).replace("torch.", "") or weight_format != atlas_fx_ops.WEIGHT_FORMAT:
+        raise FXVerificationError(f"{layer.layer_name}: qlinear dtype/format attributes differ from the layer")
+    if (layer.bias is None) != (q_bias is None) or (bias is not None and q_bias is not bias):
+        raise FXVerificationError(f"{layer.layer_name}: bias is not consumed by qlinear")
+    scope = [n for n in nodes if n.op == "call_function" and _scope(n) == path]
+    stray = sorted({str(n.target) for n in scope if n.target not in ALLOWED_NATIVE_SCOPE_TARGETS
+                    and n not in (q, act)})
+    if stray:
+        raise FXVerificationError(f"{layer.layer_name}: decode/contraction ops remain in the layer: {stray}")
+    return {"site": layer.layer_name, "module": path, "kind": "linear", "native": True,
+            "code_buffer": prefix + "weight_codes", "scale_buffer": prefix + "weight_scale_exp",
+            "code_dtype": str(layer.weight_codes.dtype).replace("torch.", ""),
+            "qlinear": q.name, "quantize_act": act.name,
+            "activation_rule": {"mode": mode, "reduce": reduce, "rule": scale_rule, "static_exp": static_exp},
+            "nodes_in_scope": [n.name for n in scope]}
+
+
+def _emulated_report(nodes, module, native_paths):
+    """Modules whose quantized operations are still emulated (decode and contract), keyed by module path:
+    their contraction nodes (attention Q.K and P.V, Conv2d, any Linear kept on the decode path), the
+    amax / frexp / gt nodes that derive their scales, and the module's total node count (which also
+    holds ordinary BF16 nodes such as RoPE and softmax). `other_nodes_outside_quantized_modules`
+    counts the remaining call_function nodes (norms, residual adds, SiLU, lm_head, embeddings)."""
+    emulated = {path: {"kind": "attention" if isinstance(getattr(layer, "_atlas_ref_attn", None), dict)
+                       else ("linear" if type(layer).__name__ == "RefQuantLinear" else "conv2d"),
+                       "node_count": 0, "contractions": [], "scale_derivation": []}
+                for path, layer in module.named_modules()
+                if path not in native_paths and (isinstance(getattr(layer, "_atlas_ref_attn", None), dict)
+                                                 or type(layer).__name__ in RECOGNIZED_QUANT_MODULES)}
+    scale_ops = (torch.ops.aten.frexp.Tensor, torch.ops.aten.amax.default, torch.ops.aten.max.default,
+                 torch.ops.aten.gt.Tensor)
+    other = 0
+    for node in nodes:
+        if node.op != "call_function":
+            continue
+        entry = emulated.get(_scope(node))
+        if entry is None:
+            other += _scope(node) not in native_paths
+            continue
+        entry["node_count"] += 1
+        if node.target in CONTRACTIONS:
+            entry["contractions"].append(node.name)
+        if node.target in scale_ops:
+            entry["scale_derivation"].append(node.name)
+    return {"emulated_modules": emulated, "other_nodes_outside_quantized_modules": other}
+
+
+def inspect_graph(program, module, policy, native_paths=None, storage="uint8"):
+    """Verify real contraction dependencies, not buffer labels alone.
+
+    native_paths: {module path: (mode, reduce, rule, static_exp)} of the Linear layers captured as
+    atlas.quantize_act + atlas.qlinear (fx_export --native-fp8); those are checked by
+    _inspect_native_site, the rest by the decode-graph rules below. `storage` is the code buffer dtype
+    name those nodes were captured with."""
     nodes = list(program.graph.nodes)
     by_name = {node.name: node for node in nodes}
     lifted = {spec.target: by_name[spec.arg.name] for spec in program.graph_signature.input_specs
@@ -161,6 +342,10 @@ def inspect_graph(program, module, policy):
         if site not in selected or site in actual:
             raise FXVerificationError(f"unexpected or duplicated quantized module: {site}")
         actual.add(site)
+        if native_paths and path in native_paths:
+            rows.append(_inspect_native_site(path, layer, selected[site], native_paths[path], nodes, lifted,
+                                             depends_on_input, storage))
+            continue
         if layer.fm is not None or getattr(layer, "residual", None):
             raise FXVerificationError(f"{site}: initial FX path requires framework accumulation and no residual passes")
         prefix = path + "." if path else ""
@@ -217,12 +402,19 @@ def inspect_graph(program, module, policy):
             name = (path + "." if path else "") + "weight"
             if name in program.state_dict and not program.state_dict[name].is_meta:
                 raise FXVerificationError(f"{name}: unused float placeholder payload was retained")
-    return {"weight_site_bindings": rows, "weight_sites_verified": len(rows),
-            "functional_attention_sites": attention,
-            "functional_attention_structural_binding": "not certified; covered by boundary output parity",
-            "unused_parameters": unused,
-            "unused_quantized_weight_storage": "meta placeholders; no serialized float weight payload",
-            "scope": "reference-emulation FX; not native-FP8 MLIR or hardware compatibility"}
+    report = {"weight_site_bindings": rows, "weight_sites_verified": len(rows),
+              "functional_attention_sites": attention,
+              "functional_attention_structural_binding": "not certified; covered by boundary output parity",
+              "unused_parameters": unused,
+              "unused_quantized_weight_storage": "meta placeholders; no serialized float weight payload",
+              "scope": "reference-emulation FX; not native-FP8 MLIR or hardware compatibility"}
+    if native_paths:
+        report["native_fp8_sites"] = len(native_paths)
+        report["still_emulated"] = _emulated_report(nodes, module, native_paths)
+        report["scope"] = ("native-FP8-carrying FX (atlas.qlinear custom op) for the listed Linear sites; "
+                           "everything in still_emulated stays decode-and-contract reference emulation; "
+                           "not native-FP8 MLIR or hardware compatibility")
+    return report
 
 
 def verify_saved(directory, device="cpu"):
@@ -250,11 +442,21 @@ def verify_saved(directory, device="cpu"):
         signatures.add(json.dumps([tensor_record(fixtures[name]) for name in case["inputs"]], sort_keys=True))
     if len(signatures) < 2:
         raise FXVerificationError("saved parity requires at least two distinct input cases")
+    native = manifest.get("native_fp8")
+    if native:
+        # The saved graph names atlas.quantize_act / atlas.qlinear; they must be registered before load.
+        import exporter.atlas_fx_ops as atlas_fx_ops  # noqa: F401
     program = torch.export.load(directory / "model.pt2")
     expected_inventory = json.loads((directory / "buffer_inventory.json").read_text())
-    if not expected_inventory or _inventory(program.named_buffers()) != expected_inventory:
+    code_dtype = STORAGE_DTYPES[native["storage"]] if native else torch.uint8
+    if not expected_inventory or _inventory(program.named_buffers(), code_dtype) != expected_inventory:
         raise FXVerificationError("saved code/exponent inventory differs")
     inspected = json.loads((directory / "graph_inspection.json").read_text())
+    if native:
+        qlinears = [n for n in program.graph.nodes if n.op == "call_function"
+                    and n.target == torch.ops.atlas.qlinear.default]
+        if len(qlinears) != inspected.get("native_fp8_sites") or not qlinears:
+            raise FXVerificationError("saved graph's atlas.qlinear count differs from its inspection record")
     if not inspected.get("weight_site_bindings") or inspected.get("weight_sites_verified") != len(
             inspected["weight_site_bindings"]):
         raise FXVerificationError("saved weight binding inventory is empty or inconsistent")
@@ -268,19 +470,27 @@ def verify_saved(directory, device="cpu"):
             args = tuple(fixtures[name] for name in case["inputs"])
             _compare(replay(*args), [fixtures[name] for name in case["outputs"]], case["output_spec"])
     return {"status": "passed", "cases": len(cases), "all_outputs_byte_identical": True,
+            **({"native_fp8_ops_registered": True, "atlas_qlinear_nodes": len(qlinears)} if native else {}),
             "code_scale_bytes_preserved": True, "unused_float_weights_not_materialized": True,
             "model_replay_modules_imported": [name for name in ("exporter.load_quantized", "reference.ref_profile", "reference.ref_attention")
                                               if name in sys.modules]}
 
 
-def capture_fx(module, cases, directory, *, policy, provenance=None, strict=True, fresh_process=True):
-    """Capture fixed-shape reference replay, save, reload and fail closed on mismatch."""
+def capture_fx(module, cases, directory, *, policy, provenance=None, strict=True, fresh_process=True,
+               native_fp8=None):
+    """Capture fixed-shape reference replay, save, reload and fail closed on mismatch.
+
+    native_fp8: None keeps the decode-based graph. "uint8" or "float8_e4m3fn" captures each candidate
+    Linear (native_candidates) as atlas.quantize_act + atlas.qlinear with its code buffer held in that
+    dtype (the same bytes); the decode-based graph is also captured in memory and must give
+    byte-identical outputs. Conv2d, attention and other sites stay decode-based and are listed."""
     from safetensors.torch import save_file
 
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=False)
     report = {"schema": SCHEMA, "status": "running", "torch": torch.__version__,
               "strict": strict, "capture_mode": "ref_conv framework reference emulation",
+              "native_fp8": native_fp8,
               "provenance": provenance or {}, "native_fp8_mlir_verified": False,
               "hardware_compatibility_verified": False, "fresh_process_requested": fresh_process}
     try:
@@ -309,11 +519,41 @@ def capture_fx(module, cases, directory, *, policy, provenance=None, strict=True
             before = _inventory(module.named_buffers())
             if not before:
                 raise FXVerificationError("no quantized weight buffers at this boundary")
+            native_info, baseline = None, None
             with _meta_placeholders(module):
-                program = torch.export.export(module, cases[0], strict=strict)
-            if _inventory(program.named_buffers()) != before:
+                if native_fp8:
+                    if native_fp8 not in STORAGE_DTYPES:
+                        raise FXVerificationError(f"unknown native storage {native_fp8!r}")
+                    baseline = torch.export.export(module, cases[0], strict=strict)
+                    for args, (outputs, spec) in zip(cases, expected):
+                        _compare(baseline.module()(*args), outputs, spec)
+                    with _native_linears(module, policy, native_fp8) as rules:
+                        if not rules:
+                            raise FXVerificationError("--native-fp8: no Linear site can be carried natively")
+                        held = _inventory(module.named_buffers(), STORAGE_DTYPES[native_fp8])
+                        program = torch.export.export(module, cases[0], strict=strict)
+                    # the held buffers are a bitcast: same bytes, so same hash and shape as the uint8 codes
+                    if any(held[k]["sha256"] != before[k]["sha256"] or held[k]["shape"] != before[k]["shape"]
+                           for k in before):
+                        raise FXVerificationError("native buffers differ in bytes from the uint8 codes")
+                    native_info = {"storage": native_fp8, "ops": ["atlas.quantize_act", "atlas.qlinear"],
+                                   "ops_module": "exporter.atlas_fx_ops", "weight_format": "atlas_e4m3",
+                                   "sites": sorted(rules),
+                                   "code_bytes_equal_uint8_source": True}
+                    before = held
+                else:
+                    program = torch.export.export(module, cases[0], strict=strict)
+            if _inventory(program.named_buffers(), STORAGE_DTYPES[native_fp8] if native_fp8 else torch.uint8) != before:
                 raise FXVerificationError("capture changed code/exponent buffers")
-            graph_report = inspect_graph(program, module, policy)
+            graph_report = inspect_graph(program, module, policy, rules if native_fp8 else None,
+                                         native_fp8 or "uint8")
+            if native_fp8:
+                for args, (outputs, spec) in zip(cases, expected):
+                    _compare(program.module()(*args), _leaves(baseline.module()(*args))[0], spec)
+                native_info["outputs_identical_to_decode_graph"] = True
+                native_info["decode_graph_nodes"] = len(baseline.graph.nodes)
+                native_info["native_graph_nodes"] = len(program.graph.nodes)
+                report["native_fp8_detail"] = native_info
             for args, (outputs, spec) in zip(cases, expected):
                 _compare(program.module()(*args), outputs, spec)
             save_file(fixtures, str(directory / "fixtures.safetensors"))
@@ -327,6 +567,7 @@ def capture_fx(module, cases, directory, *, policy, provenance=None, strict=True
         _json(directory / "fx_manifest.json", {"schema": "atlas_torchao.fx_bundle.v1",
               "torch": torch.__version__, "device": str(cases[0][0].device),
               "provenance": provenance or {},
+              **({"native_fp8": native_info} if native_info else {}),
               "files": {name: _file_record(directory / name) for name in BUNDLE_FILES}})
         report["same_process_reload"] = verify_saved(directory, str(cases[0][0].device))
         if fresh_process:
@@ -370,6 +611,13 @@ def main(argv=None):
     parser.add_argument("--seqlen", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--non-strict", action="store_true", help="explicitly select non-strict capture")
+    parser.add_argument("--native-fp8", action="store_true",
+                        help="carry each eligible quantized Linear as atlas.quantize_act + atlas.qlinear on its "
+                             "code/exponent buffers (src/exporter/atlas_fx_ops.py); the default is the decode-based graph")
+    parser.add_argument("--native-storage", choices=sorted(STORAGE_DTYPES), default="uint8",
+                        help="dtype of the held weight-code buffers with --native-fp8. uint8 (default) keeps the "
+                             "export bytes; float8_e4m3fn is a bitcast of the same bytes, refused when a layer "
+                             "holds a code on which torch and ref_numerics decode differently")
     parser.add_argument("--verify-dir", help="fresh-process replay of an existing FX bundle")
     args = parser.parse_args(argv)
     if args.verify_dir:
@@ -391,6 +639,7 @@ def main(argv=None):
                   .to(args.device),) for i in range(2)]
         report = capture_fx(CausalLogits(model).eval(), cases, args.out_dir, policy=policy,
                             strict=not args.non_strict,
+                            native_fp8=args.native_storage if args.native_fp8 else None,
                             provenance={"export_dir": str(Path(args.export_dir).resolve()),
                                         "export_manifest_sha256": quant_export.sha256_file(
                                             Path(args.export_dir) / "manifest.json"),
