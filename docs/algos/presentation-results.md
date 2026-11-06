@@ -67,7 +67,7 @@ Accumulation model on nine isolated layers (static export): relative L2 against 
 - DiT's own attention: the six `RoPEAttention` blocks are now attention sites (7 new tests pass; 77 passed and 16 skipped with the tile and native tests). Re-exported bundle `exports-tile/multitask-dit/atlas_v1_awq_tile_static_attn/`: 30 qk and 30 pv pairs, 209 of 209 sites tile-native, checker 25 of 25, strict capture and fresh-process replay passed (`docs/algos/dit-own-attention.md`). Static sites outside 122..128: 94 of 209 (the 6 new `p` sites at code 119 added 6). Attention matrices have 24 tokens, a partial tile; the compiler must confirm tail-tile handling. No DiT quality number, dropout not modelled.
 - No quality numbers for SmolVLA, DiT or Pi0.
 - No hardware equivalence claim: exact float32 accumulation plus `sa`/`ipt` models on nine isolated TinyLlama layers; no RTL run by us.
-- Full suite on the merged branch before the last two changes (`dead_columns` option, SmolVLA verifier): 870 passed, 35 skipped, 10 deselected, 0 failed. Rerun after those two changes: see the PR.
+- Full suite on the merged branch before the last two changes (`dead_columns` option, SmolVLA verifier): 870 passed, 35 skipped, 10 deselected, 0 failed. Rerun on the final branch (commit 154e08c, includes the `dead_columns` option and the SmolVLA verifier): 889 passed, 35 skipped, 10 deselected, 0 failed, in 22 minutes 19 seconds.
 
 ## 6. Decisions needed (full list in `/scratch2/lorenhung/atlas-fp8/tile-aware-checkin.md`)
 
