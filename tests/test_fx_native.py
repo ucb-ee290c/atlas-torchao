@@ -525,6 +525,9 @@ def test_quantized_layer_the_boundary_never_calls_is_recorded(tmp_path, native):
     inspection = json.loads((tmp_path / "fx" / "graph_inspection.json").read_text())
     assert inspection["unused_quantized_modules"] == [{"site": "idle", "module": "idle"}]
     assert inspection["weight_sites_verified"] == 1
+    assert ("still_emulated" not in inspection) == (native is None)
+    if native:
+        assert inspection["still_emulated"]["emulated_modules"] == {}      # an idle layer is not "emulated"
     inventory = json.loads((tmp_path / "fx" / "buffer_inventory.json").read_text())
     assert sorted(inventory) == ["used.weight_codes", "used.weight_scale_exp"]
 

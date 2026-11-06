@@ -682,7 +682,7 @@ def inspect_graph(program, module, policy, plan=None, storage="uint8", unused=()
         raise FXVerificationError(f"quantized module census differs: missing {sorted(set(selected) - actual)}")
     attention = [name for name, site in policy["sites"].items()
                  if site["status"] == "quantized" and site["kind"] == "attention"]
-    unused = [spec.target for spec in program.graph_signature.input_specs
+    unused_params = [spec.target for spec in program.graph_signature.input_specs
               if spec.kind.name == "PARAMETER" and isinstance(spec.target, str)
               and not by_name[spec.arg.name].users]
     for path, layer in module.named_modules():
@@ -699,7 +699,7 @@ def inspect_graph(program, module, policy, plan=None, storage="uint8", unused=()
               "bf16_by_policy": _bf16_by_policy_report(program, nodes, module, policy),
               "functional_attention_sites": attention,
               "functional_attention_structural_binding": "not certified; covered by boundary output parity",
-              "unused_parameters": unused,
+              "unused_parameters": unused_params,
               "unused_quantized_weight_storage": "meta placeholders; no serialized float weight payload",
               "scope": "reference-emulation FX; not native-FP8 MLIR or hardware compatibility"}
     if plan:
