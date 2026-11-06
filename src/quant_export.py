@@ -32,6 +32,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
+import pack_plan
 import tile_native
 
 POLICY_SCHEMA = "atlas_torchao.execution_policy.v1"        # NEW
@@ -473,7 +474,7 @@ def build_policy(model, mode, report, algo, options, skip, bf16_opt_out, opt_out
         v = opts.get(k)
         if v is not None and (base == "chip" or k not in chip_opts):
             chip_opts[k] = v
-    return {
+    policy = {
         "schema": POLICY_SCHEMA, "format_version": FORMAT_VERSION,
         "exported_mode": mode, "profile": quant_modes.canonical(mode), "ops": list(prof["ops"]),
         "operand": dict(OPERAND), "scale": dict(SCALE),
@@ -506,6 +507,10 @@ def build_policy(model, mode, report, algo, options, skip, bf16_opt_out, opt_out
         "compiler_pack_scale_admission": tile_native.pack_admission_report(static_act, weight_ranges),
         "pending_hardware_rulings": PENDING_RULINGS,
     }
+    # REPORTING ONLY (docs/algos/pack-plan.md): per static activation site the pack code, in-range flag, fold k and cost.
+    # The producer class needs the FX graph (capture_fx fills it into fx/policy.json); here it is 'unknown' except attention p.
+    pack_plan.attach(policy, pack_plan.build_plan(policy))
+    return policy
 
 
 # ---------------------------------------------------------------------------------------------

@@ -1,6 +1,7 @@
 """Independent checks of a tile-aware export + native FP8 FX bundle. Reads the files directly (safetensors, policy.json,
 model.pt2 graph); does not trust graph_inspection.json except where it is cross-checked.
 usage: verify_bundle.py EXPORT_DIR FX_DIR OUT_JSON [--allow-uncalibrated-fallback] [--forbid-unquantized-attention]
+                        [--require-pack-range]
        (run with PYTHONPATH=<worktree>/src)
 
 Declared vs unexpected contractions (check no_unexpected_non_atlas_contraction). A contraction outside the atlas.*
@@ -10,6 +11,10 @@ ops is DECLARED, and reported in graph.allowed_non_atlas_contractions, when it i
   - the float32 RoPE inv_freq x position outer product (no weight),
   - a plain BF16 scaled_dot_product_attention whose module is NOT in or around any policy attention site (the
     ALLOWED_PLAIN_OPS allow-list). These are counted in graph.unquantized_attention, never hidden.
+Pack plan (informational): `pack_plan` in the result recomputes the per-site pack-scale plan from policy.json and
+fx/graph.txt (src/pack_plan.py, docs/algos/pack-plan.md) and compares it with the recorded `pack_plan_summary`; it never fails
+a check. With --require-pack-range the check `pack_range_plan_present` fails when a static activation site is outside the
+admitted E8M0 range 122..128 and its recorded plan (fx/policy.json, else export/policy.json) is missing or infeasible.
 Everything else (a BF16 matmul / mm / bmm / Linear with a quantized or unknown weight, an SDPA inside a policy
 attention site, an SDPA without module info or not in BF16) is UNEXPECTED and fails the check."""
 import argparse
@@ -22,6 +27,7 @@ import torch
 from safetensors import safe_open
 
 import atlas_fx_ops  # noqa: F401  registers atlas.* ops
+import pack_plan
 
 CONTRACT = ("aten.linear", "aten.matmul", "aten.mm", "aten.bmm", "aten.addmm", "aten.baddbmm", "aten.einsum",
             "aten.conv", "aten._convolution", "aten.dot", "aten.mv", "aten.scaled_dot_product", "aten._scaled_dot")
@@ -91,12 +97,39 @@ def main(argv=None):
                          "export declared them)")
     ap.add_argument("--forbid-unquantized-attention", action="store_true",
                     help="treat plain BF16 attention outside policy sites as unexpected instead of declared")
+    ap.add_argument("--require-pack-range", action="store_true",
+                    help="fail when a static activation site is outside the compiler's admitted pack range (E8M0 122..128) "
+                         "and has no recorded pack_plan (default: the pack plan is informational only)")
     args = ap.parse_args(argv)
     export, fx, out = Path(args.export), Path(args.fx), Path(args.out)
-    return run(export, fx, out, args.allow_uncalibrated_fallback, not args.forbid_unquantized_attention)
+    return run(export, fx, out, args.allow_uncalibrated_fallback, not args.forbid_unquantized_attention,
+               args.require_pack_range)
 
 
-def run(export, fx, out, allow_fallback=False, allow_unquantized_attention=True):
+def pack_plan_report(policy, export, fx):
+    """INFORMATIONAL pack plan: recomputed from the export policy and the FX graph text, next to what the bundle recorded.
+    Returns (report, recorded plan {site key: record or None})."""
+    g, s = fx / "graph.txt", fx / "graph_signature.txt"
+    graph = g.read_text() if g.exists() else None
+    plan = pack_plan.plan_from_files(policy, graph, s.read_text() if s.exists() else None)
+    recomputed = pack_plan.summarize(plan, policy)
+    fx_pol = json.loads((fx / "policy.json").read_text()) if (fx / "policy.json").exists() else {}
+    gi = json.loads((fx / "graph_inspection.json").read_text()) if (fx / "graph_inspection.json").exists() else {}
+    recorded_fx = pack_plan.recorded_plan(fx_pol) if fx_pol else {}
+    recorded_ex = pack_plan.recorded_plan(policy)
+    # the plan a compiler owner consumes: fx/policy.json (producer classes from the graph), else the export's own
+    recorded = {k: recorded_fx.get(k) or recorded_ex.get(k) for k in plan}
+    keys = ("sites_outside", "outside_by_class", "outside_by_cost", "free_fold_sites")
+    rec_sum = {"export_policy": policy.get("pack_plan_summary"), "fx_policy": fx_pol.get("pack_plan_summary"),
+               "graph_inspection": gi.get("pack_plan_summary")}
+    return {"informational": True, "graph_available": graph is not None, "recomputed": recomputed,
+            "recorded_summaries_present": {k: v is not None for k, v in rec_sum.items()},
+            "recorded_matches_recomputed": {k: (None if v is None else all(v.get(f) == recomputed.get(f) for f in keys))
+                                            for k, v in rec_sum.items()},
+            "sites_with_recorded_plan": sum(1 for r in recorded.values() if r is not None)}, recorded
+
+
+def run(export, fx, out, allow_fallback=False, allow_unquantized_attention=True, require_pack_range=False):
     policy = json.loads((export / "policy.json").read_text())
     res = {"export_dir": str(export), "fx_dir": str(fx), "checks": {}}
     fails = []
@@ -284,6 +317,15 @@ def run(export, fx, out, allow_fallback=False, allow_unquantized_attention=True)
         "status": adm.get("status", "legacy export: no status field" if "status" not in adm else None),
         "static_sites_checked": adm.get("sites_checked"), "static_sites_outside": adm.get("sites_outside"),
         "dynamic_fixture": {k: v for k, v in dyn_adm.items() if k != "codes"} if isinstance(dyn_adm, dict) else dyn_adm}
+    res["pack_plan"], recorded_plan = pack_plan_report(policy, export, fx)      # informational, never a failing check
+    if require_pack_range:
+        exps = pack_plan.static_sites(policy)
+        lo, hi = pack_plan.PACK_ADMISSION
+        outside = {k: r for k, r in recorded_plan.items()
+                   if (r is not None and not r.get("in_range")) or (r is None and not lo <= 127 + exps[k]["exp"] <= hi)}
+        missing = pack_plan.require_pack_range(outside)
+        check("pack_range_plan_present", not missing,
+              {"static_sites": len(recorded_plan), "sites_outside_without_plan": len(missing), "examples": missing[:5]})
     ver = json.loads((fx / "verification.json").read_text())
     check("capture_verification_passed", ver["status"] == "passed", ver["status"])
     check("fresh_process_verification_passed", fresh.get("status") == "passed", fresh.get("status"))
