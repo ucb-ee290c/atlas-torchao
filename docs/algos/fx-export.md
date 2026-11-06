@@ -45,6 +45,51 @@ architecture, `load_quantized`, `ref_profile` or `ref_attention`. Use the captur
 and a compatible PyTorch version; cross-version or cross-device portability is not
 established by this check.
 
+## Native-FP8 option (`--native-fp8`)
+
+The default graph above decodes every quantized Linear into aten ops. With `--native-fp8`, each
+eligible Linear is instead two opaque nodes from `src/atlas_fx_ops.py`:
+
+```
+%quantize_act = atlas.quantize_act(%x_bf16, dynamic, token, nc, None, uint8)   -> (codes, exp)
+%qlinear      = atlas.qlinear(%codes, %exp, %<fqn>_weight_codes, %<fqn>_weight_scale_exp, %bias, bfloat16, atlas_e4m3)
+```
+
+The weight code and exponent buffers are consumed directly; no `convert`, `exp2`, `mul` or float
+weight remains in that layer's scope. The activation rule is read from `policy.json` (reference per
+tensor, dynamic token/tensor with rule `ref` or `nc`, or a static exponent). The eager bodies call the
+reference code (`ref_numerics`, `algos.granularity.scale_exp`, `F.linear`, bias after), so outputs are
+byte-identical to eager replay and to the decode graph; `capture_fx` also captures the decode graph
+in memory and compares both on every input case.
+
+```bash
+python src/fx_export.py --export-dir EXPORT --model CONFIG --out-dir NEW_DIR --device cpu --seqlen 8 --native-fp8
+python src/fx_export.py --verify-dir NEW_DIR --device cpu       # imports atlas_fx_ops itself
+```
+
+- **Loading a saved native bundle.** `model.pt2` names `atlas.quantize_act.default` and
+  `atlas.qlinear.default`. Run `import atlas_fx_ops` (from `src/`) before `torch.export.load`, or the
+  load fails with an unknown-operator error. `verify_saved` does this when `fx_manifest.json` has a
+  `native_fp8` record; tests/test_fx_native.py checks that a bare load fails and the verifier passes.
+- **Storage dtype.** `--native-storage uint8` (default) holds the export bytes as uint8 and the
+  operators carry the format as the `weight_format="atlas_e4m3"` attribute. `--native-storage
+  float8_e4m3fn` holds the same bytes as a `torch.float8_e4m3fn` bitcast. The two decoders do not agree
+  on every code: `torch.float8_e4m3fn` reads the 14 exponent-0 non-zero codes (0x01-0x07, 0x81-0x87)
+  as subnormals where `ref_numerics.e4m3_unpack` gives zero (flush to zero), and 0x7F/0xFF as NaN. The
+  other 240 of the 254 valid codes (including exponent 15 and the 448 maximum) are bit-identical. The
+  encoder never emits those 16 codes, and the float8 option refuses any layer that contains one.
+  `uint8` is the default because the proof is "every valid code", not "every code the encoder emits".
+- **Inventory.** `buffer_inventory.json` records the held dtype and the sha256 of the bytes; for
+  float8 storage the hash equals the hash of the original uint8 codes (checked at capture).
+- **Scope.** Linear layers with a per-tensor or per-channel weight exponent and a reference, token,
+  tensor or static activation rule. Per-block scales, residual passes, MXU models, Conv2d and the
+  attention Q.K / P.V operands stay on the decode path. `graph_inspection.json` lists them under
+  `still_emulated` (modules, their contraction nodes, the amax/frexp/gt scale nodes, node counts).
+- **Output rescale.** The operator scales the operands by their power-of-two exponents before the
+  contraction, as eager `ref_conv` does. The policy's wording (normalized operands, then
+  `2^(sx+sw)` in float32, then the layer dtype) gives the same bytes for per-token x per-channel
+  exponents; `test_rescale_after_contraction_equals_operand_scaling` measures it.
+
 ## Files
 
 | File | Contents |
@@ -98,6 +143,6 @@ A small synthetic DiT regression can check preservation of the exact BF16 patch
 exception without establishing full-checkpoint action-graph export. Real-model GPU
 capture is separate evidence from the synthetic CPU tests.
 
-model2MLIR lowering follows this graph check. Its native-FP8-to-FP32 projection and the
+model2MLIR lowering follows this graph check (step 3, not part of the native-FP8 option). Its native-FP8-to-FP32 projection and the
 448-versus-240 target-contract conflict remain separate blockers to claiming native
 FP8 or hardware compatibility; they do not change the reference-emulation scope here.
