@@ -37,6 +37,10 @@ Parameters (--algo gptq_awq:k=v,...):
   damp=0.01                  GPTQ dampening (Sec. 4 Step 3: 1%)
   block=128                  GPTQ lazy-batch block (Sec. 4 Step 2: B = 128)
   grid=20                    AWQ alpha grid (Sec. 5.1)
+  dead_columns=zero|rtn      input channels with diag(H) == 0 (exactly zero calibration input): `zero` (default,
+                             the original behaviour) sets the weight column to 0; `rtn` (NEW, opt-in) casts it with
+                             plain round-to-nearest on the pinned grid and keeps it out of the error feedback
+                             (docs/algos/gptq-dead-columns.md)
   hessians=cpu|device        where the calibration Hessians are kept (NEW, default cpu). Each
                              batch's x^T x is computed on the activation's device and summed into
                              a float32 CPU accumulator; GPTQ / AWQ move one layer's H to the
@@ -65,6 +69,7 @@ import ref_numerics as rn
 from algos.base import Algo, Scale
 
 METHODS = ("gptq", "awq", "awq_gptq")
+DEAD_COLUMNS = ("zero", "rtn")
 # producer suffix -> consumer suffixes (relative to the decoder layer); NEW, see the docstring
 NORM_GROUPS = {
     "input_layernorm": ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"),
@@ -90,7 +95,8 @@ DAMP_RETRIES = 3              # NEW: on a failed Cholesky, retry with 10x then 1
 
 
 @torch.no_grad()
-def gptq(W: torch.Tensor, H: torch.Tensor, s, block=128, damp=0.01, actorder=True, info=None) -> torch.Tensor:
+def gptq(W: torch.Tensor, H: torch.Tensor, s, block=128, damp=0.01, actorder=True, info=None,
+         dead_columns="zero") -> torch.Tensor:
     """GPTQ Algorithm 1 (arXiv 2210.17323) with quant() = qdq(., s). W [out, in], H [in, in], s a
     scalar exponent or one per output row ([out, 1], as GPTQ's own per-row quantizer).
     Returns the dequantized weight (float32); every entry lies on the E4M3 x 2^s grid.
@@ -98,19 +104,36 @@ def gptq(W: torch.Tensor, H: torch.Tensor, s, block=128, damp=0.01, actorder=Tru
     If the dampened H cannot be factored (rounding in the float32 calibration sum can leave a
     large, badly scaled H slightly indefinite), the factorisation is retried with 10x and then 100x
     the dampening (NEW, as common GPTQ implementations do); `info["damp"]` records the value
-    used. The first attempt is exactly the paper's step, so a layer that factors is unchanged."""
+    used. The first attempt is exactly the paper's step, so a layer that factors is unchanged.
+
+    dead_columns (NEW; default "zero" is the original code path, bit for bit): a column with
+    diag(H) == 0 saw only exact zeros in calibration. "zero" sets W[:, col] = 0 (harmless on the
+    calibration data, destructive for any input that excites the channel). "rtn" keeps the column
+    and casts it with qdq(., s) on the same pinned exponent. Dead columns take no part in the error
+    feedback: H has zero cross terms for them (H[dead, dead] = 1 only), so GPTQ's own propagation
+    to and from them is zero, and the loop enforces that exactly (their error is not fed forward),
+    so the live columns are bit-identical to dead_columns="zero". `info["dead"]` = their count."""
+    if dead_columns not in DEAD_COLUMNS:
+        raise ValueError(f"gptq: dead_columns={dead_columns!r}; choose from {DEAD_COLUMNS}")
     s = torch.as_tensor(s, dtype=torch.int32, device=W.device)
     s = s.reshape(-1) if s.dim() == 2 else s                 # one exponent per entry of a column
     W = W.detach().clone().float()
+    W0 = W.clone() if dead_columns == "rtn" else None
     H = H.detach().clone().double().to(W.device)
     K = W.shape[1]
     dead = torch.diag(H) == 0
+    dead0 = dead
     H[dead, dead] = 1
-    W[:, dead] = 0
+    if dead_columns == "zero":
+        W[:, dead] = 0
+    if info is not None:
+        info["dead"] = int(dead.sum())
     perm = None
     if actorder:
         perm = torch.argsort(torch.diag(H), descending=True)
         W, H = W[:, perm], H[perm][:, perm]
+        dead = dead[perm]
+    skip_feedback = dead.tolist() if dead_columns == "rtn" and bool(dead.any()) else None
     eye = torch.eye(K, dtype=H.dtype, device=H.device)
     mean_diag = torch.mean(torch.diag(H))
     Hinv = None
@@ -139,11 +162,15 @@ def gptq(W: torch.Tensor, H: torch.Tensor, s, block=128, damp=0.01, actorder=Tru
             q = qdq(w, s)
             Q[:, i1 + i] = q
             err = (w - q) / Hinv1[i, i]
+            if skip_feedback is not None and skip_feedback[i1 + i]:
+                err = torch.zeros_like(err)                  # dead_columns=rtn: no feedback from a dead column
             W1[:, i:] -= err.unsqueeze(1) @ Hinv1[i, i:].unsqueeze(0)
             Err1[:, i] = err
         W[:, i2:] -= Err1 @ Hinv[i1:i2, i2:]
     if perm is not None:
         Q = Q[:, torch.argsort(perm)]
+    if W0 is not None and bool(dead0.any()):
+        Q[:, dead0] = qdq(W0[:, dead0], s.reshape(-1, 1) if s.dim() == 1 else s)       # dead_columns=rtn: exactly plain RTN on the pinned grid
     return Q
 
 
@@ -267,7 +294,7 @@ class GptqAwq(Algo):
         if self.method not in METHODS:
             raise ValueError(f"gptq_awq: method={self.method!r}; choose from {METHODS}")
         unknown = set(params) - {"method", "actorder", "damp", "block", "grid", "hessians", "awq_loss", "calib", "target",
-                                 "producer_aware"}
+                                 "producer_aware", "dead_columns"}
         if unknown:
             raise ValueError(f"gptq_awq: unknown parameters {sorted(unknown)}")
         self.actorder = bool(params.get("actorder", True))
@@ -292,6 +319,10 @@ class GptqAwq(Algo):
         self.producer_aware = _as_bool(params.get("producer_aware", False))
         if self.producer_aware and self.awq_loss == "cast":
             raise ValueError("gptq_awq: producer_aware=true is implemented for awq_loss=weight only")
+        # NEW opt-in (default zero = unchanged): dead input columns cast by RTN instead of zeroed
+        self.dead_columns = str(params.get("dead_columns", "zero"))
+        if self.dead_columns not in DEAD_COLUMNS:
+            raise ValueError(f"gptq_awq: dead_columns={self.dead_columns!r}; choose from {DEAD_COLUMNS}")
         self.subsample = {}                         # owner fqn -> [T, K] CPU token subsample
         self.Hhat, self.Cxx = {}, {}                # calib=chip: sum x_hat x_hat^T, sum x x_hat^T
         self.alpha_picks = {}                       # fold group -> {"weight": a, "cast": a}
@@ -639,7 +670,7 @@ class GptqAwq(Algo):
             w = torch.linalg.solve(Hd, WC.T).T.to(device=w.device, dtype=w.dtype)
         s0, gran = self._grid(name, w, kind)
         key = (name, self.method, self.actorder, self.damp, self.block, _fingerprint(w),
-               _fingerprint(s0.contiguous()), chip, fp)
+               _fingerprint(s0.contiguous()), chip, fp, self.dead_columns)
         if key not in self._gptq_cache:
             t_gptq = time.time()
             dev = w.device                  # one layer's H moves to the weight's device (gptq())
@@ -651,7 +682,8 @@ class GptqAwq(Algo):
             else:
                 Hn = H
             ginfo = {}
-            wq = gptq(w, Hn, s0.to(dev), self.block, self.damp, self.actorder, info=ginfo)
+            extra = {} if self.dead_columns == "zero" else {"dead_columns": self.dead_columns}   # default call unchanged
+            wq = gptq(w, Hn, s0.to(dev), self.block, self.damp, self.actorder, info=ginfo, **extra)
             if ginfo.get("damp", self.damp) != self.damp:
                 self.damp_raised[name] = ginfo["damp"]
             self._gptq_cache[key] = wq.to(device=w.device, dtype=w.dtype)
@@ -678,6 +710,8 @@ class GptqAwq(Algo):
         rec["damp_raised"] = dict(self.damp_raised)
         if self.producer_aware:
             rec["producer_aware"] = True
+        if self.dead_columns != "zero":
+            rec["dead_columns"] = self.dead_columns
         rec["hw_aware"] = {"awq_loss": self.awq_loss, "calib": self.calib, "target": self.target,
                            "alpha_picks": dict(self.alpha_picks),
                            "timing_s": {k: round(v, 2) for k, v in self.timing.items()}}
