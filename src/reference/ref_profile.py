@@ -26,6 +26,8 @@ import algos
 import reference.ref_numerics as rn
 from algos import base as algo_hooks
 
+_FISHER_ROWS = 1024        # output rows of the weight-gradient block in the Fisher hook
+
 
 def _set_module(root: nn.Module, name: str, new: nn.Module) -> None:
     """smolVLA model_patcher.py:520-525."""
@@ -54,7 +56,7 @@ class RefQuantLinear(nn.Module):
         self.layer_name = name
         self.algo = algos.current()              # None under --algo none (src/algos)
         self._profile_fisher = None
-        self._dw = None
+        self._record = False
         with torch.no_grad():
             w_q, s_w, self.weight_block = algo_hooks.weight_cast(self.algo, name, self.weight.detach(), "linear")
         self.register_buffer("weight_codes", w_q, persistent=False)
@@ -88,17 +90,20 @@ class RefQuantLinear(nn.Module):
             self.register_buffer("weight_lo_norm", rn.e4m3_unpack(q2), persistent=False)
         self.algo.note("weight", f"linear:residual_{self.residual}", self.layer_name)
 
+    @staticmethod
+    def _dequant(q, s, blk=None) -> torch.Tensor:
+        """Codes + scale exponent back to values; `blk` is the per-block size (None = per-tensor)."""
+        return algo_hooks.dequant(q, s, blk) if blk else rn.dequantize(q, s)
+
     def _dequant_weight(self) -> torch.Tensor:
-        if self.weight_block:
-            return algo_hooks.dequant(self.weight_codes, self.weight_scale_exp, self.weight_block)
-        return rn.dequantize(self.weight_codes, self.weight_scale_exp)
-    
+        return self._dequant(self.weight_codes, self.weight_scale_exp, self.weight_block)
+
     def _dequant_act(self, x: torch.Tensor) -> torch.Tensor:
+        """dequant(quant(x)) under the layer's activation rule (algorithm hook, else the reference cast)."""
         if self.algo is not None:
             x_q, s_x, blk = algo_hooks.act_cast(self.algo, self.layer_name, x, "linear")
-            return algo_hooks.dequant(x_q, s_x, blk) if blk else rn.dequantize(x_q, s_x)
-        x_q, s_x = rn.quantize(x)
-        return rn.dequantize(x_q, s_x)
+            return self._dequant(x_q, s_x, blk)
+        return self._dequant(*rn.quantize(x))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self._profile_fisher is not None:
@@ -107,44 +112,51 @@ class RefQuantLinear(nn.Module):
 
     def profile_fisher(self, enable: bool = True, record: bool = True) -> None:
         """Profile mode: forward returns the clean output (the FP8 cast is not differentiable, so a
-        layer left on the quantized path blocks gradients to everything upstream of it). record=False
+        layer left on the quantized path blocks gradients to everything upstream). record=False
         keeps that clean pass-through but accumulates nothing (layers outside the profiled set)."""
         if enable:
             self._profile_fisher = torch.zeros(2, dtype=torch.float64, device=self.weight.device)
-            self._dw = (self._dequant_weight().float() - self.weight.float().reshape(self.weight_codes.shape)
-                        if record else None)
+            self._record = record
         else:
-            self._profile_fisher, self._dw = None, None
+            self._profile_fisher, self._record = None, False
 
     def fisher_report(self, n_batches: int = 1) -> dict:
         """Accumulated sensitivity per batch: weights, input activations, and their sum."""
         if self._profile_fisher is None:
             raise RuntimeError(f"{self.layer_name}: fisher_report called without profile_fisher(True)")
-        fw, fx = (self._profile_fisher.double() / max(n_batches, 1)).tolist()
+        fw, fx = (self._profile_fisher / max(n_batches, 1)).tolist()
         return {"macs": self.weight.numel(), "fisher_w": fw, "fisher_x": fx, "fisher": fw + fx}
 
     def _forward_profiled(self, x: torch.Tensor) -> torch.Tensor:
         x = x.to(self.weight.dtype)
         y = F.linear(x, self.weight, self.bias)
-  
-        if y.requires_grad and self._dw is not None:
+        if y.requires_grad and self._record:
+            xd = x.detach()
             with torch.no_grad():
-                xd = x.detach()
-                dx = (self._dequant_act(xd).float() - xd.float()).flatten(0, -2)
-
-            xf = xd.float().flatten(0, -2)
-
-            def fisher(grad):
-                g = grad.float().flatten(0, -2)                     # [T, out]
-                gW = g.T @ xf                                       # [out, in]
-                gx = g   @ self.weight.detach().float()               # [T, in]
-                self._profile_fisher[0] += 0.5 * (gW.pow(2) * self._dw.pow(2)).sum()
-                self._profile_fisher[1] += 0.5 * (gx.pow(2) * dx.pow(2)).sum()
-
-            y.register_hook(fisher)
-            
+                dx = (self._dequant_act(xd).float() - xd.float()).flatten(0, -2)    # activation rounding error
+            y.register_hook(lambda g: self._accumulate_fisher(g, xd.float().flatten(0, -2), dx))
         return y
-        
+
+    def _accumulate_fisher(self, grad: torch.Tensor, xf: torch.Tensor, dx: torch.Tensor) -> None:
+        """Backward hook body: 0.5 * sum(grad^2 * delta^2) for the weights and the input activations.
+        Returns None so the gradient is left unchanged.
+
+        Memory: the weight error dW = dequant(W_q) - W is rebuilt here, not stored per layer, and the
+        weight term is summed over blocks of `_FISHER_ROWS` output rows so the [out, in] gradient
+        gW = g^T x is never whole (each row of gW is independent, so the sum is unchanged)."""
+        g = grad.float().flatten(0, -2)                             # [T, out]
+        w = self.weight.detach()
+        w_q = self._dequant_weight()                                # [out, in]
+        fw = torch.zeros((), dtype=torch.float64, device=g.device)
+        for i in range(0, g.shape[1], _FISHER_ROWS):
+            rows = slice(i, i + _FISHER_ROWS)
+            gW = g[:, rows].T @ xf                                  # [rows, in]
+            dW = w_q[rows].float() - w.reshape(w_q.shape)[rows].float()
+            fw += 0.5 * (gW.pow(2) * dW.pow(2)).sum()
+        gx = g @ w.float()                                          # [T, in]
+        self._profile_fisher[0] += fw
+        self._profile_fisher[1] += 0.5 * (gx.pow(2) * dx.pow(2)).sum()
+
     def _forward_quant(self, x: torch.Tensor) -> torch.Tensor:
         dtype = self.weight.dtype
         # Operate in the weight dtype; some activations arrive as float32 (quant_linear.py:133-137).
@@ -180,8 +192,7 @@ class RefQuantLinear(nn.Module):
             scale = algo_hooks.output_scale(s_x, self.weight_scale_exp)
             y = (y_unscaled * scale).to(dtype=dtype, device=x.device)
         else:
-            x_dq = (algo_hooks.dequant(x_q, s_x, blk) if blk else rn.dequantize(x_q, s_x)).to(dtype)
-            y = F.linear(x_dq, self._dequant_weight().to(dtype))
+            y = F.linear(self._dequant(x_q, s_x, blk).to(dtype), self._dequant_weight().to(dtype))
         if self.bias is not None:
             y = y + self.bias
         return y

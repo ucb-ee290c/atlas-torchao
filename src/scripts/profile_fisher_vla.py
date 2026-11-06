@@ -1,8 +1,8 @@
 """Fisher-delta profile of a LeRobot VLA (SmolVLA) under the reference FP8 profile.
 
     python src/scripts/profile_fisher_vla.py --policy lerobot/smolvla_base --dataset lerobot/svla_so100_pickplace \\
-        --norm-stats dataset --n 8 --draws 4 --out src/out/fisher_smolvla.json
-    python src/scripts/plot_fisher.py src/out/fisher_smolvla.json --tower language
+        --norm-stats dataset --n 8 --draws 4 --out src/out/fisher/smolvla/smolvla_n8.json
+    python src/scripts/plot_fisher.py src/out/fisher/smolvla/smolvla_n8.json --tower language
 
 Needs the environment that has `lerobot`. UNTESTED: written against eval_policy.py's loaders; the loss
 call and the anchor names below are the parts to check on a first run (see --help).
@@ -11,9 +11,12 @@ Loss: the policy's flow-matching loss on a calibration frame (episodes eval_poli
 used). The loss samples noise and a time t, so every (frame, draw) pair is its own job, run under its
 own seed; scores are averaged over jobs (not the gradients, which would square a mean).
 
-Entries carry "tower": vision | language | expert | action_head, so towers can be compared or plotted
-separately."""
+Entries carry "tower": vision | language | expert | action_head | joint_attn, so towers can be compared or
+plotted separately. SmolVLA's attention runs through one shared function; smolvla_attention_split.py assigns
+each call to language (the VLM's own attention), expert (its cross-attention) or joint_attn (one attention
+over both) from the call order."""
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -61,10 +64,14 @@ def main():
     ap.add_argument("--exclude", nargs="*", default=[], help="fqn substrings left unquantized and unprofiled")
     ap.add_argument("--no-attn", action="store_true")
     ap.add_argument("--top", type=int, default=15)
-    ap.add_argument("--out", required=True)
+    ap.add_argument("--out", default=None,
+                    help="report JSON (default: src/out/fisher/<policy>/<policy>_n<N>.json)")
     import loaders.policy_norm as policy_norm
     policy_norm.add_args(ap)
     a = ap.parse_args()
+    if a.out is None:
+        tag = re.split(r"[-_]", Path(a.policy).name)[0].lower()
+        a.out = str(REPO / "src" / "out" / "fisher" / tag / f"{tag}_n{a.n}.json")
     a.seed = a.eval_seed                      # the name eval_policy's helpers read
 
     import torch
@@ -101,6 +108,10 @@ def main():
                                anchors=anchors, attention=not a.no_attn)
     for n, r in res.items():
         r["tower"] = tower_of(n)
+    from smolvla_attention_split import split_joint_attention
+    split = split_joint_attention(res, getattr(policy.config, "self_attn_every_n_layers", 2))
+    if split:
+        print(f"attention calls by site: {split}")
     bad = [n for n, r in res.items() if not 0 < r["fisher"] < float("inf")]
     print(f"{len(res)} entries; zero / non-finite: {len(bad)} {bad[:8]}")
     tot = sum(r["fisher"] for r in res.values())
@@ -112,7 +123,9 @@ def main():
     write_report(res, {"model": a.policy, "dataset": a.dataset, "n": a.n, "draws": a.draws,
                        "seqlen": "n/a", "seed": a.calib_seed, "include": a.include, "calibration": rec,
                        "loss": "policy flow-matching loss x action numel (sum convention)",
-                       "normalization": norm["status"]}, a.out)
+                       "normalization": norm["status"],
+                       "attention_split": "joint / vlm / expert by call order (src/scripts/smolvla_attention_split.py)"
+                       if split else None}, a.out)
 
 
 if __name__ == "__main__":

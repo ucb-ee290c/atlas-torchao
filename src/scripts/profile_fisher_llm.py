@@ -1,12 +1,13 @@
 """Fisher-delta profile of a causal LM under the reference FP8 profile (linear layers + attention q/k/p/v).
 
     python src/scripts/profile_fisher_llm.py --model /rscratch/agarcia/models/TinyLlama-1.1B-Chat-v1.0 \\
-        --n 16 --seqlen 512 --out src/out/fisher_tinyllama.json
-    python src/scripts/plot_fisher.py src/out/fisher_tinyllama.json
+        --n 16 --seqlen 512 --out src/out/fisher/tinyllama/tinyllama_n16.json
+    python src/scripts/plot_fisher.py src/out/fisher/tinyllama/tinyllama_n16.json
 
 Loss: next-token cross-entropy summed over the window's tokens. Score per layer / operand:
 0.5 * sum(grad^2 * (quantized - clean)^2), averaged over windows."""
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -25,8 +26,12 @@ def main():
     ap.add_argument("--exclude", nargs="*", default=["lm_head"], help="fqn substrings left out")
     ap.add_argument("--no-attn", action="store_true", help="skip the attention q/k/p/v profile")
     ap.add_argument("--top", type=int, default=10)
-    ap.add_argument("--out", required=True)
+    ap.add_argument("--out", default=None,
+                    help="report JSON (default: src/out/fisher/<model>/<model>_n<N>.json)")
     a = ap.parse_args()
+    if a.out is None:
+        tag = re.split(r"[-_]", Path(a.model).name)[0].lower()
+        a.out = str(REPO / "src" / "out" / "fisher" / tag / f"{tag}_n{a.n}.json")
 
     import torch.nn.functional as F
 

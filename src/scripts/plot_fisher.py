@@ -1,6 +1,7 @@
 """Plot a profile_fisher_model JSON (python -m reference.ref_profile --out ...).
 
-    python src/scripts/plot_fisher.py src/out/fisher_tinyllama.json [out.png]
+    python src/scripts/plot_fisher.py src/out/fisher/tinyllama/tinyllama_n16.json [out.png]
+    python src/scripts/plot_fisher.py src/out/fisher/smolvla/smolvla_n32.json --summary   # ONE figure, 6 panels
 
 Needs matplotlib + numpy only. Panels: layer x module heatmap (log colour), cumulative share of
 the layers ranked most-sensitive first, weight- vs activation-sensitivity scatter, top-15 layers."""
@@ -45,6 +46,16 @@ def _layer_grid(L):
 def _title_data(meta):
     return (f"{meta['n']} x {meta['seqlen']} tokens" if meta.get("seqlen") not in (None, "n/a")
             else f"{meta['n']} frames x {meta.get('draws', 1)} draws") + f", seed {meta['seed']}"
+
+
+def _save(fig, dst, src):
+    """Save with a footer naming the run (report file + model + data), so a PNG says where it came from."""
+    d = json.loads(Path(src).read_text())["meta"]
+    tower = f" | tower: {TOWER}" if TOWER else ""
+    fig.text(0.005, 0.004, f"run: {Path(src).name} | {Path(str(d['model'])).name} | {_title_data(d)}{tower}",
+             fontsize=7, color="0.4", ha="left", va="bottom")
+    Path(dst).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(dst, dpi=150)
 
 
 def _short(n):
@@ -140,7 +151,7 @@ def main(src, dst):
     a.grid(alpha=.3, axis="x")
 
     fig.tight_layout()
-    fig.savefig(dst, dpi=150)
+    _save(fig, dst, src)
     print("wrote", dst)
 
 
@@ -173,7 +184,7 @@ def scatter_normalized(src, dst):
     a.legend(frameon=False, loc="upper left")
     a.grid(alpha=.3)
     fig.tight_layout()
-    fig.savefig(dst, dpi=150)
+    _save(fig, dst, src)
     print("wrote", dst)
 
 
@@ -207,7 +218,7 @@ def heatmap_combined(src, dst):
                 f"cell text = % of {'tower' if TOWER else 'model'} total; colour is log scale", pad=34)
     fig.colorbar(im, ax=a, label="fisher = fisher_w + fisher_x", fraction=.04, pad=.03)
     fig.tight_layout()
-    fig.savefig(dst, dpi=150)
+    _save(fig, dst, src)
     print("wrote", dst)
 
 
@@ -226,14 +237,132 @@ def tower_summary(src, dst):
     a.barh(y, att, left=lin, color="#eb6834", height=.6, label="attention q/k/p/v")
     for i, (l, t) in enumerate(zip(lin, att)):
         a.text(l + t + .005, i, f"{100 * (l + t):.1f}%", va="center")
-    a.set_yticks(y, towers)
+    n_lin = [sum(1 for r in d["layers"].values() if r.get("tower") == t and r.get("kind") != "attn") for t in towers]
+    n_att = [sum(1 for r in d["layers"].values() if r.get("tower") == t and r.get("kind") == "attn") for t in towers]
+    a.set_yticks(y, [f"{t}\n{nl} linear" + (f" + {na} attn" if na else "") for t, nl, na in zip(towers, n_lin, n_att)])
     a.invert_yaxis()
     a.xaxis.set_major_formatter(lambda v, _: f"{v:.0%}")
     a.set_xlabel("share of total fisher")
     a.set_title(f"Where the sensitivity sits, by tower - {Path(d['meta']['model']).name}")
     a.legend(frameon=False, loc="lower right")
     fig.tight_layout()
-    fig.savefig(dst, dpi=150)
+    _save(fig, dst, src)
+    print("wrote", dst)
+
+
+TOWER_COLORS = {"vision": "#2a78d6", "language": "#eb6834", "expert": "#2e9e6b", "action_head": "#8a5fd0",
+                "joint_attn": "#c9a227"}
+
+
+def summary_figure(src, dst):
+    """One figure, six panels, for any report: tower shares, normalized w-vs-x scatter, cumulative
+    concentration, fisher per layer index, attention operands, top-15 entries."""
+    d = json.loads(Path(src).read_text())
+    L = d["layers"]
+    tw = lambda r: r.get("tower", "model")
+    col = lambda t: TOWER_COLORS.get(t, BLUE)
+    total = sum(r["fisher"] for r in L.values())
+    lin = {n: r for n, r in L.items() if r.get("kind") != "attn"}
+    att = {n: r for n, r in L.items() if r.get("kind") == "attn"}
+    towers = sorted({tw(r) for r in L.values()})
+
+    fig, ax = plt.subplots(2, 3, figsize=(19, 10.5))
+    a = ax[0, 0]                                                          # A: share by tower
+    y = np.arange(len(towers))
+    sl = np.array([sum(r["fisher"] for r in lin.values() if tw(r) == t) for t in towers]) / total
+    sa = np.array([sum(r["fisher"] for r in att.values() if tw(r) == t) for t in towers]) / total
+    a.barh(y, sl, color="#4d4d4d", height=.6, label="linear layers")        # neutral: tower colors mean towers
+    a.barh(y, sa, left=sl, color="#b3b3b3", height=.6, label="attention q/k/p/v")
+    for i, (l, t) in enumerate(zip(sl, sa)):
+        a.text(l + t + .005, i, f"{100 * (l + t):.1f}%", va="center")
+    count = lambda t, group: sum(1 for r in group.values() if tw(r) == t)
+    a.set_yticks(y, [f"{t}\n{count(t, lin)} linear" + (f" + {count(t, att)} attn" if att else "") for t in towers])
+    a.invert_yaxis()
+    a.xaxis.set_major_formatter(lambda v, _: f"{v:.0%}")
+    a.set(xlabel="share of total fisher", xlim=(0, 1.15 * (sl + sa).max()),
+          title="A. where the sensitivity sits, by tower\n(entries per tower under each name)")
+    a.legend(frameon=False, loc="upper center", bbox_to_anchor=(0.5, -0.16), ncol=2)
+
+    a = ax[0, 1]                                                          # B: weights vs activations
+    names = [n for n, r in lin.items() if r["fisher_w"] > 0 and r["fisher_x"] > 0]
+    w = np.array([lin[n]["fisher_w"] for n in names]) / sum(r["fisher_w"] for r in lin.values())
+    x = np.array([lin[n]["fisher_x"] for n in names]) / sum(r["fisher_x"] for r in lin.values())
+    for t in towers:
+        m = np.array([tw(lin[n]) == t for n in names])
+        if m.any():
+            a.scatter(w[m], x[m], s=30, c=col(t), edgecolors="w", linewidths=.8, label=t)
+    lim = [min(w.min(), x.min()) * .8, max(w.max(), x.max()) * 1.4]
+    a.plot(lim, lim, "--", color="gray", lw=1)
+    for i in np.argsort(-(w + x))[:4]:
+        a.annotate(_short(names[i]), (w[i], x[i]), (6, 3), textcoords="offset points", fontsize=8)
+    a.set(xscale="log", yscale="log", xlim=lim, ylim=lim, xlabel="weight fisher (share of total)",
+          ylabel="activation fisher (share of total)",
+          title="B. weights vs activations (linear layers)\nabove dashed line: activations matter more")
+    a.set_aspect("equal")
+    a.legend(frameon=False, loc="upper left", fontsize=8)
+    a.grid(alpha=.3)
+
+    a = ax[0, 2]                                                          # C: concentration
+    f = np.sort([r["fisher"] for r in L.values()])[::-1] / total
+    c = np.cumsum(f)
+    a.plot(np.arange(1, len(f) + 1), c, color=BLUE, lw=2)
+    for k in (10, 50):
+        if k <= len(f):
+            a.plot(k, c[k - 1], "o", color="#eb6834")
+            a.annotate(f"top {k}: {c[k - 1]:.0%}", (k, c[k - 1]), (8, -14), textcoords="offset points")
+    a.set(xscale="log", xlabel=f"entries ranked most sensitive first (of {len(f)})", ylabel="cumulative share",
+          title="C. how concentrated is it?")
+    a.yaxis.set_major_formatter(lambda v, _: f"{v:.0%}")
+    a.grid(alpha=.3)
+
+    a = ax[1, 0]                                                          # D: fisher per layer index
+    drawn = False
+    for t in towers:
+        per = {}
+        for n, r in lin.items():
+            m = re.search(r"layers\.(\d+)\.", n)
+            if tw(r) == t and m:
+                per[int(m.group(1))] = per.get(int(m.group(1)), 0) + r["fisher"]
+        if per:
+            xs = sorted(per)
+            a.plot(xs, [per[i] / total for i in xs], "o-", color=col(t), label=t, ms=4)
+            drawn = True
+    a.set(xlabel="layer index", ylabel="share of total fisher (linear layers, summed per layer)",
+          title="D. sensitivity by depth")
+    a.yaxis.set_major_formatter(lambda v, _: f"{v:.0%}")
+    a.grid(alpha=.3)
+    if drawn:
+        a.legend(frameon=False, fontsize=8)
+
+    a = ax[1, 1]                                                          # E: attention operands
+    if att:
+        groups = sorted({tw(r) for r in att.values()})
+        wd = .8 / len(groups)
+        for gi, t in enumerate(groups):
+            vals = [sum(r["fisher"] for n, r in att.items() if tw(r) == t and n.endswith("." + o)) / total
+                    for o in OPS]
+            a.bar(np.arange(len(OPS)) + gi * wd, vals, wd, color=col(t), label=f"{t} attention")
+        a.set_xticks(np.arange(len(OPS)) + wd * (len(groups) - 1) / 2, OPS)
+        a.set(ylabel="share of total fisher", title="E. attention operands (q, k, softmax p, v)")
+        a.yaxis.set_major_formatter(lambda v, _: f"{v:.1%}")
+        a.legend(frameon=False, fontsize=8, loc="upper left")
+    else:
+        a.text(.5, .5, "no attention entries", ha="center", transform=a.transAxes)
+        a.set_title("E. attention operands")
+
+    a = ax[1, 2]                                                          # F: top 15
+    top = sorted(L.items(), key=lambda kv: -kv[1]["fisher"])[:15]
+    ab = {"action_head": "act", "vision": "vis", "language": "lang", "expert": "exp", "joint_attn": "joint"}
+    labels = [f"{ab.get(tw(r), tw(r))}  {_short(n)}" + ("  (attn)" if r.get("kind") == "attn" else "") for n, r in top]
+    a.barh(np.arange(len(top)), [r["fisher"] / total for _, r in top], color=[col(tw(r)) for _, r in top], height=.7)
+    a.set_yticks(np.arange(len(top)), labels, fontsize=8)
+    a.invert_yaxis()
+    a.xaxis.set_major_formatter(lambda v, _: f"{v:.1%}")
+    a.set(xlabel="share of total fisher", title="F. top 15 entries")
+
+    fig.suptitle(f"Fisher-delta sensitivity - {Path(str(d['meta']['model'])).name}, {_title_data(d['meta'])}", fontsize=14)
+    fig.tight_layout(rect=(0, 0.02, 1, 0.97))
+    _save(fig, dst, src)
     print("wrote", dst)
 
 
@@ -276,7 +405,7 @@ def attn_heatmap(src, dst):
                 f"cell text = % of {TOWER + ' ' if TOWER else ''}attention total; colour is log scale", pad=34, fontsize=10)
     fig.colorbar(im, ax=a, label="fisher", fraction=.08, pad=.04)
     fig.tight_layout()
-    fig.savefig(dst, dpi=150)
+    _save(fig, dst, src)
     print("wrote", dst)
 
 
@@ -300,7 +429,7 @@ def attn_scatter(src, dst):
         a.grid(alpha=.3)
     fig.suptitle(f"Attention-operand sensitivity, {Path(meta['model']).name} (each dot is a layer)")
     fig.tight_layout()
-    fig.savefig(dst, dpi=150)
+    _save(fig, dst, src)
     print("wrote", dst)
 
 
@@ -318,11 +447,16 @@ if __name__ == "__main__":
 
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("src")
-    ap.add_argument("dst", nargs="?", default=None, help="base PNG path (default: <src>.png)")
+    ap.add_argument("dst", nargs="?", default=None, help="base PNG path (default: <src dir>/plots/<src stem>/<src stem>.png)")
+    ap.add_argument("--summary", action="store_true", help="only ONE figure with six panels (no per-plot PNGs)")
     ap.add_argument("--tower", default=None, help="VLA reports: plot only vision|language|expert|action_head")
     a = ap.parse_args()
     src = a.src
-    base = Path(a.dst) if a.dst else Path(src).with_suffix(".png")
+    base = Path(a.dst) if a.dst else Path(src).parent / "plots" / Path(src).stem / (Path(src).stem + ".png")
+    base.parent.mkdir(parents=True, exist_ok=True)
+    if a.summary:
+        summary_figure(src, str(base.with_name(base.stem + "_summary.png")))
+        raise SystemExit(0)
     towers = sorted({r["tower"] for r in json.loads(Path(src).read_text())["layers"].values() if "tower" in r})
     if a.tower or not towers:                                       # one tower, or an LLM report
         TOWER = a.tower

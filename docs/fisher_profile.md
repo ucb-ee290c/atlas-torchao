@@ -53,7 +53,7 @@ root. Plots need matplotlib (the `atlas-npu` env has it).
 ### LLM (TinyLlama + WikiText-2)
 
 ```
-CUDA_VISIBLE_DEVICES=1 python src/scripts/profile_fisher_llm.py --n 16 --out src/out/fisher_tinyllama.json
+CUDA_VISIBLE_DEVICES=1 python src/scripts/profile_fisher_llm.py --n 16 --out src/out/fisher/tinyllama/tinyllama_n16.json
 ```
 
 | Flag | Default | Meaning |
@@ -73,7 +73,7 @@ Loss is summed cross-entropy (`reduction="sum"`), so scores are per window, not 
 
 ```
 python src/scripts/profile_fisher_vla.py --policy lerobot/smolvla_base --dataset lerobot/svla_so100_pickplace \
-    --norm-stats dataset --n 8 --draws 4 --out src/out/fisher_smolvla.json
+    --norm-stats dataset --n 8 --draws 4 --out src/out/fisher/smolvla/smolvla_n8.json
 ```
 
 - Reuses `eval_policy`'s loaders and held-out episode split (`--n-test-episodes`, `--eval-seed`), so
@@ -82,16 +82,33 @@ python src/scripts/profile_fisher_vla.py --policy lerobot/smolvla_base --dataset
   own seed (`--n` frames x `--draws`). Scores are averaged over jobs (not the gradients, which would square a
   mean).
 - Loss is `policy.forward(batch)[0] * action.numel()`.
-- Each entry carries `tower`: `vision | language | expert | action_head`.
-- Attention is called 24 times per forward (8 self + 8 x 2 cross); entries are tagged `.L{i}`.
+- Each entry carries `tower`: `vision | language | expert | action_head | joint_attn`.
+- SmolVLA's text and expert attention run through one shared function, called 24 times per forward and tagged
+  `.L{i}` by call order. `src/scripts/smolvla_attention_split.py` assigns each call from the layer pattern
+  (`self_attn_every_n_layers` = 2): even layers make 1 call over language + expert tokens together
+  (`joint_attn`); odd layers make 2 calls, the language model's own attention (`language`) then the expert's
+  cross-attention (`expert`). That gives 8 + 8 + 8 calls (32 entries each). The mapping is derived from the
+  lerobot code; one cross-check is that the last language layer's call, which the action loss never reads, is
+  exactly the entry with a zero score. New reports are tagged at profile time; saved ones can be retagged with
+  `python src/scripts/smolvla_attention_split.py <report.json>`.
 - Some entries are exactly zero because the action loss never uses them: the last language layer's
   q/o/MLP, `lm_head`, and attention at L22.
+
+### Where outputs go
+
+```
+src/out/fisher/<model>/<model>_n<N>.json      report (default --out, e.g. tinyllama/tinyllama_n16.json)
+src/out/fisher/<model>/plots/                 plot_fisher.py PNGs (default: next to the JSON)
+src/out/fisher/<model>/validation/            validate_* and top-k eval results
+```
+
+`--out` is optional; pass it to write elsewhere. `src/out/` is gitignored.
 
 ### Plots
 
 ```
-python src/scripts/plot_fisher.py src/out/fisher_tinyllama.json
-python src/scripts/plot_fisher.py src/out/fisher_smolvla.json --tower language
+python src/scripts/plot_fisher.py src/out/fisher/tinyllama/tinyllama_n16.json
+python src/scripts/plot_fisher.py src/out/fisher/smolvla/smolvla_n8.json --tower language
 ```
 
 Linear and attention data are always plotted separately. Scatter plots are log scale (10^x tick labels), each
