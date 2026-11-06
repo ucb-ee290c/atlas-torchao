@@ -41,7 +41,7 @@ fails its "not collapsed to per-tensor" check (on purpose: it proves nothing abo
 
 | Recipe | Weights | Activations | Attention | Use when |
 |---|---|---|---|---|
-| `atlas_v1_awq_tile_static` | one exponent per 32 output channels (`per_panel(32)`), rule `nc` | one **static** exponent per tensor (calibrated, no run-time amax) | p static -8; q, k, v dynamic per (batch, head), reference rule | **Primary.** The compiler has no run-time scales, so this is the one to hand over |
+| `atlas_v1_awq_tile_static` | one exponent per 32 output channels (`per_panel(32)`), rule `nc` | one **static** exponent per tensor (calibrated, no run-time amax) | p static -8; q, k, v dynamic per (batch, head), reference rule | **Primary.** A compiler-team report (unverified here, `tile-aware-checkin.md`) says every exponent must be a compile-time constant, which favors static scales; q, k, v are still dynamic |
 | `atlas_v1_awq_tile` | same | **dynamic** per 32-token block over all K (`nc`) | q, k, v, p dynamic per (batch, head), `nc` | You need scales that follow the data and accept a run-time amax (ruling H2 open) |
 | `atlas_v1_tile` | same | same as `atlas_v1_awq_tile` | same | Models with an input convolution (SigLIP / DiT patch embedding): keeps every `Conv2d` with 3 input channels in BF16 |
 | `atlas_v1_awq` | one exponent per output channel | one exponent per token | per head | Not tile-native (needs per-row vector rescales); the comparison baseline |
@@ -71,11 +71,9 @@ $CAP $PY src/fx_export.py --export-dir $OUT/export --model $MODEL --out-dir $OUT
 
 326 s for TinyLlama. `--seqlen` is fixed in the graph (batch 1). Use a multiple of 32 so the 32-token blocks of the
 dynamic recipe are all full; 8 gave one partial block in the smoke test. `--model` supplies the architecture config only.
-Replay the saved graph in a fresh process (also done inside the capture): 
-
-```bash
-$CAP $PY src/fx_export.py --verify-dir $OUT/fx --device cpu
-```
+The capture already replays the saved graph in a fresh process (`fresh_process_verification.json`). The standalone command
+(`$CAP $PY src/fx_export.py --verify-dir <fx dir> --device cpu`) was run only on the smoke bundle (3.7 s, passed); it rewrites
+`fresh_process_verification.json` in that directory, and was not run on the TinyLlama bundles.
 
 ## 4. Verify (checklist)
 
@@ -166,10 +164,13 @@ tile rows is not a pure recipe effect. All accuracy figures use the framework's 
   residual nodes as ordinary ops. "Native FP8" covers Linear, Conv2d and the two attention matmuls only.
 - **AWQ folds.** Scales are folded into `input_layernorm`, `post_attention_layernorm` and `up_proj` rows. Under grouped-query attention
   the `v_proj -> o_proj` fold is not implemented (`o_proj` stays unscaled). Consequence: `up_proj`'s output is scaled by 1/s per channel, so a
-  layer output compared with the BF16 model is not comparable for `up_proj` (and `layer_rmse.py`'s "local" reference, the clean layer applied
-  to the quantized layer's input, is invalid for any folded recipe). `quality.py` reports raw and scale-recovered figures for `up_proj`.
-- **FP8 range 448** (RTL source); a hardware spec says 240. Panel scales leave far fewer codes above 240 than per-channel scales (0.031% vs 0.706%
-  of weight codes in the exponent-field-15 range) but flush more small weights to zero (0.067% vs 0.025%).
+  layer output compared with the BF16 model is not comparable for `up_proj`; `quality.py` reports raw and scale-recovered figures for it.
+  The existing `--rmse` of `eval.py` (`src/layer_rmse.py`, older than the tile work) has a "local" error that applies the clean layer to the quantized
+  layer's input. On the smoke model with `atlas_v1_awq_tile` that local error (mean relative RMSE) is 1.01 for `gate_proj`, 1.27 for `up_proj` and 8.80 for
+  `down_proj`, against 0.07, 0.95 and 0.10 cumulative, and the same with `atlas_v1_awq`; treat it as invalid for folded layers. Measured on the
+  tiny model only.
+- **FP8 range 448** (RTL source); a hardware spec says 240. Panel scales leave far fewer weight codes in the exponent-field-15 range (256 to 448, above 240) than per-channel scales (0.031% vs 0.706%
+  of weight codes) but flush more small weights to zero (0.067% vs 0.025%).
 - **CPU calibration time** 19 to 26 minutes for TinyLlama on 16 shared cores. Larger models need a GPU or a reduced `--calib-n` (state it).
 - `model.pt2` is tied to the torch version it was captured with (2.11.0 CPU); the manifest records it.
 - **Uncalibrated Linear in the static recipe.** A Linear that calibration never reached keeps the reference dynamic per-tensor rule (SmolVLA: the unused VLM `lm_head`, `policy.json` activation `source: reference`), so the policy is not 100% static. Count `mode: dynamic` Linear sites in `policy.json` before calling a bundle static.
