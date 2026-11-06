@@ -15,9 +15,10 @@ i.e. `s` in -5..+1. The MXU pop multiplies, so the pop code that realizes the sa
    (BF16 scaling by a power of two is exact; the pack output depends only on `x * 2^-s`). Measured on all 92 out-of-range TinyLlama
    Linear inputs (116,654,080 elements): 0 differing bytes. The consumer's dequant / pop exponent stays at the original `s`.
    Only *clamping the exponent while leaving the value* changes the quantization.
-2. All 114 / 244 / 88 / 127 out-of-range static sites (TinyLlama / SmolVLA / Multi-Task DiT / Pi0) can be fixed exactly by (1). 114 / 234 / 48 / 124 of
-   them sit behind an op that already multiplies by a constant (norm gamma, `up_proj` pop rescale, PV rescale, softmax normalization), so the
-   fold costs no instruction; the rest need one `vmul.bf16` per 32x32 tile, an activation-constant rewrite, or a host-side scale (table in 4.A).
+2. All 114 / 244 / 88 / 127 out-of-range static sites (TinyLlama / SmolVLA / Multi-Task DiT / Pi0) can be fixed exactly by (1). 92 / 221 / 24 / 61 of
+   them sit behind an op that already multiplies by a constant (norm gamma, `up_proj` pop rescale, PV rescale), so the fold costs no instruction.
+   The attention p sites (22 / 13 / 24 / 63) need one `vmul` on the broadcast `recip(sum)` per (head, 32-row block) because the flow's p is normalized
+   (the kit's free `* 256` belongs to the unnormalized design, which changes numerics). The rest need one `vmul.bf16` per 32x32 tile, an activation-constant rewrite, or a host-side scale (table in 4.A).
 3. The production kit never uses `vpack` for activations (only `resnet_pool` does, at code 127). It clamps to +-448*2^s, pushes BF16 into an
    accumulator and pops FP8 with `seli e, 127 - s`. That path has no range check in the compiler (`AtlasVirtualToMachine.cpp:773-783`;
    scale constants admit 0..255, `AtlasOps.cpp:246-249`). The compiler's own `--lower-atlas-guarded-pack` rewrites a pack into that path, but only when it can prove the
@@ -25,7 +26,7 @@ i.e. `s` in -5..+1. The MXU pop multiplies, so the pop code that realizes the sa
 4. Dynamic scales cannot be expressed at all: `scale_code` is a compile-time attribute (`AtlasOps.cpp:293-294`) and the FP8 readout requires a
    `virtual_scale_constant` (`AtlasVirtualToMachine.cpp:773-777`). Attention q, k, v in the "static" recipe are dynamic: on TinyLlama real text 1060/1408 q,
    48/1408 k and 1408/1408 v (layer, batch, head) exponents are outside 122..128 (4.H).
-5. Clamping all static exponents into 122..128 on TinyLlama gives perplexity {PPL_ALL} (unclamped static export {PPL_BASE}, BF16 12.7558, 16 windows x 512)
+5. Clamping all static exponents into 122..128 on TinyLlama gives perplexity 12.8756 (unclamped static export 12.8980, BF16 12.7558, 16 windows x 512; Linear-only clamp 12.8609, p-only clamp 12.9027)
    but flushes 4.36% instead of 0.92% of the nonzero values at the affected Linear inputs and 60% instead of 29% of attention p entries (4.B). It changes the quantization.
 6. Weights are never packed; unaffected (4.E).
 
@@ -85,14 +86,14 @@ Producers of the packed tensor, out-of-range sites per class (`fx_pack_census.py
 | attention output, `pv_matmul` | 22 | 44 | 24 | 27 |
 | attention output, SDPA | - | - | 6 | - |
 | gated product `act(a) * b` (SiLU/GELU) | 11 | 24 | - | 7 |
-| `x * sigmoid(.)` product (DiT text/vision encoder fc2) | - | - | 17 | - |
+| `x * sigmoid(.)` product (DiT vision/text encoder MLP) | - | - | 17 | - |
 | bare GELU / SiLU | - | 6 | 13 | 1 |
 | linear output into a linear | - | 9 | - | 0 |
 | modulation add | - | 1 | 1 | - |
 | sin / index (DiT time embedding, text projection) | - | - | 2 | - |
 | raw model input (image patches, state, noise, noisy actions) | - | 2 | 1 | 2 |
 
-Non-pack consumers of a producer (so a scaling of the producer would leak): SmolVLA 1 linear output also feeds `expand_as`, 8 expert RoPE results (all in range) also feed `copy_`;
+Non-pack consumers of a producer (so a scaling of the producer would leak): SmolVLA 1 linear output also feeds `expand_as`, 8 `empty_like` results (all in range) also feed `copy_`;
 Pi0 raw `noise` also feeds an `add`, 1 linear output feeds `expand_as` (in range). Every other packed tensor has only pack consumers (`fx_pack_census.py`).
 
 ## 4. Mitigations
@@ -101,7 +102,7 @@ Pi0 raw `noise` also feeds an `add`, 1 linear output feeds `expand_as` (in range
 
 ### 4.A Power-of-two fold into the producer (exporter plan, lowered at unit code 127)
 
-Choose `c' = 127` (best-evidenced code: the unit pack of every kit launch and compiler test) for every folded site, or any `c'` in 122..128, with `k = c' - c`. Multiply the BF16 value by `2^k` at its producer, pack at `c'`.
+Choose a code `c'` in 122..128 (admitted today) with `k = c' - c`; 127 is the default used below. Evidence per code: 127 is the code of the RTL-exact `resnet_pool` launch (`RTL-RESULTS.md:14`; its data are unpacked FP8 values, so that pack is a round trip, not general BF16) and of the compiler's unit-pack policy (`binding.py:75-76`, input domain "seven powers of two and zero"); the general-value system-level pack test uses 126 and 128 (`test_vpu_e8m0_pack_reference.py:185`, not run here). Pick 126 or 128 if general-value system evidence at the chosen code is wanted. Multiply the BF16 value by `2^k` at its producer, pack at `c'`.
 Exact because (i) BF16 scaling by `2^k` is exact for normal results (`|k| <= 10` here; measured exact at all 92 sites), (ii) `vmul` rounds RNE and `vadd` chops, both scale-equivariant, (iii) the pack output depends only on `x * 2^-s`.
 The FP8 bytes are unchanged, so the pop / dequant exponent stays `s` and the FX graph numerics are unchanged.
 
@@ -109,13 +110,15 @@ The FP8 bytes are unchanged, so the pop / dequant exponent stays `s` and the FX 
 |---|---|---|---|
 | RMSNorm / LayerNorm / `(1+w)` | gamma (and beta for LayerNorm) scaled by `2^k`; for `(1+w)` the product `2^k(1+w)` is formed in fp32 as the graph does | 0 | 59 / 145 / 0 / 27 |
 | `act(a) * b` | `b`'s producer: add `k` to every `weight_scale_exp` of `up_proj` (codes unchanged, pop constant `2^(sx+sw)` already exists) | 0 | 11 / 24 / 0 / 7 |
-| attention p | the multiplier already in the softmax path (`* 256` in the kit, `recip(sum)` in the normalized form); p <= 1 so `p * 2^8` <= 256 cannot overflow | 0 | 22 / 13 / 24 / 63 |
+| attention p | **[inference]** `p = exp(s - max) * recip(sum)` is normalized and `recip(sum)` is data, so no existing constant absorbs `2^k`: one `vmul` on the `recip(sum)` broadcast per (head, 32-row block), reused by every p tile of that block (the kit's `* 256` is free only in its unnormalized design, 4.C2). p <= 1 so `p * 2^8` <= 256 cannot overflow | 1 vmul per row block, amortized | 22 / 13 / 24 / 63 |
 | attention output (`pv_matmul`) | the PV BF16-pop rescale constant `2^(sp+sv)` (kit: `recip(sum) * 2^v_exp`, `atlas_attention_v2_program.py:560-563`) | 0 | 22 / 44 / 24 / 27 |
 | linear output into a linear | producer `weight_scale_exp += k`, only if the output has no other consumer | 0 (8 of 9 SmolVLA) | 0 / 8 / 0 / 0 |
 | bare GELU/SiLU, `x * sigmoid(c x)` | **[inference]** rewrite the activation's internal constants (tanh-GELU final `0.5`, SiLU first `-1`, sigmoid `1.702`) and scale the producer by `2^k`; equivariance is algebraic, not run | 0 if confirmed | 0 / 6 / 30 / 1 |
 | linear->linear with a second consumer, modulation add, SDPA out, sin, index | one `vmul.bf16` per 32x32 tile before the pack | 1 VPU op / tile | 0 / 2 / 9 / 0 |
 | raw model input | host scales before the f32 to BF16 conversion | host | 0 / 2 / 1 / 2 |
-| total | | | 114 / 244 / 88 / 127 |
+| total | | | 114 / 244 / 88 / 127 (no added instruction: 92 / 221 / 24 / 61) |
+
+Census checks (`fx_pack_census.py`): all 181 Pi0 `mul(mul,add)` sites have a parameter-only `add` operand (Gemma-style `1 + w`, not a conditioning output), so the 24 out-of-range ones are parameter folds; every LayerNorm site (49 + 96 + 109) carries weight and bias arguments, including the 3 out-of-range Pi0 ones.
 
 Where it must live: **exporter** records the plan; **flow** applies the edits or leaves the bundle untouched; the producer constants are device weights, so baking them into `model.safetensors`
 changes the graph (a packed tensor is `2^k x` its logical value), which requires the FX op to carry a pack shift separate from the dequant exponent (today `quantize_act` returns one exponent used for both: `atlas_fx_ops.py:71-92`).
@@ -135,16 +138,16 @@ Changes the quantization. Measured on TinyLlama real text (2 x 256 wikitext-2 te
 | attention p (22 layers), flushed fraction of nonzero p, mean / max | 29.1% / 47.9% (s=-8) | 60.1% / 79.6% (s=-5) | threshold `2^(s-6)` |
 | p probability mass lost | 7.5e-4 mean (1.1e-3 max) | 8.7e-3 (1.3e-2) | |
 | `p @ v` relative L2 vs fp32 `p @ v` (v unquantized), mean / max | 0.0205 / 0.0244 | 0.0296 / 0.0500 | |
-| perplexity, 16 windows x 512 (bf16 12.7558) | {PPL_BASE} (rerun; recorded export value 12.8980) | all: {PPL_ALL}; p only: {PPL_P}; Linear only: {PPL_LIN} | `ref_conv`, exact fp32 accumulation, 16 windows, same windows as `ppl_w16x512.json` |
+| perplexity, 16 windows x 512 (bf16 12.7558) | 12.8980 (rerun reproduces the recorded `ppl_w16x512.json` value to every printed digit) | all: 12.8756; p only: 12.9027; Linear only: 12.8609 | `ref_conv`, exact fp32 accumulation, 16 windows, same windows as `ppl_w16x512.json` |
 
-Reading: the perplexity cost of clamping is within {PPL_NOTE}; the per-value damage is concentrated in a few sites and in p. Perplexity on 16 windows is a coarse instrument; the per-site flush and error numbers are the more sensitive ones.
+Reading: the eval is deterministic (rerun identical), so these differences are not run-to-run noise, but the eval JSON has no per-window losses, so the spread over windows is not measured. As measured, clamping the Linear exponents lowered perplexity by 0.037, clamping p raised it by 0.005, clamping both lowered it by 0.022, against a 0.142 gap between the unclamped export and BF16. The per-value damage (flush, error) is concentrated in a few sites and in p; perplexity did not register it.
 Where: exporter only. Cost: none. Risk: quality (unmeasured on SmolVLA, DiT, Pi0; for Pi0 one site is above 128 and clamping *down* would saturate: not measured).
 
 ### 4.C Attention p
 
 | option | FP8 bytes vs today | PV pop | status |
 |---|---|---|---|
-| C1. p * 2^8 (existing multiplier), pack at 127 | identical to static -8 / code 119 | unchanged | = 4.A, exact |
+| C1. p * 2^8 (one `vmul` on the `recip(sum)` broadcast per row block), pack at 127 | identical to static -8 / code 119 (probe check, TinyLlama real text, `fold_p_x256_unit_bytes_identical`: 22 of 22 layers) | unchanged | = 4.A |
 | C2. kit style: unnormalized `exp(s-max) * 256`, pack at 127, divide by the sum of packed codes | different quantization | output `PV * recip(sum) * 2^v_exp` | emulated on TinyLlama real text (unquantized V): `p @ v` relative L2 0.0122 mean / 0.0171 max vs 0.0205 / 0.0244 for static -8; flushed 24.1% vs 29.1%. Emulation uses `p~ = bf16(p / rowmax(p))`, not the kit's BF16 `vexp` pipeline. Changes the FX graph (row sum, divide) |
 | C3. PV pop scale | n/a | **not constrained** by `lowerPack`: BF16 pop has no scale and is followed by a `vmul` with any power-of-two BF16 constant; an FP8 readout takes any code 0..255 (`AtlasOps.cpp:246-249`, lowering has no check `:773-783`) | read |
 
@@ -152,7 +155,7 @@ Where: exporter only. Cost: none. Risk: quality (unmeasured on SmolVLA, DiT, Pi0
 
 ### 4.D Widen the compiler admission
 
-RTL source: no special code; every code 0..255 is a defined shift (2.2). Evidence for other codes: lane-level RTL at shifts 0, +2, +10, -10 (codes 127, 129, 137, 117); full-system RTL only at 126, 127, 128; npu_model software model exhaustive over all 256 codes (run here, passes); the kit's pop path on RTL at pack-equivalent codes 120, 121 (different converter). A range that covers the measured census is 117..133 (static) and 116..137 including dynamic v codes and the lane-level endpoints.
+RTL source: no special code; every code 0..255 is a defined shift (2.2). Evidence for other codes: lane-level RTL at shifts 0, +2, +10, -10 (codes 127, 129, 137, 117); full-system pack tests on general values only at 126 and 128 (127 only in the `resnet_pool` RTL row, FP8-representable data); npu_model software model exhaustive over all 256 codes (run here, passes); the kit's pop path on RTL at pack-equivalent codes 120, 121 (different converter). A range that covers the measured census is 117..133 (static) and 116..137 including dynamic v codes and the lane-level endpoints.
 
 Exact edit list for a compiler owner (all found by `grep -rn 122`):
 - `lib/AtlasVirtualToMachine.cpp:568-570` (bounds and message); `tools/atlas_virtual_evaluator.py:251-252`; `tools/compile_atlas_linalg_tile.py:361-364`.
@@ -161,7 +164,7 @@ Exact edit list for a compiler owner (all found by `grep -rn 122`):
 - Docs: `dialect-reference.md:48`, `compiler-pipeline.md:154,298`, `native-merlin-binding.md:156,199`, `pack-relayout-loop.md:160`.
 - Add RTL runs of `test_vpu_e8m0_pack_reference.py` at the new endpoints (for example 117 and 133).
 
-Where: compiler. Cost: low code, but needs RTL evidence for the new codes. Risk: the 122..128 range is "observed", not derived; a failure at a new code would be silent corruption, not a compile error.
+Where: compiler. Cost: low code, but needs RTL evidence for the new codes. Risk: the 122..128 range is "observed", not derived; **[inference]** a failure at a new code would be silent wrong bytes, not a compile error.
 
 ### 4.E Weights
 
@@ -178,7 +181,7 @@ Measured with `atlas-mlir/build/bin/atlas-opt` on `virtual_fp8_two_layer_mlp.mli
 - `--atlas-compile=guarded-pack=true`: rc 0; the pack became `max/min` clamp splats (bits 0xBFE0 / 0x3FE0 = -+1.75 = 448 * 2^-8), `virtual_mxu_load_acc_bf16`, `virtual_scale_constant` code 135 (`254 - 119`) and `virtual_mxu_readout_fp8`; no `bf16_to_fp8` pack remains.
 - The same program with a `vpu_binary mul` inserted between the ReLU and the pack: rejected again, with or without guarded-pack.
 `provenFinite` (`AtlasGuardedPack.cpp:15-38`) accepts splats, matmul results, BF16 readouts of reset or loaded accumulators, `mov`/`relu`, and `min`/`max` of finite operands. **[inference]** every packed tensor in the four graphs passes through at least one multiply, exp or add after the matmul (norm, gated product, softmax, residual or modulation add), so none is covered today.
-Extending the compiler to treat a producer as finite (or to accept an exporter-declared finiteness bound, which the clamp-before-pop then makes safe) would route all sites through a path with no range limit. Where: compiler. Cost: medium. Risk: medium (pop converter differs from pack at 0x7F; clamp required).
+**[inference]** Extending the compiler to treat a producer as finite (or to accept an exporter-declared finiteness bound, which the clamp-before-pop then makes safe) would route all sites through a path with no range limit. Where: compiler. Cost: medium. Risk: medium (pop converter differs from pack at 0x7F; clamp required).
 
 ### 4.H Not a range problem but a blocker: attention q, k, v are dynamic (new)
 
@@ -188,9 +191,9 @@ Counts in section 3. A dynamic exponent has no `scale_code` immediate. Making q,
 
 | mitigation | sites fixed (T / S / D / P) | exactness | where | cost | risk |
 |---|---|---|---|---|---|
-| A. fold into producer, pack at 127 | 114 / 244 / 88 / 127 (0 instr: 114 / 234 / 48 / 124) | lossless (bytes identical; bit test on 92 TinyLlama sites) | exporter plan + flow/lowering | 0 for free classes, 1 vmul/tile otherwise | low; producers with other consumers excluded |
-| B. clamp exponent | 114 / 244 / 88 / 127 (changes numerics at every one) | changes quantization (flush 0.9% to 4.4%, p flush 29% to 60%) | exporter | 0 | quality unmeasured outside TinyLlama; perplexity {PPL_ALL} (all) |
-| C1. p * 2^8 then pack at 127 | 22 / 13 / 24 / 63 | lossless | flow (softmax multiplier) | 0 | low |
+| A. fold into producer, pack at 127 | 114 / 244 / 88 / 127 (no added instruction: 92 / 221 / 24 / 61) | lossless (bytes identical; bit test on 92 TinyLlama sites) | exporter plan + flow/lowering | 0 for free classes, 1 vmul/tile otherwise | low; producers with other consumers excluded |
+| B. clamp exponent | 114 / 244 / 88 / 127 (changes numerics at every one) | changes quantization (flush 0.9% to 4.4%, p flush 29% to 60%) | exporter | 0 | quality unmeasured outside TinyLlama; perplexity 12.8756 with all clamped (unclamped 12.8980) |
+| C1. p * 2^8 then pack at 127 | 22 / 13 / 24 / 63 | lossless (bytes identical, 22 of 22 layers) | flow (vmul on `recip(sum)`) | 1 vmul per (head, 32-row block) | low |
 | C2. kit-style unnormalized p | 22 / 13 / 24 / 63 | changes quantization (emulated: lower PV error) | flow + FX graph | row-sum matmul + divide | medium |
 | D. widen admission | all (needs 117..133) | lossless if the RTL honors the shift (model: all 256 codes pass) | compiler | one line plus tests/docs | RTL evidence only at 126..128 (system) and +-10 (lane) |
 | E. weights | 0 affected | n/a | none | 0 | none |
@@ -200,9 +203,9 @@ Counts in section 3. A dynamic exponent has no `scale_code` immediate. Making q,
 
 Ordering:
 
-1. **4.A for the free classes plus 4.F as the universal fallback.** Exact; no change to the admitted range, no new hardware evidence (everything packs at the already-exercised code 127 or inside 122..128); the exporter only records a plan, FX numerics stay bit-identical. Covers every out-of-range site: free for 114 / 234 / 48 / 124, activation-constant rewrite **[inference]** for 0 / 6 / 30 / 1, one `vmul` per tile for 0 / 2 / 9 / 0, host for 0 / 2 / 1 / 2.
+1. **4.A for the free classes plus 4.F as the universal fallback.** Exact; no change to the admitted range, no new hardware evidence (every pack stays inside the admitted 122..128); the exporter only records a plan, FX numerics stay bit-identical. Covers every out-of-range site: no added instruction for 92 / 221 / 24 / 61, one `vmul` per p row block for 22 / 13 / 24 / 63, activation-constant rewrite **[inference]** for 0 / 6 / 30 / 1, one `vmul` per tile for 0 / 2 / 9 / 0, host for 0 / 2 / 1 / 2.
 2. **4.D widen the compiler**, once the two RTL runs at the new endpoints pass; this removes the need for any fold but trades exactness-by-construction for hardware evidence.
-3. **4.G** extend `provenFinite` or add a declared-bound opt-in; it is the production kit mechanism and has no range limit, and it also takes over dynamic-free static scales.
+3. **4.G** extend `provenFinite` or add a declared-bound opt-in; it is the production kit mechanism and has no range limit.
 4. **4.B clamp** only as a stop-gap: it is the only option that changes numerics, and its cost is concentrated in p and in k >= 4 sites.
 5. Separately, **4.H**: calibrate attention q, k, v statically, otherwise they remain uncompilable whatever the range.
 
@@ -217,7 +220,7 @@ For every site with `activation.mode == "static"` and every attention operand `p
 4. `other_consumers`: leaves of the producer's transitive users other than `quantize_act`; non-empty means the producer cannot be scaled in place (fail the free placement, fall back to `vmul`).
 5. Shared-input groups (several `quantize_act` on one source tensor): codes identical, else record the distinct packs (SmolVLA: 2 groups, spread 1).
 6. Dynamic sites (`mode: dynamic` Linear, and attention q/k/v with `source: reference`): list them as `not_expressible_as_scale_code` (SmolVLA `lm_head`; all attention q/k/v). Real-text codes: report the fraction outside from a calibration pass.
-7. Differential fold test, per out-of-range site on fixture inputs: `e4m3_vpack(x_bf16, s) == e4m3_vpack(bf16(x * 2^k), s + k)` for all elements and `bf16(x * 2^k) == x * 2^k` in float32. Hard-fail on any difference (TinyLlama: 0 of 116,654,080).
+7. Differential fold test, per out-of-range site on the site's actual input `x` (a hooked replay of the fixture or calibration cases; `fx/fixtures.safetensors` holds only the graph's boundary inputs): `e4m3_vpack(x_bf16, s) == e4m3_vpack(bf16(x * 2^k), s + k)` for all elements and `bf16(x * 2^k) == x * 2^k` in float32. Hard-fail on any difference (TinyLlama: 0 of 116,654,080).
 8. Clamp report (informational): per site flush fraction and saturated count at `s` versus at `clamp(s)`.
 9. Weights: informational range only (no admission); keep the existing 0x7F/0xFF failure. Pop exponent `sx + sw` must satisfy `-126 <= sx + sw <= 127` (BF16 constant) or `0 <= 127 + sx + sw <= 254` (FP8 pop code): measured -23..-1.
 10. Schema: today `quantize_act` returns one exponent used for both the pack and the dequant (`atlas_fx_ops.py:71-92`); a baked fold needs an explicit `pack_shift` attribute. Not required if the plan is only recorded.
@@ -227,6 +230,7 @@ For every site with `activation.mode == "static"` and every attention operand `p
 - Quality of any clamp or fold on SmolVLA, Multi-Task DiT, Pi0; only TinyLlama 16 x 512 perplexity and 2 x 256 token per-site statistics.
 - No RTL or hardware run of any option. 4.A's exactness is algebraic plus the bit test on the encoder (`ref_numerics.e4m3_vpack`); the activation-constant rewrites (SiLU, GELU, `x * sigmoid`) were not run.
 - The kit attention o exponent, and the kit's BF16 `vexp` pipeline in 4.C2 (emulated with `bf16(p / rowmax(p))`).
+- Provenance of the TinyLlama runs: repository HEAD 3384385 (parent 29714ee) with uncommitted edits by other sessions in the working tree at run time (`src/eval.py`, `src/quant_export.py`, `src/tile_native.py`, `src/eval_pi0.py`, `src/eval_policy.py`); the unclamped rerun reproduced the recorded perplexity exactly, which is the only check that those edits did not move the numbers.
 - Graph node counts exceed policy site counts for SmolVLA (339 static `quantize_act` nodes against 316 sites); all tables use policy sites (distinct consumer weight or p tag), which match `compiler_pack_scale_admission`.
 - `docs/algos/tile-aware.md` was edited by another session while this was written; not read again, not touched.
 

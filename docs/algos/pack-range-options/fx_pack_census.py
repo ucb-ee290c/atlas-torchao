@@ -49,7 +49,20 @@ def desc(nodes, n):
         return ("mul(" if t == "aten.mul.Tensor" else "add(") + ",".join(ks) + ")"
     return t
 
-def category(pd):
+def param_only(nodes, n, depth=0):
+    """True when every leaf under node n is a parameter/buffer (p_*, b_*) or a literal, i.e. no activation or dense output feeds it."""
+    if n not in nodes:
+        return n.startswith(("p_", "b_"))
+    if depth > 8:
+        return False
+    return all(param_only(nodes, r, depth + 1) for r in nodes[n]["refs"]) if nodes[n]["refs"] else True
+
+def category(pd, nodes=None, src=None):
+    if pd == "mul(mul,add)" and nodes is not None:
+        add_operand = [r for r in nodes[src]["refs"] if kind(nodes, r) == "add"]
+        if add_operand and param_only(nodes, real(nodes, add_operand[0])):
+            return "norm_affine"
+        return "norm_modulated"
     if pd in ("mul(param,mul)", "mul(mul,add)"): return "norm_affine"
     if pd == "aten.layer_norm.default": return "layer_norm"
     if pd == "aten.softmax.int": return "attn_p"
@@ -81,6 +94,7 @@ for model in ["tinyllama", "smolvla", "multitask-dit", "pi0"]:
         for r in nodes[n]["refs"]:
             users[r].append(n)
     sites, groups, cat_out, cat_all, nonpack = {}, collections.defaultdict(list), collections.Counter(), collections.Counter(), collections.Counter()
+    ln_affine = collections.Counter()
     for n in order:
         if nodes[n]["t"] != "atlas.quantize_act":
             continue
@@ -88,7 +102,7 @@ for model in ["tinyllama", "smolvla", "multitask-dit", "pi0"]:
         if a[1] != "static":
             continue
         code = 127 + int(a[4])
-        src = real(nodes, nodes[n]["refs"][0]); pd = desc(nodes, src); cat = category(pd)
+        src = real(nodes, nodes[n]["refs"][0]); pd = desc(nodes, src); cat = category(pd, nodes, src)
         key = n
         for gi in users[n]:
             for u in users[gi]:
@@ -97,6 +111,8 @@ for model in ["tinyllama", "smolvla", "multitask-dit", "pi0"]:
                 if nodes[u]["t"] == "atlas.pv_matmul":
                     key = "P:" + (a[6] if len(a) > 6 else n)
         sites.setdefault(key, []).append((cat, code)); groups[src].append(code)
+        if pd == "aten.layer_norm.default":
+            ln_affine[("affine" if "None" not in nodes[src]["args"].split("],")[-1] else "no_affine", code < LO or code > HI)] += 1
         extra = sorted(set(l for l in leaves(nodes, users, src) if l not in ("atlas.quantize_act", "aten._assert_tensor_metadata.default")))
         if extra:
             nonpack[(cat, tuple(extra))] += 1
@@ -111,3 +127,5 @@ for model in ["tinyllama", "smolvla", "multitask-dit", "pi0"]:
         print(f"   {c:20s} sites {v:4d}  outside {cat_out[c]:4d}")
     for k, v in nonpack.items():
         print("   producer with non-pack consumers:", v, k)
+    if ln_affine:
+        print("   layer_norm weight+bias args present, (kind, outside):", dict(ln_affine))

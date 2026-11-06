@@ -74,6 +74,7 @@ def wrap(algo, site, operand, x, dims):
         q = rn.e4m3_vpack(ptq, 0); d = rn.e4m3_unpack(q)
         ssum = d.sum(-1, keepdim=True).clamp_min(1e-30)
         o_kit = (d @ v.float()) / ssum
+        rec_p["fold_p_x256_unit_bytes_identical"] = bool((rn.e4m3_vpack((pf * 256.0).to(torch.bfloat16), 0) == rn.e4m3_vpack(p, -8)).all())
         rec_p["kit_style_x256_unit"] = {"relL2_out": rel(o_kit), "flush_frac": float((((q & 0x7F) == 0) & (pt.float() > 0)).sum() / max(int((pt.float() > 0).sum()), 1))}
         att["p"].append(rec_p)
     return orig(algo, site, operand, x, dims)
