@@ -514,7 +514,8 @@ class GptqAwq(Algo):
                 self.alpha_picks[key] = {"weight": a_w, "cast": alpha}
             else:
                 producer = self._producer_term(mods, chk, cons, Ws, H) if self.producer_aware else None
-                s, alpha, _ = awq_search(Ws, H, sx, self.grid, self._grid_exp_fn(cons[0]), producer=producer)
+                extra = {} if producer is None else {"producer": producer}      # default call unchanged
+                s, alpha, _ = awq_search(Ws, H, sx, self.grid, self._grid_exp_fn(cons[0]), **extra)
                 self.alpha_picks[key] = {"weight": alpha}
             self.timing["awq"] = self.timing.get("awq", 0.0) + time.time() - t_awq
             prod = mods[chk["producer"]]

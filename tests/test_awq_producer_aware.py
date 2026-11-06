@@ -146,8 +146,9 @@ def test_awq_gptq_end_to_end_with_producer_aware_on_panel_grid():
     model = tiny_llama(1)
     algo = algos.make("gptq_awq:method=awq_gptq,grid=4,producer_aware=true+granularity:w=panel,rows=32,rule=nc")
     rep = algos.quantize(model, "ref_linear", ["lm_head"], dict(FAST), algo=algo, calib=_calib(batches))
-    assert rep["algo"]["gptq_awq"]["weights"] == {"gptq+awq": 6, "gptq": 1}
-    assert rep["algo"]["gptq_awq"]["producer_aware"] is True
+    member = next(m for m in rep["algo"]["members"] if m["name"] == "gptq_awq")
+    assert member["weights"] == {"gptq+awq": 6, "gptq": 1}
+    assert member["producer_aware"] is True
     with torch.no_grad():
         assert torch.isfinite(model(batches[0]).logits.float()).all()
 
