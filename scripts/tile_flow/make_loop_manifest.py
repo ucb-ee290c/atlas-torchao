@@ -205,7 +205,7 @@ def euler_times(num_steps):
     return float(dt), times
 
 
-def pi0_manifest(single_step_bundle, checkpoint_dir, openpi_dir):
+def pi0_manifest(single_step_bundle, checkpoint_dir, openpi_dir, stack_cameras=False):
     import torch
 
     bundle, openpi = Path(single_step_bundle), Path(openpi_dir)
@@ -262,7 +262,10 @@ def pi0_manifest(single_step_bundle, checkpoint_dir, openpi_dir):
         "model": {"action_dim": adim, "action_horizon": horizon, "paligemma_variant": ckpt["paligemma_variant"],
                   "action_expert_variant": ckpt["action_expert_variant"], "precision": ckpt["precision"]},
         "cameras": {"order": cameras, "tokens_per_image": tokens_per_image,
-                    "stacked_on_batch_axis": "one SigLIP call for all cameras (pi0_fx._embed_prefix_one_tower_call)",
+                    "siglip_calls_per_prefix_call": 1 if stack_cameras else len(cameras),
+                    "camera_handling": ("stacked on the batch axis: one SigLIP call for all cameras (pi0_fx._embed_prefix_one_tower_call)"
+                                        if stack_cameras else "openpi embed_prefix unmodified: one SigLIP call per camera, so each "
+                                        "SigLIP quantized module is called %d times in the prefix graph" % len(cameras)),
                     "image_masks_in_capture_case_0": {c: bool(values[f"input_{3 + i}"].item()) for i, c in enumerate(cameras)}},
         "graphs": {
             "prefix": {"path": "prefix/fx", "calls_per_action_chunk": 1,
@@ -305,13 +308,14 @@ def main(argv=None):
     ap.add_argument("--out", required=True)
     ap.add_argument("--checkpoint-dir")
     ap.add_argument("--openpi-dir")
+    ap.add_argument("--stack-cameras", action="store_true", help="pi0: record the one-tower-call deviation instead of one SigLIP call per camera")
     a = ap.parse_args(argv)
     if a.model == "dit":
         manifest = dit_manifest(a.single_step_bundle)
     else:
         if not a.checkpoint_dir or not a.openpi_dir:
             ap.error("pi0 needs --checkpoint-dir and --openpi-dir")
-        manifest = pi0_manifest(a.single_step_bundle, a.checkpoint_dir, a.openpi_dir)
+        manifest = pi0_manifest(a.single_step_bundle, a.checkpoint_dir, a.openpi_dir, a.stack_cameras)
     out = Path(a.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(manifest, indent=1, allow_nan=False) + "\n")

@@ -2,8 +2,10 @@
 eager 100-step sampler). Uses only torch.export.load on the two saved graphs plus the loop manifest; no model class is imported
 for the one-step comparison.
 
-  (a) one step: step(encode(obs), noisy_actions, timestep) against the single-step bundle's recorded output for the same inputs
-      (fx/fixtures.safetensors of that bundle), byte for byte, and encode's output against the encode bundle's own fixture.
+  (a) one step: step(encode(obs), noisy_actions, timestep) against (1) the single-step bundle's graph (fx/model.pt2) run in the same
+      process on the same inputs and (2) that bundle's recorded fixture output, byte for byte, and encode's output against the
+      encode bundle's own fixture. Only (1) decides `ok`: a recorded fixture is a different process's run, and the eager original
+      boundary can itself differ from it on this host (see docs/algos/phase-graphs.md).
   (b) --eager-loop EXPORT_DIR: the host loop of loop_manifest.json (100 steps, DDPM arithmetic from the per_step table, variance noise
       from the global RNG in the same order diffusers draws it) over the step graph, against DiffusionObjective.conditional_sample
       of the eagerly rebuilt quantized policy with the same seed.
@@ -70,6 +72,7 @@ def main(argv=None):
     stp = torch.export.load(ph / "step" / "fx" / "model.pt2").module()
     fx_ss = load_file(str(ss / "fx" / "fixtures.safetensors"))
     parity = json.loads((ss / "fx" / "parity.json").read_text())
+    single = torch.export.load(ss / "fx" / "model.pt2").module()
     fx_enc = load_file(str(ph / "encode" / "fx" / "fixtures.safetensors"))
     enc_parity = json.loads((ph / "encode" / "fx" / "parity.json").read_text())
     res = {"phases_dir": str(ph), "single_step_bundle": str(ss), "one_step": [], "ok": True}
@@ -80,12 +83,16 @@ def main(argv=None):
             out = stp(cond, ins[4], ins[5])
             want = fx_ss[case["outputs"][0]]
             enc_want = fx_enc[enc_parity["cases"][i]["outputs"][0]]
+            same = single(*ins)
             row = {"case": i, "encode_output_shape": list(cond.shape), "encode_equals_encode_bundle_fixture": _bytes_equal(cond, enc_want),
-                   "composition_equals_single_step_bundle_output": _bytes_equal(out, want),
-                   "max_abs_diff": _diff(out, want), "output_shape": list(out.shape), "dtype": str(out.dtype)}
+                   "composition_equals_single_step_graph_same_process": _bytes_equal(out, same),
+                   "max_abs_diff_vs_single_step_graph": _diff(out, same),
+                   "composition_equals_recorded_fixture": _bytes_equal(out, want),
+                   "single_step_graph_equals_recorded_fixture": _bytes_equal(same, want),
+                   "max_abs_diff_vs_recorded_fixture": _diff(out, want), "output_shape": list(out.shape), "dtype": str(out.dtype)}
             row["manifest_cond_shape_matches"] = row["encode_output_shape"] == manifest["graphs"]["encode"]["outputs"]["conditioning_vec"]["shape"]
             res["one_step"].append(row)
-            res["ok"] &= row["composition_equals_single_step_bundle_output"] and row["manifest_cond_shape_matches"]
+            res["ok"] &= row["composition_equals_single_step_graph_same_process"] and row["manifest_cond_shape_matches"]
         if a.eager_loop:
             sys.path.insert(0, str(Path(__file__).resolve().parent))
             from policy_fx_capture_phases import load_dit
