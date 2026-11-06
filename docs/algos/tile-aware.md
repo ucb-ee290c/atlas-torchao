@@ -2,7 +2,7 @@
 
 Everything here is **NEW**: no source defines these scale layouts for Atlas. The numerics of each cast stay
 those of the reference author's encoder (`src/ref_numerics.py`); only the choice of exponent changes.
-No quality result exists yet for the three recipes below (no full-model run has been made).
+Measured results for TinyLlama (perplexity, relative L2) and the exported FX bundles are in `howto-model-to-fx-graph.md` and the PR description; SmolVLA was exported and captured with no quality number.
 
 ## What and why
 
@@ -177,7 +177,9 @@ python -m pytest tests/test_algo_tile.py tests/test_algo_granularity.py tests/te
 
 ## Limits
 
-- No quality measurement exists (no full-model run); the recipes are mechanically tested on tiny models only.
+- Quality was measured on TinyLlama only (16 windows of 512 tokens, exact float32 accumulation; `sa`/`ipt` on nine isolated layers). No SmolVLA, DiT or Pi0 quality number exists.
+- Under the static recipe, a Linear without calibration data (for example SmolVLA `vlm.lm_head`) silently stays on a dynamic per-tensor reference rule yet is marked tile-native. Count `mode: dynamic` Linear sites in `policy.json` before calling a bundle static.
+- For dynamic recipes, `compiler_pack_scale_admission` in `policy.json` reports `sites_checked: 0`; dynamic scales are only reported from the FX fixtures (`graph_inspection.json`), not as a compliance result.
 - `rows` other than 32 are emulated but do not match the 32 x 32 hardware tile.
 - `a=block` forces `nc` and applies to Linear inputs only; Conv2d inputs get the per-tensor rule.
 - On chip under `reference_hw` / `chip`, panel / block scales run through the existing MXU model with the
