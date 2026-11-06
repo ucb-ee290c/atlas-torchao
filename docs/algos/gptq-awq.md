@@ -1,7 +1,8 @@
 # `gptq_awq`: GPTQ and AWQ weights under the Atlas E4M3 cast
 
 `--algo gptq_awq[:method=gptq|awq|awq_gptq,actorder=true,damp=0.01,block=128,grid=20]`
-(`src/algos/gptq_awq.py`, tests in `tests/test_algo_gptq_awq.py`).
+(`src/algos/gptq_awq.py`, tests in `tests/test_algo_gptq_awq.py`). Opt-in `producer_aware=true` (default off) adds the producer's
+panel-grid quantization error to the AWQ search loss: [awq-producer-aware.md](awq-producer-aware.md).
 
 Only Linear weights change. Every activation, every attention operand and every Conv2d weight keeps
 the reference rule. Nothing changes at run time: the same E4M3 codes and the same per-tensor E8M0

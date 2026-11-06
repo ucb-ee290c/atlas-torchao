@@ -147,12 +147,25 @@ def gptq(W: torch.Tensor, H: torch.Tensor, s, block=128, damp=0.01, actorder=Tru
     return Q
 
 
-def awq_search(Ws, H, sx, grid=20, exp_fn=None):
+def awq_search(Ws, H, sx, grid=20, exp_fn=None, producer=None):
     """(s, alpha, loss) minimizing sum over the group of tr(dW D H D dW^T), D = diag(1/s), with
     dW = Q(W diag(s)) - W diag(s) and Q the reference cast (exponent re-derived on W diag(s)), or
-    the cast at exp_fn(W diag(s)) when a stacked algorithm chooses the weight grid."""
+    the cast at exp_fn(W diag(s)) when a stacked algorithm chooses the weight grid.
+
+    producer (NEW, gptq_awq:producer_aware=true; default None leaves the loss untouched) is a dict
+    {"W": [I, K] producer rows, "H": [K, K] Hessian of the producer's input, "c": [I] row weights,
+    "exp_fn": the producer's weight-grid rule} and adds the quantization error of the producer
+    rows AFTER the fold, W_p[j] / s_j cast on the producer's own grid (a 32-row panel under
+    w=panel), seen through the pair: sum_j c_j e_j H_p e_j^T, e_j = s_j (Q(W_p[j] / s_j) - W_p[j] / s_j).
+    A large s_j shrinks row j inside its panel, so this term grows with the spread of s."""
     exp_fn = exp_fn or rn.po2_scale_exp
-    H = H.float().to(Ws[0].device)
+    H = H.float().to(Ws[0].device)       # [K, K], or a 1-D diagonal (NEW, used by the weights-only proxy)
+    if producer is not None:
+        p_exp = producer.get("exp_fn") or rn.po2_scale_exp
+        Wp = producer["W"]
+        Hp = producer["H"]
+        Hp = None if Hp is None else Hp.float().to(Wp.device)     # None: identity (weight-only proxy)
+        cp = producer["c"].float().to(Wp.device)
     best = (float("inf"), None, None)
     for i in range(grid):
         a = i / grid
@@ -162,10 +175,29 @@ def awq_search(Ws, H, sx, grid=20, exp_fn=None):
         for W in Ws:
             Wsc = (W.float() * s).to(W.dtype).float()        # what the folded checkpoint holds
             dW = (qdq(Wsc, exp_fn(Wsc)) - Wsc) / s
-            loss += float(((dW @ H) * dW).sum())
+            loss += float(((dW @ H) * dW).sum() if H.dim() == 2 else ((dW * dW) * H).sum())   # 1-D H: diagonal
+        if producer is not None:
+            sp = s.to(Wp.device).unsqueeze(1)
+            Wpc = (Wp.float() / sp).to(Wp.dtype).float()     # what the folded producer holds
+            e = (qdq(Wpc, p_exp(Wpc)) - Wpc) * sp
+            loss += float((((e if Hp is None else e @ Hp) * e).sum(1) * cp).sum())
         if loss < best[0]:
             best = (loss, s, a)
     return best[1], best[2], best[0]
+
+
+def producer_row_weights(Wp, Hp, Wc, Hc_diag):
+    """NEW (producer_aware): c_j for the producer term of awq_search, in the units of the consumer
+    loss (squared output error summed over calibration tokens). Row j of the producer feeds the
+    consumer input channel j; its error e_j x reaches the consumer output through ||Wc[:, j]||^2 and,
+    for an MLP (down input = act(gate) * up), is gated by act(gate_j): c_j = ||Wc[:, j]||^2 * g_j with
+    g_j = E[down_in_j^2] / E[up_j^2] = Hc_jj / (Wp[j] Hp Wp[j]^T), the second moment of the pair's
+    channel relative to the producer's alone (independence of the gate and of the error assumed;
+    no extra calibration pass). Dead channels get 0."""
+    Wp = Wp.float()
+    up2 = ((Wp if Hp is None else Wp @ Hp.float().to(Wp.device)) * Wp).sum(1)
+    g = torch.where(up2 > 0, Hc_diag.float().to(Wp.device) / up2.clamp(min=1e-30), torch.zeros_like(up2))
+    return (Wc.float() ** 2).sum(0).to(Wp.device) * g
 
 
 def act_cast_nc(x: torch.Tensor) -> torch.Tensor:
@@ -234,7 +266,8 @@ class GptqAwq(Algo):
         self.method = str(params.get("method", "gptq"))
         if self.method not in METHODS:
             raise ValueError(f"gptq_awq: method={self.method!r}; choose from {METHODS}")
-        unknown = set(params) - {"method", "actorder", "damp", "block", "grid", "hessians", "awq_loss", "calib", "target"}
+        unknown = set(params) - {"method", "actorder", "damp", "block", "grid", "hessians", "awq_loss", "calib", "target",
+                                 "producer_aware"}
         if unknown:
             raise ValueError(f"gptq_awq: unknown parameters {sorted(unknown)}")
         self.actorder = bool(params.get("actorder", True))
@@ -254,6 +287,11 @@ class GptqAwq(Algo):
                 raise ValueError(f"gptq_awq: {k}={v!r}; choose from {ok}")
         if self.target == "fp" and self.calib != "chip":
             raise ValueError("gptq_awq: target=fp needs calib=chip")
+        # NEW opt-in (default off): the AWQ search also sees the producer's own quantization error
+        # on its weight grid (docs/algos/awq-producer-aware.md)
+        self.producer_aware = _as_bool(params.get("producer_aware", False))
+        if self.producer_aware and self.awq_loss == "cast":
+            raise ValueError("gptq_awq: producer_aware=true is implemented for awq_loss=weight only")
         self.subsample = {}                         # owner fqn -> [T, K] CPU token subsample
         self.Hhat, self.Cxx = {}, {}                # calib=chip: sum x_hat x_hat^T, sum x x_hat^T
         self.alpha_picks = {}                       # fold group -> {"weight": a, "cast": a}
@@ -475,7 +513,9 @@ class GptqAwq(Algo):
                                                    self._grid_exp_fn(cons[0]), weight_H=H.float().to(Ws[0].device))
                 self.alpha_picks[key] = {"weight": a_w, "cast": alpha}
             else:
-                s, alpha, _ = awq_search(Ws, H, sx, self.grid, self._grid_exp_fn(cons[0]))
+                producer = self._producer_term(mods, chk, cons, Ws, H) if self.producer_aware else None
+                extra = {} if producer is None else {"producer": producer}      # default call unchanged
+                s, alpha, _ = awq_search(Ws, H, sx, self.grid, self._grid_exp_fn(cons[0]), **extra)
                 self.alpha_picks[key] = {"weight": alpha}
             self.timing["awq"] = self.timing.get("awq", 0.0) + time.time() - t_awq
             prod = mods[chk["producer"]]
@@ -501,6 +541,24 @@ class GptqAwq(Algo):
         self._chip_pass(model)
         return {"method": self.method, "awq_folded": folded, "awq_unscaled": refused,
                 "alpha_picks": dict(self.alpha_picks)}
+
+    def _producer_term(self, mods, chk, cons, Ws, Hc):
+        """NEW (producer_aware): the producer-row term of awq_search for an up_proj -> down_proj
+        group; None for a norm group (its producer is a 1-D weight, cast to BF16, not an FP8 operand)."""
+        if not chk["rows"]:
+            return None
+        pname = chk["producer"]
+        own_p = self.owner.get(pname, pname)
+        Hp = self.H.get(own_p)
+        if Hp is None:
+            return None
+        Wp = mods[pname].weight.detach()
+        s_in = self.awq_scale.get(pname)       # the norm group (folded first) scaled Wp's columns by s_in
+        if s_in is not None:                   # and its input is now x / s_in: H' = D H D, as transform_weight does
+            Di = (1.0 / s_in.double()).to(Hp.device)
+            Hp = (Hp.double() * Di.unsqueeze(0) * Di.unsqueeze(1)).float()
+        c = producer_row_weights(Wp, Hp, Ws[0], torch.diag(Hc.float()))
+        return {"W": Wp, "H": Hp, "c": c, "exp_fn": self._grid_exp_fn(pname)}
 
     @torch.no_grad()
     def _chip_pass(self, model):
@@ -618,10 +676,16 @@ class GptqAwq(Algo):
             counts[v] = counts.get(v, 0) + 1
         rec["weights"] = counts
         rec["damp_raised"] = dict(self.damp_raised)
+        if self.producer_aware:
+            rec["producer_aware"] = True
         rec["hw_aware"] = {"awq_loss": self.awq_loss, "calib": self.calib, "target": self.target,
                            "alpha_picks": dict(self.alpha_picks),
                            "timing_s": {k: round(v, 2) for k, v in self.timing.items()}}
         return rec
+
+
+def _as_bool(v) -> bool:
+    return v.strip().lower() in ("1", "true", "yes", "on") if isinstance(v, str) else bool(v)
 
 
 def _alive(table, k, x) -> bool:
