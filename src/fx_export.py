@@ -24,6 +24,8 @@ from pathlib import Path
 import torch
 from torch.utils import _pytree
 
+import pack_plan
+
 SCHEMA = "atlas_torchao.fx_verification.v1"
 STORAGE_DTYPES = {"uint8": torch.uint8, "float8_e4m3fn": torch.float8_e4m3fn}
 RECOGNIZED_QUANT_MODULES = ("RefQuantLinear", "RefQuantConv2d")
@@ -719,6 +721,16 @@ def _tile_native_report(module, policy, native_paths, plan, act_stats):
     return report
 
 
+def _pack_plan(program, policy):
+    """REPORTING ONLY: the pack plan of the policy's static activations with the producer class of each packed tensor read
+    from the captured graph (docs/algos/pack-plan.md). Returns (policy copy carrying the plan, plan, summary). A graph without
+    atlas.quantize_act nodes (decode-based capture) gives producer class 'unknown'."""
+    producers, shared = pack_plan.producers_from_graph(str(program.graph), str(program.graph_signature), policy)
+    with_plan = pack_plan.with_plan(policy, producers, shared)
+    plan = {k: r for k, r in pack_plan.recorded_plan(with_plan).items()}
+    return with_plan, plan, with_plan["pack_plan_summary"]
+
+
 def _admission_report(policy, act_stats):
     """compiler_pack_scale_admission for graph_inspection.json: the policy's static exponents plus the
     dynamic exponents observed in the capture cases (INFORMATIONAL; nothing is clamped)."""
@@ -853,6 +865,9 @@ def inspect_graph(program, module, policy, plan=None, storage="uint8", unused=()
               "scope": "reference-emulation FX; not native-FP8 MLIR or hardware compatibility"}
     report["tile_native"] = _tile_native_report(module, policy, native_paths, plan, act_stats)
     report["compiler_pack_scale_admission"] = _admission_report(policy, act_stats)
+    _, pack_records, pack_summary = _pack_plan(program, policy)
+    report["pack_plan_summary"] = pack_summary                    # INFORMATIONAL; compiler_pack_scale_admission is unchanged
+    report["pack_plan"] = pack_records
     if plan:
         native_rows = [row for row in rows if row.get("native")]
         native_modules = {row["module"] for row in native_rows} | {row["module"] for row in attention_rows}
@@ -1057,7 +1072,7 @@ def capture_fx(module, cases, directory, *, policy, provenance=None, strict=True
             _json(directory / "parity.json", parity)
             _json(directory / "buffer_inventory.json", before)
             _json(directory / "graph_inspection.json", graph_report)
-            _json(directory / "policy.json", policy)
+            _json(directory / "policy.json", _pack_plan(program, policy)[0])      # policy + pack_plan records (graph classes)
             (directory / "graph.txt").write_text(str(program.graph) + "\n")
             (directory / "graph_signature.txt").write_text(str(program.graph_signature) + "\n")
             torch.export.save(program, directory / "model.pt2")
