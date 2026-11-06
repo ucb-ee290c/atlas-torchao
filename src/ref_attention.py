@@ -200,6 +200,20 @@ def _smolvla_text_attention(self_inner, attention_mask, batch_size, head_dim,
     return out.permute(0, 2, 1, 3).reshape(batch_size, -1, n_heads * dv)          # 723
 
 
+def _dit_rope_attention(self, x):
+    """RoPEAttention.forward (lerobot multi_task_dit) with its F.scaled_dot_product_attention call
+    routed through ref_attention. Fused qkv_proj, plain BF16 RoPE on q and k, no mask, not causal,
+    default scale head_dim ** -0.5 (self.scale); q and k are quantized after the rotation. Dropout is
+    not modelled (eval: p = 0)."""
+    cfg = self._atlas_ref_attn
+    B, T, _ = x.shape  # noqa: N806
+    qkv = self.qkv_proj(x).reshape(B, T, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+    q, k = self.rope(qkv[0], qkv[1])
+    out = ref_attention(q, k, qkv[2], self.scale, None, cfg["fm_qk"], cfg["fm_av"], cfg["variant"],
+                        cfg.get("algo"), cfg.get("site", ""), cfg.get("two_term"))
+    return self.out_proj(out.to(q.dtype).transpose(1, 2).reshape(B, T, self.hidden_size))
+
+
 def _algo_cfg(site) -> dict:
     """{"algo", "site"} for a patched site while an algorithm is active (src/algos), else {}."""
     algo = algos.current()
@@ -215,7 +229,9 @@ def patch_attention(model: nn.Module, fm_factory=None, skip=()) -> list:
       - modules driven by a transformers config with an attention-interface key: the config is
         switched to ATTN_KEY (eager-style masks). SmolVLM vision layers use the vision variant;
         everything else (Llama-family decoders) the text variant.
-    Models with neither (e.g. custom attention modules) are left unchanged.
+      - Multi-Task DiT `RoPEAttention` (lerobot): instance `forward` replaced (_dit_rope_attention),
+        vision variant (the reference mtdit_inout routes DiT SDPA through its vision routine).
+    Models with none of these (e.g. other custom attention modules) are left unchanged.
     """
     if any(type(m).__name__ == "PaliGemmaWithExpertModel" for m in model.modules()):
         return patch_pi0_attention(model, fm_factory, skip)
@@ -240,6 +256,12 @@ def patch_attention(model: nn.Module, fm_factory=None, skip=()) -> list:
         mod._atlas_ref_attn = {"fm_qk": new_fm(), "fm_av": new_fm(), "variant": variant, **_algo_cfg(name)}
         configs[id(cfg)] = cfg
         sites.append({"site": name, "kind": type(mod).__name__, "variant": variant})
+    for name, mod in model.named_modules():
+        # Multi-Task DiT's own blocks: fused qkv_proj, no config; the instance forward is replaced
+        if type(mod).__name__ == "RoPEAttention" and hasattr(mod, "qkv_proj") and hasattr(mod, "rope"):
+            mod._atlas_ref_attn = {"fm_qk": new_fm(), "fm_av": new_fm(), "variant": "vision", **_algo_cfg(name)}
+            mod.forward = types.MethodType(_dit_rope_attention, mod)
+            sites.append({"site": name, "kind": "RoPEAttention", "variant": "vision"})
     if configs:
         register_hf_attention()
         for cfg in configs.values():
