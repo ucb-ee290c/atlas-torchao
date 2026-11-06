@@ -194,7 +194,37 @@ Result: 317 quantized sites, all tile-native; graph has 302 `atlas.qlinear`, 1 `
 nothing emulated; `bf16_by_policy` empty; capture and fresh-process replay passed. 35 Linear weights have an output size that is not a
 multiple of 32 and carry the label `per_panel(32,partial_tail)`. No quality number was measured for SmolVLA.
 
-Multi-Task DiT and Pi0 were not run. Present on this machine: the DiT checkpoint (`TRI-ML/multitask-dit-robosuite-wrist-diffusion-064000`, 954 MB) and
-its dataset snapshot (97 MB) in the Hugging Face cache; the Pi0 checkpoint (`/scratch2/lorenhung/models/openpi-pytorch/pi0_droid_jointpos_polaris`, 7.0 GB)
-and a separate `atlas-pi0` environment (torch 2.7.1). The DiT conv exception needs `atlas_v1_tile`; DiT and Pi0 action sampling are not FX boundaries
-(fx-export.md).
+### Multi-Task DiT and Pi0 (2026-11-06, CPU, commit `7aadbdc`)
+
+Both were run with `--algo atlas_v1_awq_tile_static+keep_bf16:rule=input_conv`. The named recipe `atlas_v1_awq_tile_static` has no `keep_bf16`
+member (only `atlas_v1_tile` does), so without the appended member the patch-embedding Conv2d is quantized (SmolVLA above: 1 `qconv2d`). Bundles:
+`exports-tile/multitask-dit/atlas_v1_awq_tile_static/` and `exports-tile/pi0/atlas_v1_awq_tile_static/` (each with `export/`, `fx/`,
+`verify_bundle.json`, `bundle_manifest.json`, and the capture driver `policy_fx_capture.py` + `pi0_fx.py`).
+
+| | Multi-Task DiT | Pi0 |
+|---|---|---|
+| export command | `eval_policy.py --policy TRI-ML/multitask-dit-robosuite-wrist-diffusion-064000 --dataset TRI-ML/PretrainFinetune --seed 0 --n-frames 200 --modes ref_conv --export-only` (atlas-lerobot env) | `eval_pi0.py --obs droid --n-obs 32 --seed 0 --modes ref_conv --export-only` (atlas-pi0 env, torch 2.7.1) |
+| export wall time | 385 s | 2374 s |
+| calibration | 32 frames, seed 1234, test episodes excluded (defaults) | 8 DROID frames (default `--calib-n`), seed 0, episodes disjoint from the 32 evaluated ones |
+| sites in `policy.json` | 179 Linear + 24 attention quantized, 1 Conv2d host | 420 Linear + 63 attention quantized, 1 Conv2d host, 2 skipped (`lm_head` x2) |
+| graph | 179 `qlinear`, 24 `qk_matmul`, 24 `pv_matmul`, 275 `quantize_act`, 0 `qconv2d` | 420 `qlinear`, 63 `qk_matmul`, 63 `pv_matmul`, 672 `quantize_act`, 0 `qconv2d` |
+| BF16 by policy | `...clip vision_model.embeddings.patch_embedding` (bf16 `[768,3,16,16]`) | SigLIP `...vision_tower.vision_model.embeddings.patch_embedding` (**float32** `[1152,3,14,14]`, selected by the same rule) and the two skipped `lm_head` (not in the graph) |
+| `mode: dynamic` Linear sites | 0 | 0 |
+| static activation codes outside 122..128 | 88 of 203 (64 of 179 Linear inputs, 24 of 24 `p`) | 127 of 483 (64 of 420 Linear inputs, 63 of 63 `p`) |
+| `verify_bundle.py` | 23 of 24 pass | 22 of 24 pass |
+| capture | strict, torch 2.11, 266 s | **non-strict**, torch 2.7.1, 1549 s |
+
+Boundaries are not in `fx_export.py` (`--boundary` has only `causal_lm` and `smolvla_flow_loss`); the driver `policy_fx_capture.py` mirrors the SmolVLA branch.
+DiT: `observation_encoder.encode(batch)` + one `noise_predictor` call (state, images, tokens, noisy actions, timestep in; predicted noise out).
+Pi0: `PI0Pytorch.sample_actions(num_steps=1)` with explicit noise (SigLIP, PaliGemma prefix with KV cache, one expert denoise step). Not the flow-loss
+forward: its joint prefix + suffix path runs attention through the PaliGemma layers only, so the 18 action-expert attention sites had no matmul
+in that graph (capture refused it). The driver also stacks the 3 cameras into one SigLIP call (`fx_export` refuses a quantized module called 3 times)
+and adds `aten.conv2d.padding` to `fx_export.CONTRACTIONS` at run time (SigLIP's patch embedding exports with that overload, so the BF16-by-policy
+report could not find its contraction). `src/` was not modified. Neither graph is the 10-step sampler or the DiT's 100-step loop.
+
+`verify_bundle.py` failures (it is written for causal LMs): `no_unexpected_non_atlas_contraction` fails on the patch-embedding conv (declared BF16 / float32
+by policy) and, for the DiT, on the 6 `scaled_dot_product_attention` nodes of the DiT's own `RoPEAttention` blocks: they are functional BF16 attention with
+no policy site and are not quantized (the 24 attention sites are the CLIP text and vision towers). Pi0 only:
+`graph_has_no_float_weight_param_for_quantized_linears` fails because the non-strict export keeps 420 float weight parameters as meta placeholders
+(no storage, no users in the graph; `fresh_process_verification.json`: `unused_float_weights_not_materialized: true`).
+Pi0 and DiT quality was not measured (no comparable old number; the old DiT and Pi0 exports were never produced).
