@@ -40,7 +40,7 @@ whose `s_j` all differ widely. It is complementary and not implemented here.
 
 ## Validation
 
-Tests: `tests/test_awq_producer_aware.py` (8 passed, 1 skipped: the end-to-end test needs the reference submodules, `need_refs`).
+Tests: `tests/test_awq_producer_aware.py` (9 passed with the reference submodules present; without them the end-to-end test skips via `need_refs`).
 Synthetic pair (I=64, K=48, three channels with 10^4x the activation magnitude): old search alpha 0.85 leaves 3 rows with 24-30% error on the
 panel grid (0 on a per-channel grid); new search alpha 0.55 leaves 0.
 
