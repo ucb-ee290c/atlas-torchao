@@ -82,6 +82,65 @@ def classify_contractions(contractions, policy, weight_targets, allow_unquantize
     return allowed, unexpected
 
 
+def _scope_candidates(module):
+    """Module-path spellings of a graph scope: as recorded, minus a leading wrapper attribute 'policy.', minus a leading
+    wrapper 'model.' (the wrapper name differs between bundles: 'model' for LMs / DiT / Pi0, 'policy' for SmolVLA)."""
+    if not module:
+        return set()
+    out, pending = set(), [module]
+    while pending:
+        m = pending.pop()
+        if m in out:
+            continue
+        out.add(m)
+        for p in ("policy.", "model."):
+            if m.startswith(p):
+                pending.append(m[len(p):])
+    return out
+
+
+def _owner_site(module, sites):
+    """Longest policy site that is `module` or encloses it; None when the node carries no scope (a module called as
+    `module.forward(...)` is not on the nn_module_stack) or no site covers it."""
+    best = None
+    for m in _scope_candidates(module):
+        for s in sites:
+            if (m == s or m.startswith(s + ".")) and (best is None or len(s) > len(best)):
+                best = s
+    return best
+
+
+def _wrapper_stems(names, suffix):
+    """{stem with and without its first path component} -> original name, for buffers 'x.<site>.<suffix>'."""
+    out = {}
+    for k in names:
+        if k.endswith("." + suffix):
+            stem = k[:-len(suffix) - 1]
+            out[stem] = k
+            if "." in stem:
+                out[stem.split(".", 1)[1]] = k
+    return out
+
+
+def _act_consumers(graph):
+    """{quantize_act node name: consumer class} through the getitem (and the visible V^T transpose): qlinear | qconv2d |
+    qk_matmul | pv_matmul | other. Used to check that every quantize_act feeds exactly one atlas contraction."""
+    out = {}
+    for n in graph.nodes:
+        if n.op != "call_function" or str(n.target) != "atlas.quantize_act.default":
+            continue
+        kinds, pending = set(), [u for g in n.users for u in g.users]
+        while pending:
+            u = pending.pop()
+            t = str(u.target)
+            if t == "aten.transpose.int":
+                pending.extend(u.users)
+            else:
+                kinds.add(t.replace("atlas.", "").replace(".default", "") if t.startswith("atlas.") else "other")
+        out[n.name] = kinds.pop() if len(kinds) == 1 else "other"
+    return out
+
+
 def _innermost_module(node):
     stack = node.meta.get("nn_module_stack") or {}
     return list(stack.values())[-1][0] if stack else None
@@ -192,9 +251,67 @@ def run(export, fx, out, allow_fallback=False, allow_unquantized_attention=True,
                       "panel_groups_sum": sum(groups_per_site.values())}
     check("panel_not_collapsed_to_per_tensor", multi_possible == 0 or multi > 0, res["weights"])
 
+    # ---- 1b. graph facts: which policy sites the graph really holds -------------------------------------------------
+    # A policy site is not always one graph node: a quantized layer the captured boundary never calls has no node and no
+    # lifted buffers (SmolVLA lm_head), and a module called several times (or as module.forward(), SmolVLA's text/expert
+    # attention) has one policy site but several qk/pv pairs. Expected counts are therefore derived from the graph's own
+    # inventory (lifted buffers, scopes, operand wiring) and cross-checked with the bundle's declarations.
+    prog = torch.export.load(fx / "model.pt2")
+    gi = json.loads((fx / "graph_inspection.json").read_text())
+    bufs = dict(prog.named_buffers())
+    code_stems = _wrapper_stems(bufs, "weight_codes")
+    exp_stems = _wrapper_stems(bufs, "weight_scale_exp")
+    in_graph = {n for n in sites if n in code_stems}
+    unused_derived = sorted(set(sites) - in_graph)
+    unused_declared = sorted(r["site"] for r in gi.get("unused_quantized_modules", []))
+    unused_agree = unused_derived == unused_declared
+    used = {n: s for n, s in sites.items() if n in in_graph}
+    n_lin_used = sum(1 for s in used.values() if s["kind"] == "linear")
+    n_conv_used = sum(1 for s in used.values() if s["kind"] == "conv2d")
+    res["graph_inventory"] = {"policy_quantized_linear": sum(1 for s in sites.values() if s["kind"] == "linear"),
+                              "policy_quantized_conv2d": sum(1 for s in sites.values() if s["kind"] == "conv2d"),
+                              "sites_in_graph_by_buffers": len(in_graph), "unused_in_graph_derived": unused_derived,
+                              "unused_declared_by_bundle": unused_declared, "derived_equals_declared": unused_agree}
+
+    attn_policy = sorted(n for n, s in policy["sites"].items() if s["kind"] == "attention" and s["status"] == "quantized")
+    qk_nodes = [n for n in prog.graph.nodes if n.op == "call_function" and str(n.target) == "atlas.qk_matmul.default"]
+    pv_nodes = [n for n in prog.graph.nodes if n.op == "call_function" and str(n.target) == "atlas.pv_matmul.default"]
+    scoped = {k: collections.Counter() for k in ("qk", "pv")}
+    unscoped = collections.Counter()
+    for kind, nodes in (("qk", qk_nodes), ("pv", pv_nodes)):
+        for n in nodes:
+            owner = _owner_site(_innermost_module(n), attn_policy)
+            if owner is None:
+                unscoped[kind] += 1
+            else:
+                scoped[kind][owner] += 1
+    # sites that own no scoped node are called as module.forward(): their pairs are the scope-less ones, and their number is
+    # the exporter's tag-bound count (graph_inspection native_fp8_attention_modules), which must equal the scope-less nodes
+    scopeless_sites = [a for a in attn_policy if scoped["qk"][a] == 0 and scoped["pv"][a] == 0]
+    rec_pairs = {r["site"]: r["pairs"] for r in gi.get("native_fp8_attention_modules", [])}
+    scopeless_expected = sum(rec_pairs.get(a, 0) for a in scopeless_sites)
+    per_site_ok = all(scoped["qk"][a] == scoped["pv"][a] and (scoped["qk"][a] == rec_pairs.get(a, scoped["qk"][a]))
+                      for a in attn_policy if a not in scopeless_sites)
+    attn_ok = (per_site_ok and unscoped["qk"] == unscoped["pv"] == scopeless_expected
+               and all(rec_pairs.get(a, 0) >= 1 for a in scopeless_sites)
+               and (bool(scopeless_sites) or unscoped["qk"] == 0))
+    pairs_expected = sum(scoped["qk"].values()) + scopeless_expected
+    res["graph_attention"] = {"policy_sites": len(attn_policy), "scoped_pairs": sum(scoped["qk"].values()),
+                              "scope_less_pairs": unscoped["qk"], "scope_less_sites": scopeless_sites,
+                              "scope_less_pairs_declared": scopeless_expected,
+                              "pairs_by_site": {a: (scoped["qk"][a] or rec_pairs.get(a, 0)) for a in attn_policy}}
+    consumers = _act_consumers(prog.graph)
+    cons_count = collections.Counter(consumers.values())
+    # a Linear / Conv2d activation on the dynamic rule is visible in the graph as quantize_act mode 'dynamic' feeding qlinear / qconv2d
+    dyn_linear_acts = sum(1 for n in prog.graph.nodes if n.op == "call_function" and str(n.target) == "atlas.quantize_act.default"
+                          and n.args[1] == "dynamic" and consumers.get(n.name) in ("qlinear", "qconv2d"))
+
     # ---- 2. policy activation census ---------------------------------------------------------------------------------
     census = collections.Counter()
     census_plain = collections.Counter()      # census without declared-fallback sites (owned by static_recipe_fully_static)
+    # a fallback site the graph never calls (derived from the lifted buffers AND declared by the bundle) runs no rule at all
+    def _unused_fallback(names):
+        return {n for n in names if n in unused_derived and unused_agree}
     for n, s in policy["sites"].items():
         if s.get("status") != "quantized":
             continue
@@ -204,7 +321,7 @@ def run(export, fx, out, allow_fallback=False, allow_unquantized_attention=True,
         else:
             a = s["activation"]
             census[(s["kind"], a.get("mode"), a.get("reduce") or a.get("source"), a.get("rule"))] += 1
-            if not a.get("uncalibrated_fallback"):
+            if not a.get("uncalibrated_fallback") and not (n in unused_derived and unused_agree and a.get("source") == "reference"):
                 census_plain[(s["kind"], a.get("mode"), a.get("reduce") or a.get("source"), a.get("rule"))] += 1
     res["policy_activation_census"] = [{"site_kind": k[0], "mode": k[1], "reduce_or_source": k[2], "rule": k[3], "count": v}
                                        for k, v in sorted(census.items(), key=str)]
@@ -219,12 +336,18 @@ def run(export, fx, out, allow_fallback=False, allow_unquantized_attention=True,
     else:                                   # export predates the field: reference-rule Linear sites of a static recipe
         fb_sites = sorted(n for n, s in lin_quant.items() if s["activation"].get("source") == "reference") if static_recipe else []
     declared = bool(fb_rec and fb_rec.get("declared")) or allow_fallback
+    exempt_unused = sorted(_unused_fallback(fb_sites))
+    live_fb = [n for n in fb_sites if n not in exempt_unused]
     res["static_recipe_check"] = {"static_recipe": static_recipe, "uncalibrated_fallback_count": len(fb_sites),
                                   "sites": fb_sites[:10], "declared": declared,
-                                  "export_records_field": fb_rec is not None}
-    check("static_recipe_fully_static", not static_recipe or not fb_sites or declared, res["static_recipe_check"])
+                                  "export_records_field": fb_rec is not None,
+                                  "fallback_sites_never_called_in_graph": exempt_unused,
+                                  "fallback_sites_live_in_graph": len(live_fb),
+                                  "dynamic_rule_linear_conv_activations_in_graph": dyn_linear_acts}
+    check("static_recipe_fully_static",
+          not static_recipe or declared or (not live_fb and dyn_linear_acts == 0), res["static_recipe_check"])
     # declared fallback sites are the only not-tile-native sites a bundle may carry
-    tile_exempt = set(fb_sites) if declared else set()
+    tile_exempt = (set(fb_sites) if declared else set()) | set(exempt_unused)
     check("policy_all_sites_tile_native",
           set(tn["not_tile_native"]) <= tile_exempt and tn["sites_checked"] == tn["tile_native_sites"] + len(tn["not_tile_native"]),
           {"sites_checked": tn["sites_checked"], "declared_fallback_exempt": len(set(tn["not_tile_native"]) & tile_exempt)})
@@ -232,7 +355,6 @@ def run(export, fx, out, allow_fallback=False, allow_unquantized_attention=True,
           not any(k[0] in ("linear", "conv2d") and k[2] == "reference" for k in census_plain), None)
 
     # ---- 3. the graph itself -------------------------------------------------------------------------------------------
-    prog = torch.export.load(fx / "model.pt2")
     targets = collections.Counter(str(n.target) for n in prog.graph.nodes if n.op == "call_function")
     by_name = {n.name: n for n in prog.graph.nodes}
     weight_targets = {sp.arg.name: sp.target for sp in prog.graph_signature.input_specs
@@ -249,13 +371,24 @@ def run(export, fx, out, allow_fallback=False, allow_unquantized_attention=True,
         non_atlas.append({"node": n.name, "target": str(n.target), "operands": ops, "module": _innermost_module(n)})
     res["graph"] = {"call_function_targets_atlas": {k: v for k, v in targets.items() if "atlas" in k},
                     "nodes_total": sum(targets.values()), "non_atlas_contractions": non_atlas}
-    n_q = len(sites)
-    n_attn = sum(1 for s in policy["sites"].values() if s["kind"] == "attention" and s["status"] == "quantized")
+    n_q = len(used)                      # quantized Linear + Conv2d sites the graph holds (policy sites minus never-called ones)
+    n_attn = len(attn_policy)
     cnt = lambda t: targets.get(f"atlas.{t}.default", 0)  # noqa: E731
-    check("graph_qlinear_count_equals_quantized_linears", cnt("qlinear") == n_q, {"qlinear": cnt("qlinear"), "policy": n_q})
-    check("graph_qk_pv_counts_equal_attention_sites", cnt("qk_matmul") == n_attn and cnt("pv_matmul") == n_attn,
-          {"qk": cnt("qk_matmul"), "pv": cnt("pv_matmul"), "policy": n_attn})
-    check("graph_quantize_act_count", cnt("quantize_act") == n_q + 4 * n_attn, cnt("quantize_act"))
+    check("graph_qlinear_count_equals_quantized_linears",
+          cnt("qlinear") == n_lin_used and cnt("qconv2d") == n_conv_used and unused_agree,
+          {"qlinear": cnt("qlinear"), "policy_linear_in_graph": n_lin_used, "qconv2d": cnt("qconv2d"),
+           "policy_conv2d_in_graph": n_conv_used, "policy_sites_not_in_graph": unused_derived,
+           "declared_unused": unused_declared})
+    check("graph_qk_pv_counts_equal_attention_sites",
+          cnt("qk_matmul") == pairs_expected and cnt("pv_matmul") == pairs_expected and attn_ok,
+          {"qk": cnt("qk_matmul"), "pv": cnt("pv_matmul"), "expected_pairs": pairs_expected, "policy_sites": n_attn,
+           **{k: v for k, v in res["graph_attention"].items() if k != "pairs_by_site"}})
+    act_expected = n_q + 4 * pairs_expected
+    check("graph_quantize_act_count",
+          cnt("quantize_act") == act_expected and set(cons_count) <= {"qlinear", "qconv2d", "qk_matmul", "pv_matmul"}
+          and cons_count["qlinear"] == cnt("qlinear") and cons_count["qconv2d"] == cnt("qconv2d")
+          and cons_count["qk_matmul"] == 2 * cnt("qk_matmul") and cons_count["pv_matmul"] == 2 * cnt("pv_matmul"),
+          {"quantize_act": cnt("quantize_act"), "expected": act_expected, "consumers": dict(cons_count)})
     # every non-atlas contraction must be declared (see the module docstring) or the check fails
     allowed, unexpected = classify_contractions(non_atlas, policy, weight_targets, allow_unquantized_attention)
     res["graph"]["allowed_non_atlas_contractions"] = allowed
@@ -271,13 +404,14 @@ def run(export, fx, out, allow_fallback=False, allow_unquantized_attention=True,
     res["graph"]["bf16_by_policy_sites"] = bf16_policy
 
     # buffers retained as uint8 / int32 in the loaded program
-    bufs = dict(prog.named_buffers())
     badbuf = [k for k in bufs if k.endswith("weight_codes") and bufs[k].dtype != torch.uint8] + \
              [k for k in bufs if k.endswith("weight_scale_exp") and bufs[k].dtype != torch.int32]
     nb = sum(1 for k in bufs if k.endswith("weight_codes"))
-    check("graph_weight_buffers_uint8_int32", not badbuf and nb == n_q, {"weight_code_buffers": nb, "bad": badbuf[:3]})
-    qmods = {"model." + n for n in sites}
-    fl = [k for k in dict(prog.named_parameters()) if k.endswith(".weight") and k[:-7] in qmods]
+    buffer_sites_ok = {n for n in sites if n in code_stems} == {n for n in sites if n in exp_stems} == set(used) \
+        and nb == n_q == sum(1 for k in bufs if k.endswith("weight_scale_exp"))
+    check("graph_weight_buffers_uint8_int32", not badbuf and buffer_sites_ok,
+          {"weight_code_buffers": nb, "expected": n_q, "bad": badbuf[:3], "policy_sites_without_buffers": unused_derived[:3]})
+    fl = [k for k in dict(prog.named_parameters()) if k.endswith(".weight") and any(c in sites for c in (k[:-7], k[:-7].split(".", 1)[-1]))]
     fresh = json.loads((fx / "fresh_process_verification.json").read_text())
     placeholder_of = {sp.target: sp.arg.name for sp in prog.graph_signature.input_specs
                       if sp.kind.name == "PARAMETER" and hasattr(sp.arg, "name")}
@@ -293,17 +427,21 @@ def run(export, fx, out, allow_fallback=False, allow_unquantized_attention=True,
     check("graph_has_no_float_weight_param_for_quantized_linears", not fl_bad, fl_bad[:3])
 
     # ---- 4. graph_inspection + reports ------------------------------------------------------------------------------------
-    gi = json.loads((fx / "graph_inspection.json").read_text())
     t = gi["tile_native"]
     check("inspection_all_tile_native",
           set(t["not_tile_native"]) <= tile_exempt and t["sites_checked"] == t["tile_native_sites"] + len(t["not_tile_native"]),
           {"sites_checked": t["sites_checked"], "declared_fallback_exempt": len(set(t["not_tile_native"]) & tile_exempt)})
     rows = gi["weight_site_bindings"]
-    check("inspection_all_weight_sites_native", len(rows) == n_q and all(r["native"] for r in rows), len(rows))
+    check("inspection_all_weight_sites_native",
+          len(rows) == n_q and {r["site"] for r in rows} == set(used) and all(r["native"] for r in rows),
+          {"rows": len(rows), "expected": n_q})
     check("inspection_nothing_emulated", gi["still_emulated"]["emulated_modules"] == {}, gi["still_emulated"]["emulated_modules"])
     check("inspection_bf16_by_policy_is_declared_only",
           [r["site"] for r in gi["bf16_by_policy"]] == bf16_policy, [r["site"] for r in gi["bf16_by_policy"]])
-    check("inspection_native_attention_modules", len(gi["native_fp8_attention_modules"]) == n_attn, len(gi["native_fp8_attention_modules"]))
+    check("inspection_native_attention_modules",
+          len(gi["native_fp8_attention_modules"]) == n_attn
+          and {r["site"] for r in gi["native_fp8_attention_modules"]} == set(attn_policy),
+          len(gi["native_fp8_attention_modules"]))
     fx_stats = t["fixture_activation_stats"]
     res["fixtures"] = {"sites": len(fx_stats),
                        "reserved_codes_total": sum(v.get("reserved_codes", 0) for v in fx_stats.values()),
