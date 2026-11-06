@@ -60,7 +60,7 @@ import weakref
 import torch
 import torch.nn as nn
 
-import ref_numerics as rn
+import reference.ref_numerics as rn
 from algos.base import Algo, Scale
 
 METHODS = ("gptq", "awq", "awq_gptq")

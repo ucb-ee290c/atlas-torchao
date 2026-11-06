@@ -34,20 +34,43 @@ from __future__ import annotations
 
 import threading
 import types
+from contextlib import contextmanager
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 import algos
-import ref_numerics as rn
+import reference.ref_numerics as rn
 from algos import base as algo_hooks
 
 ATTN_KEY = "atlas_ref"
+_PROF = None
+_PROF_TAG = ""        # suffix of the attn_fisher key (the SmolVLA route runs every layer through one site)
+_LAYER_CTRS: list = []  # cfg dicts holding a per-forward layer counter "_i" (SmolVLA text / expert route)
 
+
+def new_forward() -> None:
+    """Call before each model forward while profiling: restarts the per-layer counters."""
+    for cfg in _LAYER_CTRS:
+        cfg["_i"] = 0
+
+
+@contextmanager
+def attn_fisher():
+    """Profile the q/k/p/v casts of every ref_attention call; yields {"site.operand": float64 sum}."""
+    global _PROF
+    _PROF = {}
+    try:
+        yield _PROF
+    finally:
+        _PROF = None
+    
 
 def _mm(fm, a_q, a_s, b_q, b_s, dtype_out=torch.float32):
     """a [..., M, K] times b [..., N, K]^T on cast operands; result * 2^(sa+sb) in float32."""
+    if a_s is None: 
+        return torch.matmul(a_q, b_q.transpose(-1, -2).to(a_q.dtype)).to(dtype_out)
     if fm is not None:
         y = fm(rn.e4m3_unpack(a_q), rn.e4m3_unpack(b_q), None)
         return y * torch.exp2((a_s + b_s).float())
@@ -58,14 +81,28 @@ def _mm(fm, a_q, a_s, b_q, b_s, dtype_out=torch.float32):
 
 
 def _cast(algo, site, operand, x, dims):
-    """rn.quantize(x, dims) (per-(b, h) scales); with an algorithm, its act_cast hook."""
+    """rn.quantize(x, dims) (per-(b, h) scales); with an algorithm, its act_cast hook.
+
+    Under attn_fisher() the operand is not replaced: it records 0.5 * sum(g^2 * (x_hat - x)^2) for
+    `site.operand` (g = dL/dx, via a hook on the clean tensor) and returns (x, None) so the caller
+    runs on clean values (see _mm)."""
     if algo is None:
-        return rn.quantize(x, dims)
-    q, s, blk = algo_hooks.act_cast(algo, site, x, "attention." + operand, dims)
-    if blk:
-        raise NotImplementedError(f"{site}: per-block scales on attention operands are not defined "
-                                  "in algo/base")
-    return q, s
+        q, s = rn.quantize(x, dims)
+    else:
+        q, s, blk = algo_hooks.act_cast(algo, site, x, "attention." + operand, dims)
+        if blk:
+            raise NotImplementedError(f"{site}: per-block scales on attention operands are not defined "
+                                      "in algo/base")
+    if _PROF is None:
+        return q, s
+    if x.requires_grad:
+        d2 = (rn.dequantize(q, s).float() - x.detach().float()).pow(2)
+        acc = _PROF.setdefault(f"{site}{_PROF_TAG}.{operand}", torch.zeros((), dtype=torch.float64, device=x.device))
+
+        def hook(g, d2=d2, acc=acc):
+            acc.add_(0.5 * (g.float().pow(2) * d2).sum())      # returns None: the gradient is untouched
+        x.register_hook(hook)
+    return x, None
 
 
 def ref_attention(q, k, v, scaling, mask=None, fm_qk=None, fm_av=None, variant="text", algo=None, site=""):
@@ -172,16 +209,22 @@ def _smolvla_text_attention(self_inner, attention_mask, batch_size, head_dim,
     q = query_states.transpose(1, 2)                                               # [B, H, Sq, D]
     k = _expand_kv(key_states.transpose(1, 2), n_heads // n_kv)
     v = _expand_kv(value_states.transpose(1, 2), n_heads // n_kv)
-    out = ref_attention(q, k, v, head_dim ** -0.5, attention_mask, cfg["fm_qk"], cfg["fm_av"], "text",
-                        cfg.get("algo"), cfg.get("site", ""))
+    global _PROF_TAG
+    _PROF_TAG, cfg["_i"] = f".L{cfg.get('_i', 0)}", cfg.get("_i", 0) + 1       # profiling key only
+    try:
+        out = ref_attention(q, k, v, head_dim ** -0.5, attention_mask, cfg["fm_qk"], cfg["fm_av"], "text",
+                            cfg.get("algo"), cfg.get("site", ""))
+    finally:
+        _PROF_TAG = ""
     dv = out.shape[-1]
     return out.permute(0, 2, 1, 3).reshape(batch_size, -1, n_heads * dv)          # 723
 
 
 def _algo_cfg(site) -> dict:
-    """{"algo", "site"} for a patched site while an algorithm is active (src/algos), else {}."""
+    """{"algo", "site"} for a patched site; "site" is always set (attn_fisher keys by it), "algo" only
+    while an algorithm is active (src/algos)."""
     algo = algos.current()
-    return {"algo": algo, "site": site} if algo is not None else {}
+    return {"algo": algo, "site": site} if algo is not None else {"site": site}
 
 
 def patch_attention(model: nn.Module, fm_factory=None, skip=()) -> list:
@@ -202,6 +245,7 @@ def patch_attention(model: nn.Module, fm_factory=None, skip=()) -> list:
     for name, mod in model.named_modules():
         if type(mod).__name__ == "SmolVLMWithExpertModel" and hasattr(mod, "eager_attention_forward"):
             mod._atlas_ref_attn = {"fm_qk": new_fm(), "fm_av": new_fm(), "variant": "text", **_algo_cfg(name)}
+            _LAYER_CTRS.append(mod._atlas_ref_attn)
             mod.eager_attention_forward = types.MethodType(_smolvla_text_attention, mod)
             sites.append({"site": name, "kind": "smolvla_text_expert", "variant": "text"})
     smolvla = bool(sites)
@@ -425,7 +469,7 @@ class RefQuantConv2d(nn.Module):
 def quantize_conv2d(model: nn.Module, skip=(), fm_factory=None, exact_skip=()) -> dict:
     """Replace every nn.Conv2d (model_patcher.py:508-511) that the reference path supports:
     groups == 1 (339-343) and integer or 'valid' padding (330-337); others are reported."""
-    from ref_profile import _set_module
+    from reference.ref_profile import _set_module
 
     done, untouched = [], []
     for n, m in list(model.named_modules()):

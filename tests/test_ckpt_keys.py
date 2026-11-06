@@ -10,7 +10,7 @@ import torch.nn as nn
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-import ckpt_keys  # noqa: E402
+import loaders.ckpt_keys as ckpt_keys  # noqa: E402
 
 
 class Inner(nn.Module):

@@ -10,10 +10,10 @@ import types
 from pathlib import Path
 
 import algos
-import fx_export
+import exporter.fx_export as fx_export
 import pytest
-import quant_export
-import ref_numerics as rn
+import exporter.quant_export as quant_export
+import reference.ref_numerics as rn
 import torch
 import torch.nn.functional as F
 from safetensors.torch import load_file

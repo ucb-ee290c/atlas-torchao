@@ -1,4 +1,4 @@
-"""Bit-exactness of src/accum_torch.py against the reference author's functional models.
+"""Bit-exactness of src/mxu/accum_torch.py against the reference author's functional models.
 
 Oracles are built from the reference sources at test time:
   - SA C model: the C shim embedded in func_models_sa/systolic_c/systolic_array_rtl_linear.py
@@ -29,7 +29,7 @@ import torch
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
-import accum_torch as at  # noqa: E402
+import mxu.accum_torch as at  # noqa: E402
 
 
 def _ref_root():
@@ -467,7 +467,7 @@ def test_ipt_c_vs_numba_disagreement(ipt_lib, numba_ref):
 @needs_ref
 def test_ipt_float_entry_matches_reference_class(numba_ref):
     """IPTLinearRTLFunction(vec_len=32, num_lanes=32) on float input, the oracle that
-    src/accum_backends.py names for ('ipt', 'ref_cpu')."""
+    src/mxu/accum_backends.py names for ('ipt', 'ref_cpu')."""
     _, lin = numba_ref
     g = torch.Generator().manual_seed(12)
     x = bytes_to_float(rand_bytes((2, 3, 100), g, "normal"))

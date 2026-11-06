@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import torch
 
-import chip_ops
+import chip.chip_ops as chip_ops
 
 MODES = ("trunc", "rn", "rne_hw")
 SITES = ("residual", "data", "all")

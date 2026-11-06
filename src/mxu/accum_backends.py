@@ -4,14 +4,14 @@
           sa    per-step systolic array (functional_models.py:103-108, systolic_c)
     impl  ref_cpu    the reference author's CPU functional models, used as-is (the oracles)
           ref_cpu_c  ipt only: the C build of the IPT model (ipt_c), for cross-checking
-          torch      device-agnostic torch ports in src/accum_torch.py (GPU-capable)
+          torch      device-agnostic torch ports in src/mxu/accum_torch.py (GPU-capable)
 
 Every backend is a callable with the reference functional-model call contract
 (pi0_inout/functional_models.py:7-12, 79-108; quant_linear.py:166):
 
     y = fm(x, w, b=None)
 
-Contract that src/accum_torch.py must implement, with these exact signatures:
+Contract that src/mxu/accum_torch.py must implement, with these exact signatures:
 
     def ipt_linear(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor | None = None, *,
                    vec_len: int = 32) -> torch.Tensor
@@ -51,7 +51,7 @@ from typing import Callable
 
 import torch
 
-import ref_loader
+import reference.ref_loader as ref_loader
 
 MXUS = ("ipt", "sa")
 IMPLS = ("ref_cpu", "ref_cpu_c", "torch")
@@ -107,16 +107,16 @@ class _RefCPU:
 
 
 class _Torch:
-    """src/accum_torch.py. ipt follows ipt_numba (variant="numba", the reference author's run and
+    """src/mxu/accum_torch.py. ipt follows ipt_numba (variant="numba", the reference author's run and
     the RTL's single rounding); sa can torch.compile its step (compile=None reads
     ATLAS_ACCUM_COMPILE). Pure integer bit-field arithmetic: TF32 and reduction-order settings
     cannot change its results."""
 
     def __init__(self, mxu: str, compile=None):
         try:
-            import accum_torch
+            import mxu.accum_torch as accum_torch
         except ImportError as e:
-            raise RuntimeError("the torch accumulation implementation (src/accum_torch.py) is not "
+            raise RuntimeError("the torch accumulation implementation (src/mxu/accum_torch.py) is not "
                                "available in this checkout; use --mxu-impl ref_cpu") from e
         self.mxu, self.compile = mxu, compile
         self._at = accum_torch
@@ -151,10 +151,10 @@ def describe(mxu: str, impl: str) -> dict:
 
 def crosschecked(mxu: str, fm, sample_frac: float = 0.01, seed: int = 0, time_budget_s: float = 600.0):
     """Wrap a torch accumulator so a seeded sample of real calls is recomputed by the reference
-    CPU model and compared bit for bit (src/accum_crosscheck.py). One instance is shared by every
+    CPU model and compared bit for bit (src/mxu/accum_crosscheck.py). One instance is shared by every
     layer so the time budget is global. The reference is always called with its weight cache
     dropped: the operands it receives are fresh CPU copies, whose addresses can repeat."""
-    from accum_crosscheck import CrossChecked
+    from mxu.accum_crosscheck import CrossChecked
 
     ref = get_accumulator(mxu, "ref_cpu")
     return CrossChecked(fm, lambda x, w, b=None: ref(x, w, b, static=False), mxu=mxu, impl="torch",

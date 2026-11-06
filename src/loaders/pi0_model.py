@@ -44,7 +44,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-import ref_loader
+import reference.ref_loader as ref_loader
 
 OPENPI_PIN = "215abfb217dbac7d5f1273282331b9b1866c0479"   # github.com/Physical-Intelligence/openpi
 OPENPI_URL = "https://github.com/Physical-Intelligence/openpi"
@@ -356,7 +356,7 @@ def inventory(model: nn.Module) -> dict:
         if kind:
             w = getattr(m, "weight", None)
             sites[n] = {"kind": kind, "dtype": str(w.dtype).removeprefix("torch.") if w is not None else None,
-                        "component": __import__('ref_attention').pi0_component(n)}
+                        "component": __import__('reference.ref_attention', fromlist=['_']).pi0_component(n)}
     return sites
 
 

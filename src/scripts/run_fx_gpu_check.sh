@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Run only from the selected detached FX checkout. No source edits or upstream writes.
-FX_SRC="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+FX_SRC="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 FX_COMMIT="${FX_COMMIT:?set the full commit from the GPU handoff}"
 FX_EXPECTED_MANIFEST_SHA256="${FX_EXPECTED_MANIFEST_SHA256:?copy the full TinyLlama AWQ digest from run-5.3 exports_summary.json}"
 FX_ROOT="${FX_ROOT:?set the absolute atlas-fp8 working directory on the GPU machine}"
@@ -87,9 +87,9 @@ printf 'FX_GPU_CHECK_STARTED\n  commit=%s\n  source=%s\n  source_export=%s\n  re
 cd "$FX_SRC"
 "$FX_PY" -m pytest -q tests/test_fx_export.py > "$FX_RUN/pytest-fx-export.log" 2>&1
 FX_ARGS=(--export-dir "$FX_EXPORT" --model "$FX_MODEL" --out-dir "$FX_OUTPUT" --device cuda --seqlen 8 --seed 0)
-"$FX_PY" src/fx_export.py "${FX_ARGS[@]}" > "$FX_RUN/capture.log" 2>&1
+PYTHONPATH=src "$FX_PY" -m exporter.fx_export "${FX_ARGS[@]}" > "$FX_RUN/capture.log" 2>&1
 # A further standalone process verifies the same saved artifact; no model-class imports.
-"$FX_PY" src/fx_export.py --verify-dir "$FX_OUTPUT" --device cuda > "$FX_RUN/standalone-reload.log" 2>&1
+PYTHONPATH=src "$FX_PY" -m exporter.fx_export --verify-dir "$FX_OUTPUT" --device cuda > "$FX_RUN/standalone-reload.log" 2>&1
 
 "$FX_PY" - <<'PY'
 import hashlib

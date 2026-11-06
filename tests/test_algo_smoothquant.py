@@ -388,7 +388,7 @@ def test_no_supported_layers_partial_static_scales_every_linear():
     linears = {n for n, x in m.named_modules() if isinstance(x, nn.Linear)}
     assert rec["static_act_scales"] == len(linears) == 5
     assert set(algo._static_exp) == linears
-    import ref_numerics as rn
+    import reference.ref_numerics as rn
     for n in linears:   # no fold: the exponent comes straight from the calibrated maximum
         assert torch.equal(algo._static_exp[n], rn.po2_scale_exp(algo._amax[n].max().reshape(())))
     s = algo.act_scale("blocks.0.fc1", torch.zeros(1), "linear")

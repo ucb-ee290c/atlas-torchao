@@ -2,7 +2,7 @@
 import pytest
 import torch
 
-import chip_coverage as cc
+import chip.chip_coverage as cc
 
 A = torch.ops.aten
 

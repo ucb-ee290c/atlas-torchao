@@ -6,7 +6,7 @@ import pytest
 import torch
 
 import algos
-import ref_numerics as rn
+import reference.ref_numerics as rn
 from algos import base as algo_hooks
 from algos import gptq_awq as ga
 from refutil import need_refs

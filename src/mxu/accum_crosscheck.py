@@ -1,13 +1,13 @@
 """In-run cross-check of an accumulation backend against the reference CPU functional model.
 
-During a reference_hw eval with the torch backend (src/accum_torch.py), wrap the accumulator so
+During a reference_hw eval with the torch backend (src/mxu/accum_torch.py), wrap the accumulator so
 that a seeded sample of the real layer calls is also computed by the reference CPU model, and
 record the bit-level comparison in the result JSON. This makes "bit-exact Atlas arithmetic" a
 property checked in the run that produced the numbers, not only in the unit tests. (All NEW: the
 reference has no such mode.)
 
-    from accum_backends import get_accumulator
-    from accum_crosscheck import CrossChecked
+    from mxu.accum_backends import get_accumulator
+    from mxu.accum_crosscheck import CrossChecked
 
     fm = CrossChecked(get_accumulator("sa", "torch"), get_accumulator("sa", "ref_cpu"),
                       impl="torch", ref_impl="ref_cpu", mxu="sa",
@@ -199,7 +199,7 @@ class CrossChecked:
 
     def summary(self) -> dict:
         try:
-            import accum_torch
+            import mxu.accum_torch as accum_torch
             numerics = accum_torch.numerics_report()
         except Exception as e:  # pragma: no cover
             numerics = {"error": repr(e)}

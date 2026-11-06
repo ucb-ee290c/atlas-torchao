@@ -1,7 +1,7 @@
 """Rank a causal LM's Linear layers by FP8 sensitivity on the calibration split (offline input of
 --algo mixed_precision:rank_file=...; docs/algos/mixed-precision.md).
 
-    python scripts/rank_layers.py --model /path/TinyLlama-1.1B-Chat-v1.0 --seqlen 512 \
+    python src/scripts/rank_layers.py --model /path/TinyLlama-1.1B-Chat-v1.0 --seqlen 512 \
         --calib-n 4 --calib-seed 1234 --device cuda --out out/rank_tinyllama.json
 
 Calibration windows come from algos.calib.wikitext2_train (WikiText-2 TRAIN; the evaluation reads
@@ -20,7 +20,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
+REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "src"))
 
 
@@ -81,7 +81,7 @@ def main():
 
     from algos import calib
     device = a.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    from modelutils import load_llama
+    from loaders.modelutils import load_llama
 
     if a.threads:
         torch.set_num_threads(a.threads)

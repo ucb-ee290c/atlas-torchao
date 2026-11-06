@@ -1,4 +1,4 @@
-"""src/accum_crosscheck.py: the in-run bit-level cross-check of an accumulation backend."""
+"""src/mxu/accum_crosscheck.py: the in-run bit-level cross-check of an accumulation backend."""
 
 import sys
 from pathlib import Path
@@ -9,8 +9,8 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-import accum_crosscheck as xc  # noqa: E402
-import accum_torch as at  # noqa: E402
+import mxu.accum_crosscheck as xc  # noqa: E402
+import mxu.accum_torch as at  # noqa: E402
 from test_accum_torch import bytes_to_float, needs_ref, numba_ref, rand_bytes  # noqa: E402,F401
 
 

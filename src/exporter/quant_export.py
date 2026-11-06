@@ -15,7 +15,7 @@ with calibration, folds and algorithm transforms applied) and before any evaluat
   manifest.json      provenance, sha256 of the two files above, NEW decisions, pending rulings.
 
 Only the reference-numerics modes (ref_linear .. chip) can be exported: they are the ones whose
-weights are E4M3 codes with E8M0-style exponents (src/ref_profile.py, src/ref_attention.py).
+weights are E4M3 codes with E8M0-style exponents (src/reference/ref_profile.py, src/reference/ref_attention.py).
 Everything not taken from a source is marked NEW here and listed in NEW_DECISIONS.
 """
 
@@ -357,7 +357,7 @@ def build_policy(model, mode, report, algo, options, skip, bf16_opt_out, opt_out
                 "kind": res, "lo_codes": f"{n}.weight_lo_codes", "lo_scale_exp": f"{n}.weight_lo_scale_exp",
                 "passes": ["x_hi.w_hi", "x_hi.w_lo"] + (["x_lo.w_hi"] if res == "wx" else []),
                 "sum": "each pass rescaled, summed in the layer dtype (VPU vmul / vadd); pending ruling R4",
-                "lo_rule": "reference per-tensor rule on w - dequant(w_hi) (src/ref_profile.py _init_residual)"}
+                "lo_rule": "reference per-tensor rule on w - dequant(w_hi) (src/reference/ref_profile.py _init_residual)"}
         sites[n] = site
     for n, cfg in attention_sites(model).items():
         ops = {}
@@ -368,7 +368,7 @@ def build_policy(model, mode, report, algo, options, skip, bf16_opt_out, opt_out
                     "matmuls": ["q.k^T (FP8 x FP8)", "softmax in BF16 / VPU", "p.v (FP8 x FP8)"],
                     "operands": ops,
                     "output_rescale": "2^(s_q + s_k) on the scores, 2^(s_p + s_v) on the output "
-                                      "(src/ref_attention.py, model_patcher.py:624-723)"}
+                                      "(src/reference/ref_attention.py, model_patcher.py:624-723)"}
     for n in bf16_opt_out:
         mods = dict(model.named_modules())
         mod = mods.get(n)
@@ -405,7 +405,7 @@ def build_policy(model, mode, report, algo, options, skip, bf16_opt_out, opt_out
             "requirements": [
                 "RoPE / timestep sin-cos tables are host constants (--chip-rope host, the default chip step)",
                 "every op outside the listed sites runs in BF16 on the VPU / scalar core or the host "
-                "(src/op_unit_map.py, chip_coverage)",
+                "(src/chip/op_unit_map.py, chip_coverage)",
             ] + (["dynamic activation scales need a run-time amax (pending rulings Q2 / H2)"]
                  if any(_is_dynamic(s) for s in sites.values()) else []) + ([f"chip vadd {chip_opts['chip_vadd']} on {chip_opts.get('chip_vadd_sites', 'residual')} sites "
                   "(recipe chip default; NEW, off-ladder)"] if chip_opts.get("chip_vadd") else []),

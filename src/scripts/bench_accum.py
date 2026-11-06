@@ -1,8 +1,8 @@
-"""Throughput of the torch MXU accumulation ports (src/accum_torch.py), in MAC/s.
+"""Throughput of the torch MXU accumulation ports (src/mxu/accum_torch.py), in MAC/s.
 
-    python scripts/bench_accum.py                       # CPU, eager, default shapes
-    python scripts/bench_accum.py --device cuda --compile --check
-    PI0_QUANT_DIR=third_party/pi0-quant python scripts/bench_accum.py --ref
+    python src/scripts/bench_accum.py                       # CPU, eager, default shapes
+    python src/scripts/bench_accum.py --device cuda --compile --check
+    PI0_QUANT_DIR=third_party/pi0-quant python src/scripts/bench_accum.py --ref
 
 --check   re-run each case and compare bits run-to-run; on a non-CPU device also compare
           against the same call on CPU (the CUDA re-verification the docs ask for).
@@ -47,10 +47,10 @@ from pathlib import Path
 
 import torch
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
-import accum_torch as at  # noqa: E402
+import mxu.accum_torch as at  # noqa: E402
 
 DEFAULT_SHAPES = ["16x2048x256", "64x2048x2048", "8x5632x512"]   # M x K x N
 

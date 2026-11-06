@@ -1,7 +1,7 @@
 """mixed_precision: keep the most FP8-sensitive layers out of single-pass FP8 (docs/algos/mixed-precision.md).
 
 The layers are chosen from a ranking file built OFFLINE on the calibration split by
-scripts/rank_layers.py (algos.quantize calls bf16_layers before calibrate, so a ranking computed
+src/scripts/rank_layers.py (algos.quantize calls bf16_layers before calibrate, so a ranking computed
 inside the run could not select them; see the doc for the proposed base option). Scores:
 
   fisher_out    NEW: 0.5 * sum_t (dL/dy_t . e_t)^2, e_t the layer's local FP8 output error on the
@@ -104,7 +104,7 @@ class MixedPrecision(Algo):
             total = None
         else:
             if "rank_file" not in p:
-                raise ValueError("mixed_precision needs rank_file= (scripts/rank_layers.py) or units=")
+                raise ValueError("mixed_precision needs rank_file= (src/scripts/rank_layers.py) or units=")
             rk = load_ranking(p["rank_file"])
             fqns = select(rk["layers"], p.get("score", "fisher_out"), p.get("k"), p.get("mac_budget"))
             prov = {"source": "rank_file", "path": rk["path"], "sha256": rk["sha256"], "meta": rk.get("meta", {})}
@@ -150,7 +150,7 @@ ALGO = MixedPrecision
 
 
 # ---------------------------------------------------------------------------------------------
-# Offline scoring (scripts/rank_layers.py)
+# Offline scoring (src/scripts/rank_layers.py)
 # ---------------------------------------------------------------------------------------------
 
 def score_layers(clean, quant, batches, loss_fn, names, iso=True) -> dict:
