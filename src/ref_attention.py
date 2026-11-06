@@ -53,7 +53,9 @@ def _mm(fm, a_q, a_s, b_q, b_s, dtype_out=torch.float32, role=None, pop_shift=0)
     site passes it; docs/algos/pack-fold.md): the result is multiplied by 2^pop_shift (exact in float32)."""
     if fm is not None:
         y = fm(rn.e4m3_unpack(a_q), rn.e4m3_unpack(b_q), None)
-        return y * torch.exp2((a_s + b_s + int(pop_shift)).float())
+        if pop_shift:
+            return y * torch.exp2((a_s + b_s + int(pop_shift)).float())
+        return y * torch.exp2((a_s + b_s).float())
     # NEW: reference profile without an MXU model: matmul on the dequantized operands in float32.
     y = rn.dq_matmul_nt(a_q, a_s, b_q, b_s)
     return y if not pop_shift else y * (2.0 ** int(pop_shift))

@@ -4,7 +4,9 @@ A static activation exponent s means real = e4m3(byte) * 2^s and the pack code i
 c in 122..128. Packing 2^k * x at exponent s + k gives byte-identical FP8 codes to packing x at s, so for every static
 site that sits behind a producer which already multiplies by a constant, the pass
   1. scales the producer by 2^k exactly:
-       norm_affine      (RMSNorm gamma, `mul(param, mul)`)      gamma             <- gamma * 2^k      (BF16, exact)
+       norm_affine      (RMSNorm gamma `mul(param, mul)`; Gemma x * (1 + w) when float32 and exact)
+                                                                gamma             <- gamma * 2^k      (BF16, exact)
+       layer_norm       (weight and bias)                       both scaled by 2^k (exact)
        gated_product    (act(gate) * up)                        up_proj weight_scale_exp += k  (bias * 2^k)
        linear_to_linear (a Linear feeding only a Linear)        producer weight_scale_exp += k (bias * 2^k)
        attn_out_pv      (P.V feeding o_proj)                    policy attention site `pv_pop_shift` += k, i.e. the
@@ -36,7 +38,7 @@ import pack_plan as pp
 import tile_native as tn
 
 SCHEMA = "atlas_torchao.pack_fold.v1"
-FREE_CLASSES = ("norm_affine", "gated_product", "attn_out_pv", "linear_to_linear")
+FREE_CLASSES = ("norm_affine", "layer_norm", "gated_product", "attn_out_pv", "linear_to_linear")
 BF16_MAX = float(torch.finfo(torch.bfloat16).max)
 BF16_MIN_NORMAL = float(torch.finfo(torch.bfloat16).tiny)
 E8M0_CODE_LIMITS = (1, 254)               # a weight exponent code outside this would alias / clamp (VectorEngine.scala e8m0 clamp)
@@ -90,6 +92,12 @@ def graph_info(graph_text: str, signature_text: str, policy: dict, tensor_names=
     users = _users(nodes, order)
     acts_of_src = collections.defaultdict(list)
     per_key = collections.defaultdict(list)
+    site_calls = collections.Counter()                  # qlinear / qconv2d nodes per weight site (a module called twice shows 2)
+    for n in order:
+        if nodes[n]["t"] in ("atlas.qlinear", "atlas.qconv2d"):
+            s_ = _qlinear_site(nodes, buffers, n, qsites)
+            if s_:
+                site_calls[s_] += 1
     for n in order:
         if nodes[n]["t"] != "atlas.quantize_act":
             continue
@@ -121,22 +129,39 @@ def graph_info(graph_text: str, signature_text: str, policy: dict, tensor_names=
         extra = sorted({t for t in pp._leaves(nodes, users, src)
                         if t not in ("atlas.quantize_act", "aten._assert_tensor_metadata.default")})
         info[key] = {"class": cls, "other_consumers": extra, "node": first["node"], "nodes": len(rows), "src": src,
-                     "desc": pd, "consumer_site": next(iter(first["consumers"])) if len(first["consumers"]) == 1 else None,
+                     "desc": pd, "site_calls": dict(site_calls), "consumer_site": next(iter(first["consumers"])) if len(first["consumers"]) == 1 else None,
                      "consumer_sites": sorted(first["consumers"]), "group_acts": acts_of_src[src],
                      "producer": _producer(nodes, users, buffers, params, src, cls, pd, qsites, attn_names, tensor_names)}
+        info[key]["producer"] = _single_user(nodes, users, info[key]["producer"], params)
     return info
 
 
 def _producer(nodes, users, buffers, params, src, cls, pd, qsites, attn_names, tensor_names) -> dict:
-    if cls == "norm_affine":
-        if pd != "mul(param,mul)":
-            return {"kind": "unsupported", "why": "(1 + w) multiplier: 2^k (1 + w) - 1 is not exact in the parameter dtype"}
-        ph = next((pp._real(nodes, r) for r in nodes[src]["refs"] if pp._kind(nodes, r) == "param"), None)
+    def stored(ph):
         tgt = params.get(ph)
-        tensor = _match_tensor(tgt, tensor_names) if tgt and tensor_names else None
+        return (_match_tensor(tgt, tensor_names) if tgt and tensor_names else None), tgt
+
+    if cls == "norm_affine":
+        if pd == "mul(mul,add)":                       # Gemma style x * (1 + w): the multiplier is a parameter-only add
+            addn = next((pp._real(nodes, r) for r in nodes[src]["refs"] if pp._kind(nodes, r) == "add"), None)
+            ph = pp._real(nodes, nodes[addn]["refs"][0]) if addn in nodes and nodes[addn]["refs"] else None
+            tensor, tgt = stored(ph)
+            if tensor is None or not nodes[addn]["args"].rstrip().endswith(("1.0", ", 1")):
+                return {"kind": "unsupported", "why": f"(1 + w) parameter {ph!r} is not a stored tensor / not add(param, 1)"}
+            return {"kind": "norm_one_plus", "tensor": tensor, "param_target": tgt}
+        ph = next((pp._real(nodes, r) for r in nodes[src]["refs"] if pp._kind(nodes, r) == "param"), None)
+        tensor, tgt = stored(ph)
         if tensor is None:
             return {"kind": "unsupported", "why": f"gamma parameter {ph!r} (target {tgt!r}) is not a stored tensor"}
         return {"kind": "norm_gamma", "tensor": tensor, "param_target": tgt}
+    if cls == "layer_norm":
+        refs = nodes[src]["refs"]
+        if len(refs) < 3:
+            return {"kind": "unsupported", "why": "LayerNorm without weight and bias arguments"}
+        (wt, wtgt), (bt, _) = stored(pp._real(nodes, refs[1])), stored(pp._real(nodes, refs[2]))
+        if wt is None or bt is None:
+            return {"kind": "unsupported", "why": "LayerNorm weight / bias are not stored tensors"}
+        return {"kind": "layer_norm", "tensor": wt, "bias_tensor": bt, "param_target": wtgt}
     if cls in ("gated_product", "linear_to_linear"):
         if cls == "gated_product":
             ref = next((r for r in nodes[src]["refs"] if pp._kind(nodes, r) == "qlinear"), None)
@@ -155,6 +180,15 @@ def _producer(nodes, users, buffers, params, src, cls, pd, qsites, attn_names, t
         site = pp._match_site(a[6].rpartition(":")[0], attn_names) if len(a) > 6 and ":" in a[6] else None
         return {"kind": "pv_shift", "site": site, "node": src}
     return {"kind": "unsupported", "why": f"producer class {cls!r} is not free"}
+
+
+def _single_user(nodes, users, prod: dict, params: dict) -> dict:
+    """A parameter placeholder read by more than one node (shared / tied gamma, a module called twice) cannot be scaled in place."""
+    ph = [p for p, tgt in params.items() if tgt == prod.get("param_target")] if prod.get("param_target") else []
+    if prod["kind"] in ("norm_gamma", "norm_one_plus", "layer_norm") and any(
+            len([u for u in users[p] if not u.startswith("_assert")]) != 1 for p in ph):
+        return {"kind": "unsupported", "why": "the parameter placeholder is read by more than one node (shared or called twice)"}
+    return prod
 
 
 def producers_for_plan(info: dict) -> dict:
@@ -219,6 +253,11 @@ def _group_reason(policy, g, k, max_abs_k) -> str | None:
         return "multi_call_site: a site is packed at more than one node"
     if any(r["consumer_site"] is None for r in infos):
         return "consumer_not_a_single_linear"
+    calls = next(iter(infos))["site_calls"]
+    multi = sorted(s_ for s_ in {r["consumer_site"] for r in infos} | ({g["producer"]["site"]} if g["producer"].get("site") else set())
+                   if s_ in calls and calls[s_] != 1)
+    if multi:
+        return "multi_call_site: weights read by more than one node: " + ",".join(multi)
     # every quantize_act that reads the producer must be one of this group's static Linear sites
     bad = [m for m, key in g["group_acts"] if m != "static" or key not in g["keys"]]
     if bad:
@@ -259,6 +298,23 @@ def _scale_pow2(t: torch.Tensor, k: int):
     return out, exact, stats
 
 
+def _scale_one_plus(w: torch.Tensor, k: int):
+    """w' with fl32(w' + 1) == 2^k * fl32(w + 1) bit for bit (the graph forms 1 + w in float32), or (None, stats) when some
+    element has no such w' in the parameter dtype. Only float32 parameters qualify."""
+    if w.dtype != torch.float32:
+        return None, {"why": f"parameter dtype {w.dtype}: 2^k (1 + w) - 1 is not exact outside float32"}
+    w64 = w.double()
+    new64 = (w64 + 1.0) * (2.0 ** k) - 1.0
+    new = new64.to(torch.float32)
+    target = (w + 1.0) * (2.0 ** k)
+    # what has to hold is the identity of the multiplier the graph forms, fl32(w' + 1) == 2^k fl32(w + 1); w' itself need not be exact
+    exact = bool(torch.isfinite(new).all()) and bool(((new + 1.0) == target).all())
+    mult = target.abs()
+    nz = mult[mult != 0]
+    return (new if exact else None), {"elements": w.numel(), "min_abs_nonzero": float(nz.min()) if nz.numel() else None,
+                                      "max_abs": float(mult.max()) if mult.numel() else 0.0}
+
+
 def _weight_guard(exp: torch.Tensor, delta: int):
     """New weight exponents must stay an admissible E8M0 code and keep the dequantized weights normal in BF16."""
     new = exp.to(torch.int64) + delta
@@ -278,6 +334,8 @@ def apply_folds(tensors: dict, policy: dict, groups: dict, *, only_free=True) ->
     report = {"groups": [], "bf16_range": {"gamma_sites": 0, "min_abs_nonzero_after": None, "max_abs_after": None,
                                           "bf16_min_normal": BF16_MIN_NORMAL, "bf16_max": BF16_MAX, "failures": []}}
     rng = report["bf16_range"]
+    aliased = set(policy.get("aliases") or {}) | set((policy.get("aliases") or {}).values())
+    param_edited, producer_used = set(), set()            # stored tensors a producer edit has already claimed
     for src, g in sorted(groups.items()):
         row = {"src": src, "class": g["class"], "keys": g["keys"], "k": g["k"], "reason": g["reason"], "applied": False}
         report["groups"].append(row)
@@ -286,8 +344,20 @@ def apply_folds(tensors: dict, policy: dict, groups: dict, *, only_free=True) ->
         k = g["k"]
         deltas = collections.defaultdict(int)             # weight_scale_exp tensor name -> delta
         edits = {}                                        # tensor name -> new tensor
+        stats = []                                        # BF16 range stats, merged only when the group is applied
         why = None
         prod = g["producer"]
+        claimed = [prod[f] for f in ("tensor", "bias_tensor") if prod.get(f)]
+        if prod["kind"] == "weight_exp":
+            claimed.append(policy["sites"][prod["site"]]["weight"]["scale_exp"])
+        touched = claimed + [policy["sites"][g["info"][key]["consumer_site"]]["weight"]["scale_exp"] for key in g["keys"]]
+        if any(t_ in aliased for t_ in touched):
+            why = "aliased_tensor: " + ",".join(sorted(t_ for t_ in touched if t_ in aliased))
+        elif any(t_ in param_edited | producer_used for t_ in claimed):
+            why = "shared_producer_tensor: " + ",".join(sorted(t_ for t_ in claimed if t_ in param_edited | producer_used))
+        if why is not None:
+            row["reason"] = g["reason"] = why
+            continue
         if prod["kind"] == "norm_gamma":
             new, exact, st = _scale_pow2(tensors[prod["tensor"]], k)
             if not exact:
@@ -295,10 +365,24 @@ def apply_folds(tensors: dict, policy: dict, groups: dict, *, only_free=True) ->
                 rng["failures"].append({"tensor": prod["tensor"], "k": k, **st})
             else:
                 edits[prod["tensor"]] = new
-                rng["gamma_sites"] += 1
-                lo_, hi_ = st["min_abs_nonzero"], st["max_abs"]
-                rng["min_abs_nonzero_after"] = lo_ if rng["min_abs_nonzero_after"] is None or (lo_ is not None and lo_ < rng["min_abs_nonzero_after"]) else rng["min_abs_nonzero_after"]
-                rng["max_abs_after"] = hi_ if rng["max_abs_after"] is None else max(rng["max_abs_after"], hi_)
+                stats.append(st)
+        elif prod["kind"] == "norm_one_plus":
+            new, st = _scale_one_plus(tensors[prod["tensor"]], k)
+            if new is None:
+                why = f"bf16_range: {prod['tensor']}: (1 + w) * 2^{k} is not representable exactly ({st.get('why', 'float32 mismatch')})"
+                rng["failures"].append({"tensor": prod["tensor"], "k": k, **st})
+            else:
+                edits[prod["tensor"]] = new
+                stats.append(st)
+        elif prod["kind"] == "layer_norm":
+            for tname in (prod["tensor"], prod["bias_tensor"]):
+                new, exact, st = _scale_pow2(tensors[tname], k)
+                if not exact:
+                    why = f"bf16_range: {tname} * 2^{k} is not finite / not exact in {tensors[tname].dtype}"
+                    rng["failures"].append({"tensor": tname, "k": k, **st})
+                    break
+                edits[tname] = new
+                stats.append(st)
         elif prod["kind"] == "weight_exp":
             ps = policy["sites"][prod["site"]]
             deltas[ps["weight"]["scale_exp"]] += k
@@ -326,6 +410,12 @@ def apply_folds(tensors: dict, policy: dict, groups: dict, *, only_free=True) ->
             continue
         for name, new in edits.items():
             tensors[name] = new
+        if stats:
+            rng["gamma_sites"] += 1
+            for st in stats:
+                rng["min_abs_nonzero_after"] = _min_opt(rng["min_abs_nonzero_after"], st["min_abs_nonzero"])
+                rng["max_abs_after"] = _max_opt(rng["max_abs_after"], st["max_abs"])
+        (producer_used if prod["kind"] == "weight_exp" else param_edited).update(claimed)
         for name, d in deltas.items():
             if d:
                 tensors[name] = (tensors[name].to(torch.int64) + d).to(tensors[name].dtype)
@@ -352,10 +442,18 @@ def apply_folds(tensors: dict, policy: dict, groups: dict, *, only_free=True) ->
     return tensors, policy, report
 
 
+def _min_opt(a, b):
+    return b if a is None else a if b is None else min(a, b)
+
+
+def _max_opt(a, b):
+    return b if a is None else a if b is None else max(a, b)
+
+
 def _placement(g) -> dict:
     prod = g["producer"]
     out = {"kind": prod["kind"]}
-    for f in ("tensor", "site"):
+    for f in ("tensor", "bias_tensor", "site"):
         if prod.get(f):
             out[f] = prod[f]
     return out

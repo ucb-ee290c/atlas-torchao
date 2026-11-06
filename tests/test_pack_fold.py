@@ -447,3 +447,99 @@ def test_options_without_the_flag_do_not_fold(tmp_path):
     _, d, _, _ = _quantize_export(tmp_path, STATIC, layers=1)
     assert not (tmp_path / "export.unfolded").exists()
     assert "pack_fold_summary" not in json.loads((d / "policy.json").read_text())
+
+
+# -- 6. LayerNorm and Gemma-style (1 + w) producers -----------------------------------------------------------
+
+def _norm_graph(kind):
+    if kind == "ln":
+        g = _n("ln", "torch.ops.aten.layer_norm.default", "%x, [32], %p_model_model_ln_weight, %p_model_model_ln_bias, 1e-06")
+    else:
+        g = _n("m0", "torch.ops.aten.mul.Tensor", "%x, %rs")
+        g += _n("w32", "torch.ops.aten.to.dtype", "%p_model_model_ln_weight, torch.float32")
+        g += _n("onep", "torch.ops.aten.add.Tensor", "%w32, 1.0")
+        g += _n("ln", "torch.ops.aten.mul.Tensor", "%m0, %onep")
+    g += _n("n1", "torch.ops.aten.to.dtype", "%ln, torch.bfloat16")
+    return g + _pack_chain(0, "n1", -9, "a_q_proj") + _pack_chain(1, "n1", -9, "a_k_proj")
+
+
+_LN_SIG = ("p_model_model_ln_weight: PARAMETER target='model.model.ln.weight'\n"
+           "p_model_model_ln_bias: PARAMETER target='model.model.ln.bias'\n"
+           + "".join(f"b_model_model_a_{n}_weight_codes: BUFFER target='model.model.a.{n}.weight_codes' persistent=False\n"
+                     for n in ("q_proj", "k_proj")))
+
+
+def _norm_case(kind, dtype):
+    policy, t = _policy_and_tensors()
+    policy["sites"] = {k: v for k, v in policy["sites"].items() if k in ("a.q_proj", "a.k_proj")}
+    t = {k: v for k, v in t.items() if k.startswith(("a.q_proj", "a.k_proj"))}
+    policy["sites"]["a.k_proj"]["activation"]["exp"] = -9                       # one shared code, 118: k = 4
+    gen = torch.Generator().manual_seed(7)
+    t["ln.weight"] = (torch.rand(32, generator=gen) - 0.5).to(dtype) if kind == "onep" else (torch.rand(32, generator=gen) + 0.5).to(dtype)
+    t["ln.bias"] = (torch.rand(32, generator=gen) - 0.5).to(dtype)
+    info = pf.graph_info(_norm_graph(kind), _LN_SIG, policy, set(t))
+    groups = pf.plan_folds(policy, info)
+    return policy, t, info, groups, pf.apply_folds(t, policy, groups)
+
+
+def test_layer_norm_weight_and_bias_are_both_scaled():
+    policy, t, info, groups, (nt, npol, rep) = _norm_case("ln", torch.bfloat16)
+    assert info["a.q_proj"]["class"] == "layer_norm" and info["a.q_proj"]["producer"]["bias_tensor"] == "ln.bias"
+    assert all(g["applied"] for g in groups.values()) and next(iter(groups.values()))["k"] == 4
+    assert torch.equal(nt["ln.weight"].float(), t["ln.weight"].float() * 16) and torch.equal(nt["ln.bias"].float(), t["ln.bias"].float() * 16)
+    assert npol["sites"]["a.q_proj"]["activation"]["exp"] == -5 == npol["sites"]["a.k_proj"]["activation"]["exp"]
+
+
+def test_gemma_one_plus_w_fold_is_exact_in_float32_and_refused_in_bf16():
+    policy, t, info, groups, (nt, npol, rep) = _norm_case("onep", torch.float32)
+    assert info["a.q_proj"]["producer"]["kind"] == "norm_one_plus"
+    g = next(iter(groups.values()))
+    assert g["applied"] and g["k"] == 4
+    assert torch.equal(nt["ln.weight"] + 1.0, (t["ln.weight"] + 1.0) * 16)                       # the multiplier the graph forms
+    policy, t, info, groups, (nt, npol, rep) = _norm_case("onep", torch.bfloat16)
+    g = next(iter(groups.values()))
+    assert not g["applied"] and "float32" in g["reason"]
+    assert torch.equal(nt["ln.weight"].float(), t["ln.weight"].float()) and npol["sites"]["a.q_proj"]["activation"]["exp"] == -9
+
+
+# -- 7. shared producers, aliases, weights read twice ---------------------------------------------------------
+
+def test_gamma_placeholder_read_by_two_nodes_is_not_scaled():
+    policy, t = _policy_and_tensors()
+    g = _graph() + _n("m_twice", "torch.ops.aten.mul.Tensor", "%p_model_model_norm_weight, %m0")
+    info = pf.graph_info(g, _SIG, policy, set(t))
+    groups = pf.plan_folds(policy, info)
+    grp = groups[info["a.q_proj"]["src"]]
+    assert grp["reason"].startswith("producer_unsupported") and "more than one node" in grp["reason"]
+    new_t, new_p, _ = pf.apply_folds(t, policy, groups)
+    assert torch.equal(new_t["model.norm.weight"].float(), t["model.norm.weight"].float())
+
+
+def test_aliased_tensor_is_not_edited():
+    policy, t = _policy_and_tensors()
+    policy["aliases"] = {"model.tied.weight": "model.norm.weight"}
+    info = pf.graph_info(_graph(), _SIG, policy, set(t))
+    groups = pf.plan_folds(policy, info)
+    new_t, new_p, rep = pf.apply_folds(t, policy, groups)
+    assert groups[info["a.q_proj"]["src"]]["reason"].startswith("aliased_tensor")
+    assert torch.equal(new_t["model.norm.weight"].float(), t["model.norm.weight"].float())
+    assert new_p["sites"]["a.q_proj"]["activation"]["exp"] == -9
+    assert groups[info["a.down_proj"]["src"]]["applied"]                         # an unrelated group still folds
+
+
+def test_weights_read_by_a_second_node_block_the_group():
+    policy, t = _policy_and_tensors()
+    g = _graph() + _n("ql_again", "torch.ops.atlas.qlinear.default",
+                      "%ga0, %gb0, %b_model_model_a_q_proj_weight_codes, %b_model_model_a_q_proj_weight_scale_exp, None, bfloat16")
+    info = pf.graph_info(g, _SIG, policy, set(t))
+    grp = pf.plan_folds(policy, info)[info["a.q_proj"]["src"]]
+    assert grp["reason"].startswith("multi_call_site") and "a.q_proj" in grp["reason"]
+
+
+def test_failed_group_adds_nothing_to_the_range_report():
+    gamma = (torch.rand(32) + 0.5).to(torch.bfloat16)
+    policy, t = _policy_and_tensors(gamma)
+    t["a.q_proj.weight_scale_exp"] = torch.full((64, 1), -125, dtype=torch.int32)   # weight exponent guard fails, gamma is exact
+    _, groups, new_t, new_p, rep = _fold(policy, t)
+    assert rep["bf16_range"]["gamma_sites"] == 0 and rep["bf16_range"]["max_abs_after"] is None
+    assert torch.equal(new_t["model.norm.weight"].float(), gamma.float())
