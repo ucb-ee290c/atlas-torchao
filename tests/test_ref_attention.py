@@ -4,9 +4,9 @@ import torch.nn as nn
 
 from refutil import need_refs
 
-import accum_backends as ab
-import ref_loader
-from ref_attention import RefQuantConv2d, patch_attention, ref_attention
+import mxu.accum_backends as ab
+import reference.ref_loader as ref_loader
+from reference.ref_attention import RefQuantConv2d, patch_attention, ref_attention
 
 
 @pytest.fixture(scope="module")

@@ -2,7 +2,7 @@
 import pytest
 import torch
 
-import ref_loader
+import reference.ref_loader as ref_loader
 
 
 def need_refs():

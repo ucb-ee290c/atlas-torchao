@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 
 import algos
-import ref_numerics as rn
+import reference.ref_numerics as rn
 from algos.granularity import block_scale_exp, scale_exp
 from refutil import need_refs
 from test_ladder import FAST, ConvNet, tiny_llama
@@ -71,7 +71,7 @@ def test_output_rescale_exact_on_mxu_model(mxu):
     """reference_hw with w=channel, a=token: the MXU model sees only E4M3 codes, and the output is
     model(codes) * 2^(sx[m] + sw[n]) exactly (then BF16), i.e. the scales are a pure output rescale."""
     need_refs()
-    import accum_torch as at
+    import mxu.accum_torch as at
 
     torch.manual_seed(0)
     lin = nn.Linear(96, 40, bias=False).to(torch.bfloat16)

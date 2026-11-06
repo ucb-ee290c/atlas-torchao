@@ -15,8 +15,8 @@ import torch.nn as nn
 
 from refutil import need_refs
 
-import accum_backends as ab
-import ref_loader
+import mxu.accum_backends as ab
+import reference.ref_loader as ref_loader
 
 
 def _openpi():
@@ -35,7 +35,7 @@ def _openpi():
 @pytest.fixture(scope="module")
 def rt():
     need_refs()
-    import pi0_model
+    import loaders.pi0_model as pi0_model
 
     return pi0_model.runtime(_openpi())
 
@@ -96,7 +96,7 @@ def tiny_obs(seed=0, max_tok=8):
 
 
 def sample(m, seed=0, steps=2):
-    import pi0_model
+    import loaders.pi0_model as pi0_model
 
     noise = pi0_model.frame_noise(seed, 4, 32, "cpu")
     return m.sample_actions("cpu", tiny_obs(seed), noise=noise, num_steps=steps)
@@ -105,7 +105,7 @@ def sample(m, seed=0, steps=2):
 def test_patch_coverage_reference_hw(rt):
     """Every Linear (but lm_head), the patch conv and every self_attn is patched and called;
     attention fires on the reference's routes (Gemma eager, SigLIP sdpa)."""
-    import pi0_model as eval_pi0
+    import loaders.pi0_model as eval_pi0
     from quant_modes import quantize
 
     m = tiny_pi0(rt)
@@ -168,7 +168,7 @@ def test_gemma_attention_bitexact(rt, mp, mxu):
     """Pi0 Gemma route == the reference patch_attn_eager closure (model_patcher.py:911-1005)."""
     from transformers.models.gemma import modeling_gemma
 
-    import ref_attention
+    import reference.ref_attention as ref_attention
 
     g = torch.Generator().manual_seed(0)
     q, k, v, mask = _qkv(g)
@@ -204,7 +204,7 @@ def test_siglip_sdpa_bitexact(rt, mp):
     BF16 softmax, no mask."""
     import torch.nn.functional as F
 
-    import ref_attention
+    import reference.ref_attention as ref_attention
 
     g = torch.Generator().manual_seed(1)
     q, k, v = ((torch.randn(1, 2, 7, 16, generator=g) * s).bfloat16() for s in (2, 1, 0.5))
@@ -238,7 +238,7 @@ def test_siglip_sdpa_bitexact(rt, mp):
 def test_pi0_linear_bitexact(rt, mp, mxu):
     """A Pi0 action-head layer (float32, quantized through BF16) and a bf16 projection under
     reference_hw == the reference QuantLinear with its functional model (quant_linear.py:133-175)."""
-    from ref_profile import RefQuantLinear
+    from reference.ref_profile import RefQuantLinear
 
     m = tiny_pi0(rt)
     QF = ref_loader.import_ref("pi0_inout.quant_types").QuantFormat
@@ -273,7 +273,7 @@ def test_determinism_and_effect(rt, mode):
 def test_component_rules_match_reference(mp):
     """Our Pi0 component tables == pi0-quant's _infer_component (model_patcher.py:112-126)."""
     import layer_rmse
-    import ref_attention
+    import reference.ref_attention as ref_attention
 
     paths = ["action_in_proj", "action_time_mlp_out", "state_proj",
              "paligemma_with_expert.gemma_expert.model.layers.0.self_attn.q_proj",

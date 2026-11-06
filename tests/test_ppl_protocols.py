@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from ppl_protocols import mxq_eval, mxq_select, mxq_text, sample_nll  # noqa: E402
+from loaders.ppl_protocols import mxq_eval, mxq_select, mxq_text, sample_nll  # noqa: E402
 
 
 def test_empty_lines_dropped():

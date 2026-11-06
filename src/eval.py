@@ -67,9 +67,9 @@ def main():
 
     import algos
     from algos import calib as algo_calib
-    from datautils import get_wikitext2
-    from modelutils import load_llama
-    from ppl_protocols import PROTOCOLS, load_mxq_windows, mxq_eval
+    from loaders.datautils import get_wikitext2
+    from loaders.modelutils import load_llama
+    from loaders.ppl_protocols import PROTOCOLS, load_mxq_windows, mxq_eval
     from quant_modes import (ALL_MODES, add_profile_args, add_subset_compare_arg, finalize_report, ladder_deltas,
                              ladder_record, quantize, require_mode_supported, subset_compare_modes)
 
@@ -102,7 +102,7 @@ def main():
     add_profile_args(ap)
     add_subset_compare_arg(ap)
     algos.add_args(ap, calib_sources=("wikitext2_train",))
-    import quant_export
+    import exporter.quant_export as quant_export
 
     quant_export.add_args(ap)
     args = ap.parse_args()
@@ -168,7 +168,7 @@ def main():
         result["kl"] = {}
     for mode in args.modes:
         if args.from_export and mode != "bf16":
-            import load_quantized
+            import exporter.load_quantized as load_quantized
 
             # no calibration, no float weights of the quantized layers (docs/algos/export.md)
             model, result["layers"][mode], man = load_quantized.load_quantized(

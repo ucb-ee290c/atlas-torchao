@@ -133,7 +133,7 @@ class Algo:
 # ---------------------------------------------------------------------------------------------
 
 def _rn():
-    import ref_numerics as rn
+    import reference.ref_numerics as rn
     return rn
 
 
@@ -142,14 +142,14 @@ def _guard():
     import contextlib
     import sys
 
-    cc = sys.modules.get("chip_coverage")                  # loaded only by the chip profiles
+    cc = sys.modules.get("chip.chip_coverage")                  # loaded only by the chip profiles
     return cc.guard() if cc is not None else contextlib.nullcontext()
 
 
 def _count_cast(x, dynamic):
     import sys
 
-    chip_profile = sys.modules.get("chip_profile")       # loaded only by the chip profiles
+    chip_profile = sys.modules.get("chip.chip_profile")       # loaded only by the chip profiles
     if chip_profile is not None:
         chip_profile.count_algo_cast(x.numel(), dynamic)
 

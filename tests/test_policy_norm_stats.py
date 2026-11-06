@@ -1,4 +1,4 @@
-"""The LeRobot normalization protocol (src/policy_norm.py, eval_policy --norm-stats): the guard
+"""The LeRobot normalization protocol (src/loaders/policy_norm.py, eval_policy --norm-stats): the guard
 against silent pass-through, the probe, the recorded status and the export check."""
 
 import json
@@ -23,7 +23,7 @@ from lerobot.processor.converters import (batch_to_transition, policy_action_to_
                                           transition_to_batch, transition_to_policy_action)
 
 import eval_policy as ep  # noqa: E402
-import policy_norm  # noqa: E402
+import loaders.policy_norm as policy_norm  # noqa: E402
 
 STATE, ACTION, IMAGE = "observation.state", "action", "observation.image"
 FEATURES = {STATE: PolicyFeature(FeatureType.STATE, (3,)),
@@ -318,7 +318,7 @@ def _norm(protocol="dataset", status=policy_norm.VERIFIED, sha="a" * 64, transfo
 
 def test_export_carries_the_protocol(tmp_path):
     import algos
-    import quant_export
+    import exporter.quant_export as quant_export
     from test_ladder import FAST, tiny_llama
 
     m = tiny_llama(1)

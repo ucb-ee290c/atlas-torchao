@@ -3,7 +3,7 @@ import torch
 
 from refutil import e4m3_values, need_refs, with_ties
 
-import accum_backends as ab
+import mxu.accum_backends as ab
 
 
 @pytest.fixture(scope="module", autouse=True)

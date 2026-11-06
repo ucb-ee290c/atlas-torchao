@@ -1,5 +1,5 @@
-"""Export of a quantized model and its reload (docs/algos/export.md; src/quant_export.py,
-src/load_quantized.py): the loaded model is bit-identical to the in-memory quantized one, the
+"""Export of a quantized model and its reload (docs/algos/export.md; src/exporter/quant_export.py,
+src/exporter/load_quantized.py): the loaded model is bit-identical to the in-memory quantized one, the
 files hold no float weight of a quantized layer, and the manifest's digests match the files."""
 import copy
 import hashlib
@@ -10,8 +10,8 @@ import torch
 from safetensors.torch import load_file
 
 import algos
-import load_quantized
-import quant_export
+import exporter.load_quantized as load_quantized
+import exporter.quant_export as quant_export
 from test_ladder import FAST, ConvNet, tiny_llama
 
 # The atlas_v1 recipes written out (docs/algos/atlas_v1.md); on a branch with algos.RECIPES the

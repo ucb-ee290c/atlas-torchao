@@ -8,10 +8,10 @@ import math
 import pytest
 import torch
 
-import chip_coverage as cc
-import chip_ops as co
-import op_unit_map as M
-import ref_loader
+import chip.chip_coverage as cc
+import chip.chip_ops as co
+import chip.op_unit_map as M
+import reference.ref_loader as ref_loader
 from refutil import need_refs
 
 A = torch.ops.aten

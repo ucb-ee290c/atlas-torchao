@@ -8,10 +8,10 @@
   reference     the reference author's operand cast: dynamic per-tensor po2 scales
                 (floor(log2(amax/256))) and the vpack encoder for activations and weights, every
                 nn.Linear including fp32 ones; F.linear on the dequantized operands (NEW), BF16
-                bias after (src/ref_profile.py)
+                bias after (src/reference/ref_profile.py)
   reference_hw  as reference, with the matmul through an MXU accumulation model: --mxu ipt
                 (default, the reference author's choice) or sa, implementation --mxu-impl
-                ref_cpu (the reference CPU models) or torch (src/accum_torch.py)
+                ref_cpu (the reference CPU models) or torch (src/mxu/accum_torch.py)
   torchao       stock TorchAO Float8DynamicActivationFloat8WeightConfig, per-tensor
                 (native FP8 matmul; needs compute capability >= 8.9, e.g. L40S / H100)
 
@@ -87,8 +87,8 @@ PROFILES = {
                 adds="Atlas MXU accumulation (--mxu, cross-checked)"),
         Profile("torchao", "Float8DynamicActivationFloat8WeightConfig, per-tensor", "torchao 0.18"),
         Profile("chip", "reference_hw + every other op on the Atlas VPU / scalar core, or listed as "
-                "host fallback; RoPE / timestep tables host constants by default (src/chip_profile.py)",
-                "see src/op_unit_map.py", ops=OPS, step=7,
+                "host fallback; RoPE / timestep tables host constants by default (src/chip/chip_profile.py)",
+                "see src/chip/op_unit_map.py", ops=OPS, step=7,
                 adds="VPU / scalar-core vector ops, lane-exact; position/timestep tables host constants"),
         Profile("chip_rope_vpu", "chip with RoPE / timestep tables computed on the VPU (--chip-rope vpu)",
                 "the reference author's treatment, quant_vector.py:170-171", impl="chip", ops=OPS,
@@ -148,7 +148,7 @@ def _quantize_torchao_style(model: nn.Module, name: str, skip) -> dict:
     planned = [fqn for fqn, m in model.named_modules() if keep(m, fqn)]
     before = {fqn: type(m) for fqn, m in model.named_modules() if fqn in set(planned)}
     if name in ("collab_v0", "collab_v0_hw"):
-        from atlas_torchao import AtlasQConfig
+        from collab.atlas_torchao import AtlasQConfig
 
         config = AtlasQConfig(hw_activation_cast=(name == "collab_v0_hw"))
     else:
@@ -169,7 +169,7 @@ def _quantize_torchao_style(model: nn.Module, name: str, skip) -> dict:
 
 def add_profile_args(ap) -> None:
     """Options of the reference profiles, shared by the eval CLIs."""
-    from accum_backends import DEFAULT_MXU, IMPLS, MXUS
+    from mxu.accum_backends import DEFAULT_MXU, IMPLS, MXUS
 
     g = ap.add_argument_group("reference profiles")
     g.add_argument("--mxu", choices=MXUS, default=DEFAULT_MXU,
@@ -188,7 +188,7 @@ def add_profile_args(ap) -> None:
                    help="fraction of calls checked beyond the first call of each shape")
     g.add_argument("--crosscheck-budget", type=float, default=600.0,
                    help="seconds of reference CPU time the cross-check may spend")
-    __import__("chip_profile").add_args(ap)
+    __import__("chip.chip_profile", fromlist=['_']).add_args(ap)
     g.add_argument("--ops", default=None,
                    help="comma-separated ops the reference profiles cover: linear, conv2d, attention "
                         "(smolVLA run_eval.py:7-18). Default: the profile's own (ref_linear: linear; "
@@ -198,7 +198,7 @@ def add_profile_args(ap) -> None:
 
 def profile_options(options) -> dict:
     """The profile options in `options` (an argparse namespace or a dict), with defaults."""
-    from accum_backends import DEFAULT_MXU
+    from mxu.accum_backends import DEFAULT_MXU
 
     get = options.get if isinstance(options, dict) else (lambda k, d=None: getattr(options, k, d))
     ops = get("ops", None) or get("_profile_ops", None) or ",".join(OPS)
@@ -391,19 +391,19 @@ def ladder_deltas(metrics: dict, ladder: dict | None = None) -> list:
 def _quantize_profile(model: nn.Module, name: str, skip=(), options=None) -> dict:
     """The implementation profiles: bf16, collab_v0(_hw), reference, reference_hw, chip, torchao."""
     if name == "chip":
-        return __import__("chip_profile").quantize_chip(model, skip, options)
+        return __import__("chip.chip_profile", fromlist=['_']).quantize_chip(model, skip, options)
     if name == "bf16":
         return {"planned": 0, "quantized": 0, "untouched": []}
     if name in ("reference", "reference_hw"):
-        import ref_loader
-        from ref_profile import quantize_reference
+        import reference.ref_loader as ref_loader
+        from reference.ref_profile import quantize_reference
 
         opts = profile_options(options or {})
         factory = fm0 = None
         if name == "reference_hw":
-            from accum_backends import describe, get_accumulator
+            from mxu.accum_backends import describe, get_accumulator
 
-            from accum_backends import crosschecked
+            from mxu.accum_backends import crosschecked
 
             fm0 = get_accumulator(opts["mxu"], opts["mxu_impl"], compile=opts["accum_compile"])
             if opts["mxu_impl"] == "torch":
@@ -414,7 +414,7 @@ def _quantize_profile(model: nn.Module, name: str, skip=(), options=None) -> dic
                 factory = lambda: fm0  # noqa: E731
             else:
                 factory = lambda: get_accumulator(opts["mxu"], opts["mxu_impl"])  # noqa: E731
-        from ref_attention import patch_attention, quantize_conv2d
+        from reference.ref_attention import patch_attention, quantize_conv2d
 
         if "linear" in opts["ops"]:
             rep = quantize_reference(model, skip, fm_factory=factory)

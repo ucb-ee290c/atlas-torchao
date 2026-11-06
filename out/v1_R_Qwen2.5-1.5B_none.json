@@ -1,0 +1,293 @@
+{
+  "args": {
+    "model": "/rscratch/agarcia/Qwen2.5-1.5B",
+    "seqlen": 2048,
+    "max_windows": null,
+    "protocol": "default",
+    "nsamples": 0,
+    "seed": 0,
+    "sequential": false,
+    "rmse": false,
+    "rmse_dir": null,
+    "modes": [
+      "bf16",
+      "ref_conv"
+    ],
+    "device": "cuda",
+    "out": "out/v1_R_Qwen2.5-1.5B_none.json",
+    "kl": false,
+    "mxu": "ipt",
+    "mxu_impl": "torch",
+    "accum_compile": false,
+    "crosscheck": "on",
+    "crosscheck_frac": 0.01,
+    "crosscheck_budget": 600.0,
+    "chip_rope": null,
+    "chip_strict": false,
+    "chip_native": [],
+    "chip_vadd": null,
+    "chip_vadd_sites": "residual",
+    "chip_mxu": "model",
+    "ops": null,
+    "subset_compare": "on",
+    "algo": "none",
+    "calib_n": null,
+    "calib_seed": 1234,
+    "calib_source": "wikitext2_train",
+    "export_dir": null,
+    "export_only": false,
+    "from_export": null
+  },
+  "torch": "2.5.1+cu121",
+  "host": "a27",
+  "gpu": "NVIDIA RTX A6000",
+  "protocol": "default",
+  "ppl": {
+    "bf16": 9.670358657836914,
+    "ref_conv": 43.06236267089844
+  },
+  "layers": {
+    "ref_conv": {
+      "planned": 196,
+      "quantized": 196,
+      "untouched": [],
+      "conv2d": {
+        "quantized": 0,
+        "untouched": []
+      },
+      "attention_sites": [
+        {
+          "site": "model.layers.0.self_attn",
+          "kind": "Qwen2Attention",
+          "variant": "text"
+        },
+        {
+          "site": "model.layers.1.self_attn",
+          "kind": "Qwen2Attention",
+          "variant": "text"
+        },
+        {
+          "site": "model.layers.2.self_attn",
+          "kind": "Qwen2Attention",
+          "variant": "text"
+        },
+        {
+          "site": "model.layers.3.self_attn",
+          "kind": "Qwen2Attention",
+          "variant": "text"
+        },
+        {
+          "site": "model.layers.4.self_attn",
+          "kind": "Qwen2Attention",
+          "variant": "text"
+        },
+        {
+          "site": "model.layers.5.self_attn",
+          "kind": "Qwen2Attention",
+          "variant": "text"
+        },
+        {
+          "site": "model.layers.6.self_attn",
+          "kind": "Qwen2Attention",
+          "variant": "text"
+        },
+        {
+          "site": "model.layers.7.self_attn",
+          "kind": "Qwen2Attention",
+          "variant": "text"
+        },
+        {
+          "site": "model.layers.8.self_attn",
+          "kind": "Qwen2Attention",
+          "variant": "text"
+        },
+        {
+          "site": "model.layers.9.self_attn",
+          "kind": "Qwen2Attention",
+          "variant": "text"
+        },
+        {
+          "site": "model.layers.10.self_attn",
+          "kind": "Qwen2Attention",
+          "variant": "text"
+        },
+        {
+          "site": "model.layers.11.self_attn",
+          "kind": "Qwen2Attention",
+          "variant": "text"
+        },
+        {
+          "site": "model.layers.12.self_attn",
+          "kind": "Qwen2Attention",
+          "variant": "text"
+        },
+        {
+          "site": "model.layers.13.self_attn",
+          "kind": "Qwen2Attention",
+          "variant": "text"
+        },
+        {
+          "site": "model.layers.14.self_attn",
+          "kind": "Qwen2Attention",
+          "variant": "text"
+        },
+        {
+          "site": "model.layers.15.self_attn",
+          "kind": "Qwen2Attention",
+          "variant": "text"
+        },
+        {
+          "site": "model.layers.16.self_attn",
+          "kind": "Qwen2Attention",
+          "variant": "text"
+        },
+        {
+          "site": "model.layers.17.self_attn",
+          "kind": "Qwen2Attention",
+          "variant": "text"
+        },
+        {
+          "site": "model.layers.18.self_attn",
+          "kind": "Qwen2Attention",
+          "variant": "text"
+        },
+        {
+          "site": "model.layers.19.self_attn",
+          "kind": "Qwen2Attention",
+          "variant": "text"
+        },
+        {
+          "site": "model.layers.20.self_attn",
+          "kind": "Qwen2Attention",
+          "variant": "text"
+        },
+        {
+          "site": "model.layers.21.self_attn",
+          "kind": "Qwen2Attention",
+          "variant": "text"
+        },
+        {
+          "site": "model.layers.22.self_attn",
+          "kind": "Qwen2Attention",
+          "variant": "text"
+        },
+        {
+          "site": "model.layers.23.self_attn",
+          "kind": "Qwen2Attention",
+          "variant": "text"
+        },
+        {
+          "site": "model.layers.24.self_attn",
+          "kind": "Qwen2Attention",
+          "variant": "text"
+        },
+        {
+          "site": "model.layers.25.self_attn",
+          "kind": "Qwen2Attention",
+          "variant": "text"
+        },
+        {
+          "site": "model.layers.26.self_attn",
+          "kind": "Qwen2Attention",
+          "variant": "text"
+        },
+        {
+          "site": "model.layers.27.self_attn",
+          "kind": "Qwen2Attention",
+          "variant": "text"
+        }
+      ],
+      "profile": {
+        "name": "reference",
+        "ops": [
+          "linear",
+          "conv2d",
+          "attention"
+        ]
+      },
+      "reference_sources": {},
+      "ladder": {
+        "mode": "ref_conv",
+        "profile": "ref_conv",
+        "step": 5,
+        "adds": "Conv2d FP8 (none for a model without Conv2d)",
+        "previous": "ref_attn",
+        "operand_cast": "reference: dynamic po2 floor(log2(amax/256)), vpack; BF16 bias after rescale",
+        "quantized_op_classes": {
+          "linear": 196,
+          "attention": 28,
+          "conv2d": 0
+        },
+        "accumulation": "framework",
+        "vector_ops": "framework",
+        "rope_tables": "framework",
+        "equivalent_to": "ref_attn",
+        "on_ladder": true,
+        "off_ladder_reasons": []
+      }
+    }
+  },
+  "ladder": {
+    "bf16": {
+      "mode": "bf16",
+      "profile": "bf16",
+      "step": 1,
+      "adds": "baseline",
+      "previous": null,
+      "operand_cast": null,
+      "quantized_op_classes": {},
+      "accumulation": "framework",
+      "vector_ops": "framework",
+      "rope_tables": "framework",
+      "on_ladder": true,
+      "off_ladder_reasons": []
+    },
+    "ref_conv": {
+      "mode": "ref_conv",
+      "profile": "ref_conv",
+      "step": 5,
+      "adds": "Conv2d FP8 (none for a model without Conv2d)",
+      "previous": "ref_attn",
+      "operand_cast": "reference: dynamic po2 floor(log2(amax/256)), vpack; BF16 bias after rescale",
+      "quantized_op_classes": {
+        "linear": 196,
+        "attention": 28,
+        "conv2d": 0
+      },
+      "accumulation": "framework",
+      "vector_ops": "framework",
+      "rope_tables": "framework",
+      "equivalent_to": "ref_attn",
+      "on_ladder": true,
+      "off_ladder_reasons": []
+    }
+  },
+  "algo": {
+    "bf16": {
+      "name": "none",
+      "params": {},
+      "calibration": null
+    },
+    "ref_conv": {
+      "name": "none",
+      "params": {},
+      "calibration": null
+    }
+  },
+  "subset_compare": {
+    "enabled": null,
+    "added_modes": []
+  },
+  "windows": 146,
+  "ladder_deltas": [
+    {
+      "from": "bf16",
+      "to": "ref_conv",
+      "steps": 4,
+      "adds": "Conv2d FP8 (none for a model without Conv2d)",
+      "delta": {
+        "ppl": 33.39200401306152
+      }
+    }
+  ]
+}
