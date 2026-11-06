@@ -27,7 +27,7 @@ Why: the matrix unit multiplies unscaled E4M3 and accumulates in BF16 across K t
 | Model | qlinear | qconv2d | qk / pv matmul each | Dynamic Linear sites | Checker |
 |---|---|---|---|---|---|
 | TinyLlama (static and dynamic) | 154 | 0 | 22 | 0 / 154 | 25 of 25 |
-| SmolVLA (static) | 302 | 1 | 36 | 1 (unused `lm_head`, declared) | stored file missing, rerun reported by the how-to |
+| SmolVLA (static) | 302 | 1 | 36 | 1 (`vlm.lm_head`, never called in the captured boundary) | 25 of 25 after the verifier was made correct for SmolVLA (`docs/algos/smolvla-verify.md`) |
 | Multi-Task DiT (static) | 179 | 0 | 24 | 0 | 25 of 25 after the verifier fix |
 | Multi-Task DiT with own attention quantized (`atlas_v1_awq_tile_static_attn`) | 179 | 0 | 30 (24 CLIP + 6 DiT) | 0 | 25 of 25, `unquantized_attention` 0 |
 | Pi0 (static) | 420 | 0 | 63 | 0 | 25 of 25 after the verifier fix |
@@ -67,7 +67,7 @@ Accumulation model on nine isolated layers (static export): relative L2 against 
 - DiT's own attention: the six `RoPEAttention` blocks are now attention sites (7 new tests pass; 77 passed and 16 skipped with the tile and native tests). Re-exported bundle `exports-tile/multitask-dit/atlas_v1_awq_tile_static_attn/`: 30 qk and 30 pv pairs, 209 of 209 sites tile-native, checker 25 of 25, strict capture and fresh-process replay passed (`docs/algos/dit-own-attention.md`). Static sites outside 122..128: 94 of 209 (the 6 new `p` sites at code 119 added 6). Attention matrices have 24 tokens, a partial tile; the compiler must confirm tail-tile handling. No DiT quality number, dropout not modelled.
 - No quality numbers for SmolVLA, DiT or Pi0.
 - No hardware equivalence claim: exact float32 accumulation plus `sa`/`ipt` models on nine isolated TinyLlama layers; no RTL run by us.
-- Last full-suite run: 810 passed, 1 failure in a new test that was then fixed; no clean full-suite rerun after the final merges.
+- Full suite on the merged branch before the last two changes (`dead_columns` option, SmolVLA verifier): 870 passed, 35 skipped, 10 deselected, 0 failed. Rerun after those two changes: see the PR.
 
 ## 6. Decisions needed (full list in `/scratch2/lorenhung/atlas-fp8/tile-aware-checkin.md`)
 
