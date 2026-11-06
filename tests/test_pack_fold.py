@@ -543,3 +543,19 @@ def test_failed_group_adds_nothing_to_the_range_report():
     _, groups, new_t, new_p, rep = _fold(policy, t)
     assert rep["bf16_range"]["gamma_sites"] == 0 and rep["bf16_range"]["max_abs_after"] is None
     assert torch.equal(new_t["model.norm.weight"].float(), gamma.float())
+
+
+def test_the_comparison_is_not_vacuous_a_fold_without_the_weight_compensation_changes_the_output():
+    x, gamma = _bf((1, 32, 64), 1, 3.0), (torch.rand(64) + 0.5).to(torch.bfloat16)
+    wc = torch.randint(0, 120, (96, 64), dtype=torch.uint8)
+    we = torch.full((96, 1), -13, dtype=torch.int32)
+    s, k = -9, 4
+
+    def run(g, exp, w_exp):
+        c, e = torch.ops.atlas.quantize_act(g * x, "static", "tensor", "ref", exp, "uint8")
+        return torch.ops.atlas.qlinear(c, e, wc, w_exp, None, "bfloat16", "atlas_e4m3")
+
+    y0 = run(gamma, s, we)
+    assert not torch.equal(run(gamma * (2.0 ** k), s + k, we), y0)                  # consumer weight exponent left alone
+    assert torch.equal(run(gamma * (2.0 ** k), s + k, we - k), y0)
+    assert not torch.equal(run(gamma * (2.0 ** k), s, we), y0)                      # pack exponent not moved with the value
