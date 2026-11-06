@@ -11,12 +11,12 @@ Perplexity: WikiText-2 test, 16 windows of 512 tokens, exact fp32 accumulation (
 |---|---|---|---|---|---|---|---|
 | BF16 | | | | 12.7558 | 0 | 1 | `tile_static/ppl_w16x512.json` |
 | tile static, AWQ + GPTQ | panel(32) | on | static | 12.8980 | 0.0536 | 0.951 | `exports-tile/tinyllama/atlas_v1_awq_tile_static/` |
-| tile static, GPTQ only (this work) | panel(32) | off | static | 12.9008 | pending (not finished at hand-back) | pending (not finished at hand-back) | `exports-tile-diag/tinyllama/gptq_panel_static_noawq/` |
+| tile static, GPTQ only (this work) | panel(32) | off | static | 12.9008 | 0.0646 | 0.922 | `exports-tile-diag/tinyllama/gptq_panel_static_noawq/` |
 | per-channel static, AWQ | channel | on | static | not run (see below) | | | |
 | tile dynamic, AWQ + GPTQ | panel(32) | on | dynamic per 32-token block | 12.8287 | 0.0522 | 0.934 | `exports-tile/tinyllama/atlas_v1_awq_tile/` |
 | `tl_E0` (`atlas_v1_awq`) | channel | on | dynamic per token | 12.8451 | 0.0579 | 0.936 | `exports-tile/tinyllama/atlas_v1_awq_baseline_tl_E0/` |
 
-Reading (controlled AWQ comparison): removing AWQ changes perplexity from 12.8980 to 12.9008 (+0.0028). The final-logits run (`quality.py`) had not finished when this was written; if `quality.json` exists next to the export, its figure is in the table, otherwise the cell stays pending. One calibration set and one 16-window perplexity sample; no confidence interval was computed, so a difference this size is not resolved.
+Reading (controlled AWQ comparison): removing AWQ changes perplexity from 12.8980 to 12.9008 (+0.0028) and logits rel. L2 from 0.0536 to 0.0646. One calibration set and one 16-window perplexity sample; no confidence interval was computed, so small differences are not resolved.
 
 Recipe of the new export (same string as the Pi0 diagnostic, `tile-pi0-awq-diag.md`, without the Pi0-only `keep_bf16`):
 `gptq_awq:method=gptq,actorder=true+granularity:w=panel,a=defer,attn=defer,rows=32,rule=nc+static_calib`, exported with
