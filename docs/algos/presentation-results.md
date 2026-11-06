@@ -29,6 +29,7 @@ Why: the matrix unit multiplies unscaled E4M3 and accumulates in BF16 across K t
 | TinyLlama (static and dynamic) | 154 | 0 | 22 | 0 / 154 | 25 of 25 |
 | SmolVLA (static) | 302 | 1 | 36 | 1 (unused `lm_head`, declared) | stored file missing, rerun reported by the how-to |
 | Multi-Task DiT (static) | 179 | 0 | 24 | 0 | 25 of 25 after the verifier fix |
+| Multi-Task DiT with own attention quantized (`atlas_v1_awq_tile_static_attn`) | 179 | 0 | 30 (24 CLIP + 6 DiT) | 0 | 25 of 25, `unquantized_attention` 0 |
 | Pi0 (static) | 420 | 0 | 63 | 0 | 25 of 25 after the verifier fix |
 
 All contractions are native FP8 operations except declared exceptions: `lm_head`, patch-embedding convolutions kept BF16 by `keep_bf16:rule=input_conv`, and the RoPE outer product. DiT's own six attention blocks were plain BF16 in this bundle (see 5).
@@ -61,7 +62,7 @@ Accumulation model on nine isolated layers (static export): relative L2 against 
 ## 5. Limits
 
 - DiT and Pi0 graphs are partial: DiT is one noise-predictor call; Pi0 is a one-step sampler captured non-strict under torch 2.7.1 with three cameras stacked into one SigLIP call (bitwise equal to three calls on a tiny Pi0 and a real-width two-layer SigLIP; real checkpoint not run). No Pi0 or DiT boundary spec exists from the compilers team. (`docs/algos/dit-pi0-full-graph-plan.md`)
-- DiT's own attention: patch written and unit-tested (branch `tile-dit-attn`); re-exported bundle PENDING (`docs/algos/dit-own-attention.md`). Attention matrices have 24 tokens, a partial tile.
+- DiT's own attention: the six `RoPEAttention` blocks are now attention sites (7 new tests pass; 77 passed and 16 skipped with the tile and native tests). Re-exported bundle `exports-tile/multitask-dit/atlas_v1_awq_tile_static_attn/`: 30 qk and 30 pv pairs, 209 of 209 sites tile-native, checker 25 of 25, strict capture and fresh-process replay passed (`docs/algos/dit-own-attention.md`). Static sites outside 122..128: 94 of 209 (the 6 new `p` sites at code 119 added 6). Attention matrices have 24 tokens, a partial tile; the compiler must confirm tail-tile handling. No DiT quality number, dropout not modelled.
 - No quality numbers for SmolVLA, DiT or Pi0.
 - No hardware equivalence claim: exact float32 accumulation plus `sa`/`ipt` models on nine isolated TinyLlama layers; no RTL run by us.
 - Last full-suite run: 810 passed, 1 failure in a new test that was then fixed; no clean full-suite rerun after the final merges.
