@@ -78,7 +78,9 @@ The capture already replays the saved graph in a fresh process (`fresh_process_v
 ## 4. Verify (checklist)
 
 ```bash
-$CAP $PY scripts/tile_flow/verify_bundle.py $OUT/export $OUT/fx $OUT/verify_bundle.json     # 8 s, 24 checks, exit 0 = all pass
+$CAP $PY scripts/tile_flow/verify_bundle.py $OUT/export $OUT/fx $OUT/verify_bundle.json     # 25 checks, exit 0 = all pass
+# optional flags: --allow-uncalibrated-fallback (accept undeclared uncalibrated Linear sites of a static recipe),
+#                 --forbid-unquantized-attention (plain BF16 attention outside policy sites becomes unexpected)
 # tiny model only (re-calibrates in memory with the same recipe / calibration / seed, then compares codes, exponents and
 # logits with the bundle); run on the section 0.5 smoke model. args: MODEL RECIPE EXPORT FX CALIB_N CALIB_SEQLEN FX_SEQLEN OUT
 $CAP $PY scripts/tile_flow/inmem_check.py $TINY atlas_v1_awq_tile_static $TOUT/export $TOUT/fx 4 128 64 $TOUT/inmem_check.json
@@ -93,8 +95,9 @@ python3 scripts/tile_flow/make_bundle_manifest.py $OUT                          
 | 4 | `weight_scale_exp` constant within every group of 32 output channels, and not collapsed to one value per tensor | `verify_bundle.py` (own implementation, not `tile_native`) |
 | 5 | `graph_inspection.json` `tile_native.all_tile_native` is true; `still_emulated.emulated_modules` is empty | `verify_bundle.py` |
 | 6 | graph holds exactly one `atlas.qlinear` per quantized Linear, one `atlas.qk_matmul` and one `atlas.pv_matmul` per attention site | `verify_bundle.py` reads `model.pt2` |
-| 7 | the only non-atlas contractions are `lm_head` (BF16 by policy) and the float32 RoPE `inv_freq x position_ids` outer product | `verify_bundle.py` (operand dtypes from the graph) |
-| 8 | weight buffers in the loaded program are uint8 / int32; no float weight parameter for a quantized layer | `verify_bundle.py` |
+| 7 | the only non-atlas contractions are declared: BF16-by-policy Linear / Conv2d (`host` / `skipped` sites such as `lm_head` and the patch-embedding conv), the float32 RoPE `inv_freq x position_ids` outer product, and plain BF16 `scaled_dot_product_attention` in blocks without a policy attention site (reported as `graph.unquantized_attention`); anything else fails | `verify_bundle.py` (operand dtypes and `nn_module_stack` from the graph) |
+| 8 | weight buffers in the loaded program are uint8 / int32; no float weight parameter for a quantized layer (unused meta placeholders of a non-strict export are tolerated when the fresh-process report says `unused_float_weights_not_materialized: true`, they are meta and unconsumed) | `verify_bundle.py` |
+| 8b | a static recipe has no undeclared uncalibrated Linear / Conv2d (`policy.json` `uncalibrated_fallback`; `static_recipe_fully_static`) | `verify_bundle.py` |
 | 9 | eager replay, captured graph and reloaded graph are byte identical on two inputs; fresh-process replay passes | `fx_export.py` (`verification.json`, `fresh_process_verification.json`) |
 | 10 | in-memory model equals the exported bundle (codes, exponents, logits) | `inmem_check.py`; for a model too big to re-calibrate, `load_quantized` re-derives every code bit for bit |
 | 11 | dynamic block exponents are constant within each 32-row group in the capture cases | `graph_inspection.json` `fixture_activation_stats` (`groups_constant`) |
@@ -173,8 +176,9 @@ tile rows is not a pure recipe effect. All accuracy figures use the framework's 
   of weight codes) but flush more small weights to zero (0.067% vs 0.025%).
 - **CPU calibration time** 19 to 26 minutes for TinyLlama on 16 shared cores. Larger models need a GPU or a reduced `--calib-n` (state it).
 - `model.pt2` is tied to the torch version it was captured with (2.11.0 CPU); the manifest records it.
-- **Uncalibrated Linear in the static recipe.** A Linear that calibration never reached keeps the reference dynamic per-tensor rule (SmolVLA: the unused VLM `lm_head`, `policy.json` activation `source: reference`), so the policy is not 100% static. Count `mode: dynamic` Linear sites in `policy.json` before calling a bundle static.
-- `verify_bundle.py` is written for causal LMs (it names `lm_head` and the RoPE outer product as the allowed non-atlas contractions); for a policy boundary read `graph_inspection.json` directly (section 8).
+- **Uncalibrated Linear in the static recipe.** A Linear that calibration never reached keeps the reference dynamic per-tensor rule (SmolVLA: the unused VLM `lm_head`). It is declared in `policy.json` (`activation.uncalibrated_fallback: true`, `tile_native: false`, top-level `uncalibrated_fallback.count` / `sites` / `declared`), the export warns, and `verify_bundle.py` fails `static_recipe_fully_static` unless the export was run with `--allow-uncalibrated-fallback` (or the verifier with the same flag). Exports made before this change lack the field.
+- **Dynamic recipes: pack admission is not checked in `policy.json`.** `compiler_pack_scale_admission.status` is `not_checked_dynamic` (counts null); read `graph_inspection.json` `compiler_pack_scale_admission.dynamic_activation_scales` (capture-case fixtures) and `dyn_admission.py`.
+- `verify_bundle.py` classifies non-atlas contractions as declared or unexpected using the policy and the graph's module stack, so DiT / Pi0 bundles no longer fail for their BF16-by-policy convs or the DiT's unquantized `RoPEAttention` SDPA nodes; those are listed, not hidden (`graph.unquantized_attention`). A policy boundary's quality still has to be read from `graph_inspection.json` (section 8).
 
 ## 8. Other models
 
@@ -222,9 +226,10 @@ in that graph (capture refused it). The driver also stacks the 3 cameras into on
 and adds `aten.conv2d.padding` to `fx_export.CONTRACTIONS` at run time (SigLIP's patch embedding exports with that overload, so the BF16-by-policy
 report could not find its contraction). `src/` was not modified. Neither graph is the 10-step sampler or the DiT's 100-step loop.
 
-`verify_bundle.py` failures (it is written for causal LMs): `no_unexpected_non_atlas_contraction` fails on the patch-embedding conv (declared BF16 / float32
+`verify_bundle.py` on these two bundles failed (table row above, as first run) before the declared / unexpected classification was added: `no_unexpected_non_atlas_contraction` failed on the patch-embedding conv (declared BF16 / float32
 by policy) and, for the DiT, on the 6 `scaled_dot_product_attention` nodes of the DiT's own `RoPEAttention` blocks: they are functional BF16 attention with
 no policy site and are not quantized (the 24 attention sites are the CLIP text and vision towers). Pi0 only:
 `graph_has_no_float_weight_param_for_quantized_linears` fails because the non-strict export keeps 420 float weight parameters as meta placeholders
 (no storage, no users in the graph; `fresh_process_verification.json`: `unused_float_weights_not_materialized: true`).
+After the change the same verifier, run read-only on the same bundles, passes 25 of 25 checks for both (DiT: 7 declared contractions, 1 BF16-by-policy conv and 6 unquantized attention; Pi0: 1 declared conv and 420 tolerated meta placeholders), and still 25 of 25 for TinyLlama `atlas_v1_awq_tile` and `atlas_v1_awq_tile_static` (the extra check is `static_recipe_fully_static`). The bundles' own `policy.json` files were written before `uncalibrated_fallback` existed; their count is derived by the verifier (0).
 Pi0 and DiT quality was not measured (no comparable old number; the old DiT and Pi0 exports were never produced).

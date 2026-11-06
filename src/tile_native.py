@@ -139,6 +139,12 @@ def weight_site_status(label: str, exp: torch.Tensor, rows: int = GROUP) -> dict
 def activation_rule_status(rule: dict, kind: str = "linear") -> dict:
     """Tile-native status of a policy activation rule (quant_export rule dict)."""
     mode = rule.get("mode")
+    if rule.get("uncalibrated_fallback"):
+        # a Linear / Conv2d of a static recipe that saw no calibration data: dynamic per-tensor reference
+        # rule (run-time amax). Numerically unchanged, but not static: never counted as tile-native.
+        return {"tile_native": False, "dynamic": True, "uncalibrated_fallback": True,
+                "reasons": ["activation uncalibrated_fallback: no calibration data in a static recipe, so the "
+                            "site keeps the dynamic per-tensor reference rule (needs a run-time amax)"]}
     if rule.get("source") == "reference" or mode == "dynamic" and rule.get("reduce") in ("tensor", "reference_dims"):
         return {"tile_native": True, "reasons": [], "dynamic": mode != "static"}
     if mode == "static":
@@ -255,7 +261,8 @@ def linear_site_status(weight_label: str, exp: torch.Tensor, panel_rows: int, ru
     w = weight_site_status(weight_label, exp, panel_rows or GROUP)
     a = activation_rule_status(rule)
     return {"tile_native": bool(w["tile_native"] and a["tile_native"]),
-            "reasons": list(w["reasons"]) + list(a["reasons"]), "weight": w, "activation": a}
+            "reasons": list(w["reasons"]) + list(a["reasons"]), "weight": w, "activation": a,
+            **({"uncalibrated_fallback": True} if a.get("uncalibrated_fallback") else {})}
 
 
 def attention_site_status(operands: dict) -> dict:
@@ -269,8 +276,11 @@ def attention_site_status(operands: dict) -> dict:
 def tile_summary(site_status: dict) -> dict:
     """{site: status dict} -> counts and the list of sites that are not tile-native, with reasons."""
     bad = {n: st["reasons"] for n, st in site_status.items() if not st["tile_native"]}
+    fallback = sorted(n for n, st in site_status.items() if st.get("uncalibrated_fallback"))
     return {"sites_checked": len(site_status), "tile_native_sites": len(site_status) - len(bad),
             "all_tile_native": not bad, "not_tile_native": dict(sorted(bad.items())),
+            "uncalibrated_fallback_sites": fallback,
+            "uncalibrated_fallback_count": len(fallback),
             "group_rows": GROUP,
             "rules": "exponents must be constant along K: weight per 32-channel group, activation per "
                      "32-token block or static per tensor, attention per head or per 32-row block "
@@ -281,10 +291,21 @@ def pack_admission_report(static_act: dict, weight_ranges: dict) -> dict:
     """INFORMATIONAL compiler-pack admission (key `compiler_pack_scale_admission`; nothing is clamped).
     static_act: {site_or_operand: [exp, ...]} static activation exponents (per-step lists allowed);
     weight_ranges: {site: (min_code, max_code)} E8M0 codes of the weight exponents. Dynamic activation
-    exponents are data-dependent: they are reported from FX fixtures only (graph_inspection.json)."""
+    exponents are data-dependent: they are reported from FX fixtures only (graph_inspection.json).
+
+    Without any static activation exponent (dynamic recipes) nothing was checked: the report says
+    status "not_checked_dynamic" with null counts, never zero counts that read as a pass."""
     act_codes = {k: (min(v) + E8M0_BIAS, max(v) + E8M0_BIAS) for k, v in static_act.items() if v}
-    rep = pack_admission_flags(act_codes)
-    rep["activation_static_codes"] = {k: {"min": a, "max": b} for k, (a, b) in sorted(act_codes.items())}
+    if act_codes:
+        rep = {"status": "checked_static_sites", **pack_admission_flags(act_codes)}
+        rep["activation_static_codes"] = {k: {"min": a, "max": b} for k, (a, b) in sorted(act_codes.items())}
+    else:
+        rep = {"status": "not_checked_dynamic", "admitted_range": list(PACK_ADMISSION),
+               "sites_checked": None, "sites_outside": None, "offending_sites": None,
+               "note": "NOT CHECKED: this export has no static activation exponent, so there is nothing to "
+                       "check here; the dynamic activation exponents are data dependent and are reported "
+                       "from the FX capture-case fixtures only (see)",
+               "see": "fx/graph_inspection.json compiler_pack_scale_admission.dynamic_activation_scales"}
     if weight_ranges:
         rep["weight_codes"] = {"sites": len(weight_ranges),
                                "min": min(a for a, _ in weight_ranges.values()),

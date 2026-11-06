@@ -146,6 +146,10 @@ def add_args(ap) -> None:
     g.add_argument("--export-only", action="store_true",
                    help="with --export-dir: quantize the exported mode, write the export and stop "
                         "(no evaluation)")
+    g.add_argument("--allow-uncalibrated-fallback", action="store_true",
+                   help="declare in policy.json that Linear / Conv2d sites of a static recipe without "
+                        "calibration data (e.g. an unused lm_head) may keep the dynamic per-tensor rule; "
+                        "undeclared sites make verify_bundle.py fail 'static recipe is fully static'")
     g.add_argument("--from-export", default=None,
                    help="build every quantized mode from this export (load_quantized.py) instead of "
                         "quantizing: no calibration, no float weights of the quantized layers")
@@ -171,6 +175,9 @@ def check_args(ap, args) -> str | None:
 # ---------------------------------------------------------------------------------------------
 
 REFERENCE_ACT = {"mode": "dynamic", "source": "reference", "rule": "ref"}
+# Linear / Conv2d of a static recipe with no calibration data: same numerics as REFERENCE_ACT (source
+# "reference" is what replay and the FX capture dispatch on), but declared in policy.json and never tile-native.
+UNCALIBRATED_FALLBACK_ACT = {**REFERENCE_ACT, "uncalibrated_fallback": True, "label": "uncalibrated_fallback"}
 
 
 def _granularity_rule(g, name, kind):
@@ -261,8 +268,25 @@ def check_exportable(algo) -> None:
                                       "(add one to quant_export.ACT_RULES)")
 
 
+def is_static_recipe(algo) -> bool:
+    """True when a member gives Linear / Conv2d inputs calibrated static exponents (static_calib, or
+    smoothquant with static=true)."""
+    return any(m.name == "static_calib" or (m.name == "smoothquant" and getattr(m, "static", False))
+               for m in _members(algo))
+
+
+def _static_covers(algo, kind) -> bool:
+    """Does a static member give `kind` ("linear" / "conv2d") a calibrated exponent? static_calib: both;
+    smoothquant static=true: Linear only (its Conv2d inputs keep the reference rule by design, so a Conv2d is
+    never reported as uncalibrated under it)."""
+    return any(m.name == "static_calib" or (m.name == "smoothquant" and getattr(m, "static", False)
+                                            and kind == "linear") for m in _members(algo))
+
+
 def act_rule(algo, name, kind) -> dict:
-    """The activation scale rule of (site, kind) as data; REFERENCE_ACT when no member sets one."""
+    """The activation scale rule of (site, kind) as data; REFERENCE_ACT when no member sets one, except
+    that a Linear / Conv2d the calibration never saw, of a kind a static member covers, gets
+    UNCALIBRATED_FALLBACK_ACT (identical numerics, declared)."""
     got = []
     for m in _members(algo):
         if not _overrides(m, "act_scale"):
@@ -272,7 +296,11 @@ def act_rule(algo, name, kind) -> dict:
             got.append(r)
     if len(got) > 1:
         raise ValueError(f"export: {name} {kind}: several activation rules {got}")
-    return got[0] if got else dict(REFERENCE_ACT)
+    if got:
+        return got[0]
+    if not kind.startswith("attention.") and _static_covers(algo, kind):
+        return dict(UNCALIBRATED_FALLBACK_ACT)
+    return dict(REFERENCE_ACT)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -300,6 +328,9 @@ def weight_panel_rows(algo) -> int:
 
 
 def _act_description(rule, kind):
+    if rule.get("uncalibrated_fallback"):
+        return ("dynamic per tensor: reference rule; UNCALIBRATED FALLBACK (a static recipe, but this layer "
+                "saw no calibration data, so there is no static exponent)")
     if rule.get("source") == "reference":
         return ("dynamic per (batch, head): reference rule over the last two dims"
                 if kind.startswith("attention.") else "dynamic per tensor: reference rule")
@@ -341,7 +372,7 @@ def _accumulation(ladder):
 
 
 def build_policy(model, mode, report, algo, options, skip, bf16_opt_out, opt_out_reasons,
-                 tensors_out: dict) -> dict:
+                 tensors_out: dict, allow_uncalibrated_fallback: bool = False) -> dict:
     """The policy dict; fills `tensors_out` with the codes / exponent tensors it names."""
     import quant_modes
 
@@ -350,6 +381,7 @@ def build_policy(model, mode, report, algo, options, skip, bf16_opt_out, opt_out
     sites = {}
     panel_rows = weight_panel_rows(algo)
     tile, static_act, weight_ranges = {}, {}, {}
+    fallback_sites = []
     for n, m in quantized_modules(model).items():
         kind = "linear" if type(m).__name__ == "RefQuantLinear" else "conv2d"
         codes, exp = m.weight_codes.detach().cpu(), m.weight_scale_exp.detach().cpu().to(torch.int32)
@@ -386,6 +418,8 @@ def build_policy(model, mode, report, algo, options, skip, bf16_opt_out, opt_out
             static_act[n] = [int(e) for e in rule["exps"]]
         weight_ranges[n] = tuple(site["weight"]["e8m0_code_range"].values())
         site["tile_native"] = tile[n] = tile_native.linear_site_status(wgran, exp, panel_rows, rule)
+        if rule.get("uncalibrated_fallback"):
+            fallback_sites.append(n)
         if kind == "conv2d":
             site["conv"] = {"kernel_size": list(m.kernel_size), "stride": list(m.stride),
                             "padding": list(m.padding), "dilation": list(m.dilation),
@@ -457,6 +491,13 @@ def build_policy(model, mode, report, algo, options, skip, bf16_opt_out, opt_out
                  if any(_is_dynamic(s) for s in sites.values()) else []) + ([f"chip vadd {chip_opts['chip_vadd']} on {chip_opts.get('chip_vadd_sites', 'residual')} sites "
                   "(recipe chip default; NEW, off-ladder)"] if chip_opts.get("chip_vadd") else []),
         },
+        "uncalibrated_fallback": {
+            "static_recipe": is_static_recipe(algo),
+            "count": len(fallback_sites), "sites": sorted(fallback_sites),
+            "declared": bool(allow_uncalibrated_fallback),
+            "note": "Linear / Conv2d sites of a static recipe without calibration data: they keep the dynamic "
+                    "per-tensor reference rule (activation.uncalibrated_fallback, tile_native false). "
+                    "declared=true only when the export was run with --allow-uncalibrated-fallback"},
         "tile_native": {**tile_native.tile_summary(tile),
                         "token_grouping": "activation block groups = consecutive rows of the flattened "
                                           "row-major [B*T, K] operand; the last group may be partial; padding "
@@ -611,14 +652,19 @@ def _opt_out_reasons(algo, bf16) -> dict:
 
 def export(model: nn.Module, export_dir, *, mode: str, report: dict, algo, algo_spec: str, options=None,
            skip=(), model_record: dict | None = None, calib_batches=None, calib_record=None,
-           device=None, extra_provenance: dict | None = None, normalization: dict | None = None) -> dict:
+           device=None, extra_provenance: dict | None = None, normalization: dict | None = None,
+           allow_uncalibrated_fallback: bool = False) -> dict:
     """Write model.safetensors, policy.json and manifest.json for `model`, quantized under `mode`
     by algos.quantize (whose return value is `report`). Returns the manifest.
 
     normalization (NEW; LeRobot policies, src/policy_norm.export_record): the input / output
     normalization protocol, its stats sha256 and its transform (per-key mode and eps) sha256,
     written to both files; --from-export refuses an export whose protocol or transform differs
-    from the requested one."""
+    from the requested one.
+
+    allow_uncalibrated_fallback: declare (policy.json uncalibrated_fallback.declared) that Linear sites of a
+    static recipe without calibration data may stay on the dynamic reference rule; without it the export is
+    still written but warns, and tools/verify_bundle.py fails the static check."""
     from safetensors.torch import save_file
 
     import quant_modes
@@ -636,7 +682,13 @@ def export(model: nn.Module, export_dir, *, mode: str, report: dict, algo, algo_
     for n in exact_bf16:
         reasons[n] = exact_reasons.get(n, "algorithm exact BF16 opt-out (bf16_exact)")
     quant = {}
-    policy = build_policy(model, mode, report, algo, options, list(skip or ()), bf16, reasons, quant)
+    policy = build_policy(model, mode, report, algo, options, list(skip or ()), bf16, reasons, quant,
+                          allow_uncalibrated_fallback=allow_uncalibrated_fallback)
+    fb = policy["uncalibrated_fallback"]
+    if fb["count"]:
+        status = "declared" if fb["declared"] else "NOT declared; pass --allow-uncalibrated-fallback to declare"
+        print(f"export: WARNING {fb['count']} Linear / Conv2d site(s) of a static recipe have no calibration "
+              f"data and stay on the dynamic per-tensor rule ({status}): {fb['sites'][:5]}", flush=True)
     # NEW: exact site identity avoids excluding similarly named sibling layers on replay.
     for row in policy["bf16_opt_out"]:
         if row["site"] in exact_bf16:

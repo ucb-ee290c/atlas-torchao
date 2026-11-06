@@ -187,7 +187,8 @@ def main():
                 model_record={"kind": "causal_lm", "cli": "src/eval.py", "id": args.model, "seqlen": args.seqlen,
                               "checkpoint": quant_export.checkpoint_record(args.model)},
                 calib_batches=calib_cache[0][0] if calib_cache else None,
-                calib_record=calib_cache[0][1] if calib_cache else None)
+                calib_record=calib_cache[0][1] if calib_cache else None,
+                allow_uncalibrated_fallback=getattr(args, "allow_uncalibrated_fallback", False))
             result["export"] = {"dir": args.export_dir, "mode": mode, "files": man["files"]}
             if args.export_only:
                 break
