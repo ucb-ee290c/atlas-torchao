@@ -1,7 +1,7 @@
 # vpu-numerics: vadd/vsub numerics for the `chip` profile
 
-`--chip-vadd {trunc,rn,rne_hw}` and `--chip-vadd-sites {residual,data,all}` (`src/chip_numerics.py`,
-wired through `src/chip_profile.py`, `src/chip_coverage.py` and `src/quant_modes.py`). The flags are
+`--chip-vadd {trunc,rn,rne_hw}` and `--chip-vadd-sites {residual,data,all}` (`src/chip/chip_numerics.py`,
+wired through `src/chip/chip_profile.py`, `src/chip/chip_coverage.py` and `src/quant_modes.py`). The flags are
 chip-profile options, not `--algo` quantization hooks: they change how the VPU adds, not how operands
 are cast. The default, `trunc`, is the chip profile exactly as on `l40s-run-2.1`
 (`tests/test_algo_base.py`, `tests/test_algo_vpu_numerics.py`).

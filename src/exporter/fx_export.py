@@ -10,6 +10,7 @@ import argparse
 import contextlib
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -268,7 +269,7 @@ def verify_saved(directory, device="cpu"):
             _compare(replay(*args), [fixtures[name] for name in case["outputs"]], case["output_spec"])
     return {"status": "passed", "cases": len(cases), "all_outputs_byte_identical": True,
             "code_scale_bytes_preserved": True, "unused_float_weights_not_materialized": True,
-            "model_replay_modules_imported": [name for name in ("load_quantized", "ref_profile", "ref_attention")
+            "model_replay_modules_imported": [name for name in ("exporter.load_quantized", "reference.ref_profile", "reference.ref_attention")
                                               if name in sys.modules]}
 
 
@@ -329,8 +330,10 @@ def capture_fx(module, cases, directory, *, policy, provenance=None, strict=True
               "files": {name: _file_record(directory / name) for name in BUNDLE_FILES}})
         report["same_process_reload"] = verify_saved(directory, str(cases[0][0].device))
         if fresh_process:
-            result = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--verify-dir", str(directory),
-                                     "--device", str(cases[0][0].device)], capture_output=True, text=True)
+            result = subprocess.run([sys.executable, "-m", "exporter.fx_export", "--verify-dir", str(directory),
+                                     "--device", str(cases[0][0].device)], capture_output=True, text=True,
+                                    env={**os.environ, "PYTHONPATH": os.pathsep.join(
+                                        [str(Path(__file__).resolve().parent.parent), os.environ.get("PYTHONPATH", "")])})
             (directory / "fresh_process.log").write_text(result.stdout + result.stderr)
             if result.returncode:
                 raise FXVerificationError(f"fresh-process reload failed with exit {result.returncode}")
@@ -375,8 +378,8 @@ def main(argv=None):
     else:
         if not args.export_dir or not args.out_dir or args.seqlen < 2:
             parser.error("--export-dir, --out-dir and --seqlen >= 2 are required")
-        import load_quantized
-        import quant_export
+        import exporter.load_quantized as load_quantized
+        import exporter.quant_export as quant_export
 
         _, policy, manifest = load_quantized.read_export(args.export_dir)
         if (manifest.get("model") or {}).get("kind", "causal_lm") != "causal_lm":
@@ -403,7 +406,7 @@ def main(argv=None):
 
 
 def _capture_source():
-    root = Path(__file__).resolve().parent.parent
+    root = Path(__file__).resolve().parent.parent.parent
     result = {"fx_export_py": _file_record(Path(__file__))}
     for key, command in (("commit", ["rev-parse", "HEAD"]), ("dirty", ["status", "--porcelain"])):
         process = subprocess.run(["git", "-C", str(root), *command], capture_output=True, text=True)

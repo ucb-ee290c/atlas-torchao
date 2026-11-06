@@ -61,7 +61,7 @@ class NormalizationError(RuntimeError):
 
 
 def add_args(ap) -> None:
-    g = ap.add_argument_group("normalization (src/policy_norm.py)")
+    g = ap.add_argument_group("normalization (src/loaders/policy_norm.py)")
     g.add_argument("--norm-stats", choices=PROTOCOLS, default="checkpoint",
                    help="checkpoint: the processors' saved stats; dataset (NEW): override the "
                         "normalizer / unnormalizer stats with the evaluated dataset's stats, as a "

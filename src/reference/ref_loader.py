@@ -23,7 +23,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 THIRD_PARTY = REPO_ROOT / "third_party"
 
 # Pinned revisions (full shas). pi0-quant comes first on sys.path: it is the only one that carries

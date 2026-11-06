@@ -1,8 +1,8 @@
 """Every aten op the three models execute has a unit (or an explicit host reason)."""
 import torch
 
-import chip_coverage as cc
-import op_unit_map as M
+import chip.chip_coverage as cc
+import chip.op_unit_map as M
 
 # Op census (aten overload packets) of one pass: TinyLlama seqlen 128 (eager), SmolVLA one frame,
 # Multi-Task DiT one frame (CLIP towers eager). Taken with a TorchDispatchMode on the unpatched models.

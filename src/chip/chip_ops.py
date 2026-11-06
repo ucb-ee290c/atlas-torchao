@@ -45,7 +45,7 @@ from typing import Callable, Optional
 
 import torch
 
-import ref_loader
+import reference.ref_loader as ref_loader
 
 # instruction mnemonics: examples/atlas/.../atlas_isa_green_card.md section 3
 INSTR = {

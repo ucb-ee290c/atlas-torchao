@@ -1,12 +1,12 @@
 import os
 import torch
 import torch.nn as nn
-from datautils import get_wikitext2
+from loaders.datautils import get_wikitext2
 import m2m
 from m2m.capture.torchao_pipeline import QuantizationConfig
 from torchao.quantization import quantize_
-from atlas_torchao import AtlasQConfig, AtlasQuantLinear, skip_lm_head
-from modelutils import load_llama
+from collab.atlas_torchao import AtlasQConfig, AtlasQuantLinear, skip_lm_head
+from loaders.modelutils import load_llama
 
 
 TINY_LLAMA = "/rscratch/agarcia/TinyLlama-1.1B-Chat-v1.0"

@@ -18,7 +18,7 @@
 a documented stack of the merged algorithms (`algos.RECIPES` and `algos.ALIASES` in
 `src/algos/__init__.py`; stacking rules in [stacking.md](stacking.md)). The recipe itself is **NEW**: it combines tracks that each cite their
 own sources, but no source defines this combination. Each component keeps the numerics of its
-track, and the reference author's numerics (`src/ref_numerics.py`) stay the source of truth for
+track, and the reference author's numerics (`src/reference/ref_numerics.py`) stay the source of truth for
 every cast.
 
 There are dynamic and static variants because the hardware ruling on run-time activation scales
@@ -87,7 +87,7 @@ without a recorded resolved name must be read against its source tag in this tab
   it on the DiT. BF16 has no MXU operand path: placement on the VPU or host remains pending R4.
 - **Other mixed precision.** fp8x3 residual passes need ruling R4 (whether passes can share the MXU
   accumulator). Opt in with `+`, for example
-  `--algo atlas_v1_awq+mixed_precision:rank_file=PATH,k=4` (ranking from `scripts/rank_layers.py`;
+  `--algo atlas_v1_awq+mixed_precision:rank_file=PATH,k=4` (ranking from `src/scripts/rank_layers.py`;
   causal LM only).
 - Recipes take no parameters (`atlas_v1:alpha=0.3` is refused). To change a component, write the
   stack out.
@@ -140,7 +140,7 @@ unchanged when its key has no stats (`lerobot/processor/normalize_processor.py:3
 the checkpoint's processors nothing is normalized and nothing fails. The `so100` stats do not match
 `svla_so100_pickplace` and are not aliased.
 
-`src/eval_policy.py` (and `src/policy_norm.py`) therefore:
+`src/eval_policy.py` (and `src/loaders/policy_norm.py`) therefore:
 
 - `--norm-stats checkpoint` (default): the processors as saved.
 - `--norm-stats dataset` (NEW): a zero-shot evaluation protocol for a pretraining checkpoint,

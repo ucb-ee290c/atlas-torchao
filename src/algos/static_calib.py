@@ -50,7 +50,7 @@ from collections import Counter
 
 import torch
 
-import ref_numerics as rn
+import reference.ref_numerics as rn
 from algos.base import Algo, Scale, observe_inputs
 
 NBINS = 1 << 15                      # BF16 magnitudes 0x0000 .. 0x7FFF
@@ -150,7 +150,7 @@ def weight_exponent(w: torch.Tensor, rule: str) -> int | None:
     if rule == "ref":
         return None
     if rule == "ceil448":
-        from atlas_quant import scale_exp_for          # the collaborator (atlas_quant.py:53-60)
+        from collab.atlas_quant import scale_exp_for          # the collaborator (atlas_quant.py:53-60)
         return int(scale_exp_for(w))
     if rule == "mse":
         return search(bf16_abs_hist(w), int(rn.po2_scale_exp(w)), sq_err, -3, 2)

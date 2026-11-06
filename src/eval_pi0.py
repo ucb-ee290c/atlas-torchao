@@ -1,7 +1,7 @@
 """Pi0 (openpi PI0Pytorch) action accuracy before and after FP8 quantization.
 
 The reference author's pi0-quant (third_party/pi0-quant @8bc0f6a) is the Pi0 reference profile:
-model, checkpoint, config, observation pipelines, noise and metrics follow it (src/pi0_model.py
+model, checkpoint, config, observation pipelines, noise and metrics follow it (src/loaders/pi0_model.py
 has the loader sources). Every mode is compared with the unquantized baseline `bf16` (openpi's
 own mixed precision: bfloat16 weights; norms, SigLIP patch / position embeddings and the action
 head in float32, gemma_pytorch.py:71-82, pi0_pytorch.py:100-109) on the same frames and noise.
@@ -80,9 +80,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
-import pi0_model
+import loaders.pi0_model as pi0_model
 from eval_policy import agreement, determinism_state, error_vs_gt, make_deterministic, repeat_agreement
-from pi0_model import CallCounter, inventory, patch_coverage
+from loaders.pi0_model import CallCounter, inventory, patch_coverage
 import algos
 from quant_modes import (ALL_MODES, add_profile_args, add_subset_compare_arg, finalize_report, ladder_deltas,
                          ladder_record, quantize, require_mode_supported, subset_compare_modes)
@@ -188,7 +188,7 @@ def build_parser():
     algos.add_args(ap, calib_sources=("auto", "droid", "dummy", "mxu_dummy"))
     add_profile_args(ap)
     add_subset_compare_arg(ap)
-    __import__("quant_export").add_args(ap)
+    __import__("exporter.quant_export", fromlist=['_']).add_args(ap)
     return ap
 
 
@@ -233,7 +233,7 @@ def mxu_dummy_observations(n: int, cfg, device, seed: int = 0) -> list[dict]:
     """run_eval_mxu_io.py:793-801: torch.manual_seed(0), then n of its _make_dummy_obs, drawn by
     the reference function on `device` (the CUDA and CPU streams differ, as in the reference).
     The global RNG state is restored afterwards (NEW)."""
-    import ref_loader
+    import reference.ref_loader as ref_loader
 
     rio = ref_loader.load_file("pi0-quant", "experiments/run_eval_mxu_io.py")
     dev = torch.device(device)
@@ -249,7 +249,7 @@ def sim_observations(obs_dir, obs_file, cfg, checkpoint_dir, norm_stats_dir, tok
     """run_eval_mxu_io.py --obs-dir/--obs-file: its _load_real_obs (:136-256) itself. That function
     finds the tokenizer only under ~/Desktop or ~/.cache/openpi/big_vision (:163-173), so it runs
     with HOME pointing at a temporary dir that links --tokenizer-path there (NEW)."""
-    import ref_loader
+    import reference.ref_loader as ref_loader
 
     rio = ref_loader.load_file("pi0-quant", "experiments/run_eval_mxu_io.py")
     old = os.environ.get("HOME")
@@ -345,7 +345,7 @@ def vs_ground_truth(preds, gts) -> dict:
 
 def reference_action_rmse(base, quant, csv_path) -> dict:
     """The reference's action metric, by the reference function (run_output_eval.py:251-295)."""
-    import ref_loader
+    import reference.ref_loader as ref_loader
 
     roe = ref_loader.load_file("pi0-quant", "experiments/run_output_eval.py")
     csv_path = Path(csv_path)
@@ -471,7 +471,7 @@ def evaluate(args, frames, build, level, horizon, action_dim, out: Path) -> dict
         print(mode, json.dumps(brief, default=str)[:600], flush=True)
         print(mode, "patch coverage:", json.dumps(entry["patch_coverage"]["summary"]), flush=True)
         if isinstance((layers or {}).get("coverage"), dict):
-            import chip_coverage
+            import chip.chip_coverage as chip_coverage
 
             print(chip_coverage.format_report(layers["coverage"]), flush=True)
         del model, policy, run
@@ -503,7 +503,7 @@ def provenance(args, openpi) -> dict:
     import torchao
     import transformers
 
-    import ref_loader
+    import reference.ref_loader as ref_loader
 
     def sh(*cmd):
         try:
@@ -609,7 +609,7 @@ def main(argv=None):
               "(reduced_steps: true in the JSON)", flush=True)
 
     calib_cache = []
-    import quant_export
+    import exporter.quant_export as quant_export
 
     export_mode = quant_export.check_args(ap, args)
     prov = provenance(args, openpi)
@@ -620,7 +620,7 @@ def main(argv=None):
         inv = inventory(model)
         calib = lambda: calibration(args, rt, cfg, model, frames, calib_cache)  # noqa: E731
         if args.from_export and mode != "bf16":
-            import load_quantized
+            import exporter.load_quantized as load_quantized
 
             # no calibration; every exported tensor overwrites the checkpoint's (docs/algos/export.md)
             _, layers, _man = load_quantized.load_quantized(None, args.from_export, args.device,
@@ -697,7 +697,7 @@ def data_record(args, frames, level, horizon) -> dict:
 
 
 def write_result(args, result, out: Path) -> None:
-    import ref_loader
+    import reference.ref_loader as ref_loader
 
     if args.rmse:
         import layer_rmse

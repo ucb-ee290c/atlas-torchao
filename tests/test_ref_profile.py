@@ -6,8 +6,8 @@ import torch.nn.functional as F
 from refutil import need_refs
 
 import quant_modes
-import ref_loader
-from ref_profile import RefQuantLinear
+import reference.ref_loader as ref_loader
+from reference.ref_profile import RefQuantLinear
 
 
 @pytest.fixture(scope="module")
@@ -58,8 +58,8 @@ def test_linear_parity(hw, mxu, dtype, impl):
     """reference_hw == the reference QuantLinear(functional_model=...) bit for bit
     (smolvla_inout quant_linear.py:133-175), K with a tail tile, bias, 3-D float32 input."""
     QuantLinear = ref_loader.import_ref("smolvla_inout.quant_linear").QuantLinear
-    import accum_backends as ab
-    from ref_profile import quantize_reference
+    import mxu.accum_backends as ab
+    from reference.ref_profile import quantize_reference
 
     torch.manual_seed(3)
     lin = nn.Linear(70, 33).to(dtype)
@@ -82,7 +82,7 @@ def test_fm_idempotent():
     (ipt_rtl_linear.py:43-78), the C shim_float_to_e4m3 (ipt_rtl_linear_c.py:240-287, also used
     by systolic_c, systolic_array_rtl_linear.py:201,279) and the numba port of it."""
     need_refs()
-    import ref_numerics as rn
+    import reference.ref_numerics as rn
 
     codes = torch.tensor([b for b in range(256) if ((b >> 3) & 0xF) != 0 and (b & 0x7F) != 0x7F] + [0],
                          dtype=torch.uint8)

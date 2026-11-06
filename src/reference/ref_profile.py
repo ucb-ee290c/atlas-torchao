@@ -15,12 +15,15 @@ s = floor(log2(amax_bf16 / 256)) and the vpack E4M3 encoder (quant_linear.py:153
 
 from __future__ import annotations
 
+import re
+from contextlib import ExitStack, contextmanager
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 import algos
-import ref_numerics as rn
+import reference.ref_numerics as rn
 from algos import base as algo_hooks
 
 
@@ -50,6 +53,8 @@ class RefQuantLinear(nn.Module):
         self.in_features, self.out_features = linear.in_features, linear.out_features
         self.layer_name = name
         self.algo = algos.current()              # None under --algo none (src/algos)
+        self._profile_fisher = None
+        self._dw = None
         with torch.no_grad():
             w_q, s_w, self.weight_block = algo_hooks.weight_cast(self.algo, name, self.weight.detach(), "linear")
         self.register_buffer("weight_codes", w_q, persistent=False)
@@ -87,8 +92,60 @@ class RefQuantLinear(nn.Module):
         if self.weight_block:
             return algo_hooks.dequant(self.weight_codes, self.weight_scale_exp, self.weight_block)
         return rn.dequantize(self.weight_codes, self.weight_scale_exp)
+    
+    def _dequant_act(self, x: torch.Tensor) -> torch.Tensor:
+        if self.algo is not None:
+            x_q, s_x, blk = algo_hooks.act_cast(self.algo, self.layer_name, x, "linear")
+            return algo_hooks.dequant(x_q, s_x, blk) if blk else rn.dequantize(x_q, s_x)
+        x_q, s_x = rn.quantize(x)
+        return rn.dequantize(x_q, s_x)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self._profile_fisher is not None:
+            return self._forward_profiled(x)
+        return self._forward_quant(x)
+
+    def profile_fisher(self, enable: bool = True, record: bool = True) -> None:
+        """Profile mode: forward returns the clean output (the FP8 cast is not differentiable, so a
+        layer left on the quantized path blocks gradients to everything upstream of it). record=False
+        keeps that clean pass-through but accumulates nothing (layers outside the profiled set)."""
+        if enable:
+            self._profile_fisher = torch.zeros(2, dtype=torch.float64, device=self.weight.device)
+            self._dw = (self._dequant_weight().float() - self.weight.float().reshape(self.weight_codes.shape)
+                        if record else None)
+        else:
+            self._profile_fisher, self._dw = None, None
+
+    def fisher_report(self, n_batches: int = 1) -> dict:
+        """Accumulated sensitivity per batch: weights, input activations, and their sum."""
+        if self._profile_fisher is None:
+            raise RuntimeError(f"{self.layer_name}: fisher_report called without profile_fisher(True)")
+        fw, fx = (self._profile_fisher.double() / max(n_batches, 1)).tolist()
+        return {"macs": self.weight.numel(), "fisher_w": fw, "fisher_x": fx, "fisher": fw + fx}
+
+    def _forward_profiled(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.to(self.weight.dtype)
+        y = F.linear(x, self.weight, self.bias)
+  
+        if y.requires_grad and self._dw is not None:
+            with torch.no_grad():
+                xd = x.detach()
+                dx = (self._dequant_act(xd).float() - xd.float()).flatten(0, -2)
+
+            xf = xd.float().flatten(0, -2)
+
+            def fisher(grad):
+                g = grad.float().flatten(0, -2)                     # [T, out]
+                gW = g.T @ xf                                       # [out, in]
+                gx = g   @ self.weight.detach().float()               # [T, in]
+                self._profile_fisher[0] += 0.5 * (gW.pow(2) * self._dw.pow(2)).sum()
+                self._profile_fisher[1] += 0.5 * (gx.pow(2) * dx.pow(2)).sum()
+
+            y.register_hook(fisher)
+            
+        return y
+        
+    def _forward_quant(self, x: torch.Tensor) -> torch.Tensor:
         dtype = self.weight.dtype
         # Operate in the weight dtype; some activations arrive as float32 (quant_linear.py:133-137).
         x = x.to(dtype)
@@ -185,3 +242,90 @@ def quantize_reference(model: nn.Module, skip=(), fm_factory=None) -> dict:
         _set_module(model, n, RefQuantLinear(modules[n], name=n,
                                                    fm=fm_factory() if fm_factory else None))
     return {"planned": len(planned), "quantized": len(planned), "untouched": []}
+
+def _select_layers(model: nn.Module, include=None, exclude=()) -> dict:
+    """{fqn: RefQuantLinear} whose fqn matches regex `include` (None = all) and has no `exclude` substring."""
+    pat = re.compile(include) if include else None
+    return {n: m for n, m in model.named_modules()
+            if isinstance(m, RefQuantLinear)
+            and (pat is None or pat.search(n))
+            and not any(s in n for s in exclude)}
+
+
+@contextmanager
+def _grad_anchored(model: nn.Module, anchors):
+    """Freeze every parameter except `anchors`, so activations carry grad but weights do not.
+    Restores the original requires_grad flags and clears grads on exit."""
+    saved = {p: p.requires_grad for p in model.parameters()}
+    model.requires_grad_(False)
+    for p in anchors:
+        p.requires_grad_(True)
+    try:
+        yield
+    finally:
+        model.zero_grad(set_to_none=True)
+        for p, r in saved.items():
+            p.requires_grad_(r)
+
+
+@contextmanager
+def _profiling(layers, record=True):
+    layers = list(layers)
+    for m in layers:
+        m.profile_fisher(True, record)
+    try:
+        yield
+    finally:
+        for m in layers:
+            m.profile_fisher(False)
+
+
+def profile_fisher_model(model: nn.Module, batches, loss_fn, include=None, exclude=(), anchors=None,
+                         attention=True) -> dict:
+    """{fqn: {macs, fisher_w, fisher_x, fisher}} averaged over `batches`.
+
+    attention  also profile the q / k / p / v operands of every reference-attention call (the model
+               must have been routed through reference.ref_attention.patch_attention); entries are
+               keyed "<site>.q|k|p|v" with {"kind": "attn", "fisher"}.
+
+    model    already quantized by quantize_reference; every RefQuantLinear returns its clean output
+             while profiling (selected or not), so the gradients are those of the unquantized model.
+    loss_fn  loss_fn(model, batch) -> scalar loss (summed over tokens / elements).
+    include  regex over layer fqns (None = every RefQuantLinear); exclude: substrings to skip.
+    anchors  callable(model) -> params that get requires_grad so every profiled layer's output
+             is in the graph; default is the input embedding (LLM). A VLA needs one anchor per
+             input path, e.g. vision patch embed, token embed, state / action projections.
+    """
+    import reference.ref_attention as ra
+
+    layers = _select_layers(model, include, exclude)
+    if not layers:
+        raise ValueError(f"no RefQuantLinear matches include={include!r} exclude={exclude!r}")
+    anchors = anchors or (lambda m: [m.get_input_embeddings().weight])
+    nb = max(len(batches), 1)
+    with ExitStack() as st:
+        st.enter_context(_grad_anchored(model, anchors(model)))
+        chosen = set(layers.values())
+        others = [m for m in model.modules() if isinstance(m, RefQuantLinear) and m not in chosen]
+        st.enter_context(_profiling(others, record=False))     # not profiled, but must not block gradients
+        st.enter_context(_profiling(layers.values()))
+        acc = st.enter_context(ra.attn_fisher()) if attention else {}
+        for b in batches:
+            ra.new_forward()
+            loss_fn(model, b).backward()
+            model.zero_grad(set_to_none=True)
+        res = {n: m.fisher_report(len(batches)) for n, m in layers.items()}
+        res.update({k: {"kind": "attn", "fisher": v.item() / nb} for k, v in acc.items()})
+    return res
+
+
+def write_report(res: dict, meta: dict, out: str) -> None:
+    """{"meta", "layers"} JSON as src/scripts/plot_fisher.py reads it."""
+    import json
+    from pathlib import Path
+
+    meta = {**meta, "torch": torch.__version__, "loss": "summed (see script)",
+            "score": "0.5 * sum(grad^2 * delta^2), averaged over batches; fisher = fisher_w + fisher_x"}
+    Path(out).parent.mkdir(parents=True, exist_ok=True)
+    Path(out).write_text(json.dumps({"meta": meta, "layers": res}, indent=1))
+    print("wrote", out)

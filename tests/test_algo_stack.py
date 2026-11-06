@@ -7,7 +7,7 @@ import pytest
 import torch
 
 import algos
-import ref_numerics as rn
+import reference.ref_numerics as rn
 from algos.base import Algo
 from algos.granularity import scale_exp
 from algos.stack import Stack, StackConflict

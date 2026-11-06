@@ -113,7 +113,7 @@ class _Granular(Algo):
         return w / 2
 
     def weight_scale(self, name, w, kind):
-        import ref_numerics as rn
+        import reference.ref_numerics as rn
         return Scale(rn.po2_scale_exp(w, (1,)), "per_channel")
 
     def act_scale(self, name, x, kind, dims=None):
@@ -144,7 +144,7 @@ def test_granularity_and_online_hooks_reference_paths():
 
 def test_per_block_framework_path_and_refusal_under_mxu():
     need_refs()
-    import ref_numerics as rn
+    import reference.ref_numerics as rn
 
     class Block(Algo):
         def weight_scale(self, name, w, kind):

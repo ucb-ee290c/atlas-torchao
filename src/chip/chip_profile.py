@@ -30,10 +30,10 @@ import functools
 import torch
 import torch.nn as nn
 
-import chip_coverage as cc
-import chip_numerics
-import chip_ops
-import ref_numerics as rn
+import chip.chip_coverage as cc
+import chip.chip_numerics as chip_numerics
+import chip.chip_ops as chip_ops
+import reference.ref_numerics as rn
 
 ENTRY_POINTS = ("forward", "predict_action_chunk", "select_action", "_generate_actions",
                 "sample_actions", "conditional_sample")
@@ -158,7 +158,7 @@ class _Session:
             self.saved = {"quantize": rn.quantize, "e4m3_unpack": rn.e4m3_unpack, "dequantize": rn.dequantize}
             rn.quantize, rn.e4m3_unpack, rn.dequantize = quantize, guarded(rn.e4m3_unpack), guarded(rn.dequantize)
             try:
-                import ref_attention
+                import reference.ref_attention as ref_attention
                 self.saved["_mm"] = ref_attention._mm
                 ref_attention._mm = guarded(ref_attention._mm)
             except ImportError:
@@ -179,7 +179,7 @@ class _Session:
             rn.e4m3_unpack = self.saved["e4m3_unpack"]
             rn.dequantize = self.saved["dequantize"]
             if "_mm" in self.saved:
-                import ref_attention
+                import reference.ref_attention as ref_attention
                 ref_attention._mm = self.saved["_mm"]
             if r.vadd is not None and getattr(r, "vadd_record", None) is not None:
                 r.vadd_record.update(r.vadd.record())
@@ -343,7 +343,7 @@ def quantize_chip(model: nn.Module, skip=(), options=None) -> dict:
     if vadd is not None:
         router.vadd_record = vadd.record()
         rep["profile"]["vadd"] = router.vadd_record
-    import ref_loader
+    import reference.ref_loader as ref_loader
     rep["reference_sources"] = ref_loader.provenance()
     rep["coverage"] = cov.refresh()
     return rep

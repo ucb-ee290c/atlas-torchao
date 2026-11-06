@@ -6,8 +6,8 @@ No calibration runs and no algorithm is re-applied: every quantized layer gets i
 exponents from model.safetensors, every other tensor (the folded norms, producer rows, biases,
 embeddings, BF16 opt-outs) is assigned from the same file in its stored dtype, and the activation
 scale of every site is executed from policy.json by `PolicyAlgo`, an algos.base.Algo whose hooks
-read the policy instead of calibration statistics. The reference modules (src/ref_profile.py,
-src/ref_attention.py) then run exactly the code they run after algos.quantize, so the loaded model
+read the policy instead of calibration statistics. The reference modules (src/reference/ref_profile.py,
+src/reference/ref_attention.py) then run exactly the code they run after algos.quantize, so the loaded model
 is bit-identical to the in-memory quantized one (tests/test_export.py).
 
 Architecture: a causal LM (eval.py exports) is built from its config alone, with no checkpoint
@@ -109,7 +109,7 @@ def read_export(export_dir, verify=True):
     """(tensors, policy, manifest); with verify, the files' sha256 must match the manifest."""
     from safetensors.torch import load_file
 
-    import quant_export
+    import exporter.quant_export as quant_export
 
     d = Path(export_dir)
     manifest = json.loads((d / "manifest.json").read_text())
@@ -181,7 +181,7 @@ def apply_export(model, tensors, policy, device, mode=None, options=None):
     qkeys = {f"{n}.weight" for n in quant}
     aliases = policy.get("aliases", {})
     state_keys = set(model.state_dict().keys())
-    named = {k for k in tensors if not k.endswith(tuple(__import__("quant_export").QUANT_SUFFIXES))}
+    named = {k for k in tensors if not k.endswith(tuple(__import__("exporter.quant_export", fromlist=['_']).QUANT_SUFFIXES))}
     missing = state_keys - qkeys - named - set(aliases)
     if missing:
         raise KeyError(f"load_quantized: state-dict entries not in the export: {sorted(missing)[:8]}")
@@ -200,7 +200,7 @@ def apply_export(model, tensors, policy, device, mode=None, options=None):
             codes = tensors[s["weight"]["codes"]]
             exp = tensors[s["weight"]["scale_exp"]]
             blk = int(s["weight"].get("block", 0))
-            w = algo_hooks.dequant(codes, exp, blk) if blk else __import__("ref_numerics").dequantize(codes, exp)
+            w = algo_hooks.dequant(codes, exp, blk) if blk else __import__("reference.ref_numerics", fromlist=['_']).dequantize(codes, exp)
             dtype = getattr(torch, s["weight_dtype"])
             mods[n].weight.data = w.reshape(s["weight_shape"]).to(device=device, dtype=dtype)
     skip = list(policy.get("skip", []))
@@ -215,7 +215,7 @@ def apply_export(model, tensors, policy, device, mode=None, options=None):
         opts["_algo_bf16"] = tuple(bf16)
         opts["_algo_bf16_exact"] = tuple(exact_bf16)
     replay = PolicyAlgo(policy, {k: v.to(device) for k, v in tensors.items()
-                                 if k.endswith(tuple(__import__("quant_export").QUANT_SUFFIXES))})
+                                 if k.endswith(tuple(__import__("exporter.quant_export", fromlist=['_']).QUANT_SUFFIXES))})
     with algos.active(replay):
         rep = quant_modes.quantize(model, mode, skip + [n for n in bf16 if n not in exact_bf16], opts)
     # the codes the modules derived must be the exported ones, bit for bit
@@ -234,7 +234,7 @@ def apply_export(model, tensors, policy, device, mode=None, options=None):
                 m.weight_lo_codes = lo
                 m.weight_lo_scale_exp = tensors[r["lo_scale_exp"]].to(device)
                 if getattr(m, "fm", None) is not None:
-                    m.weight_lo_norm = __import__("ref_numerics").e4m3_unpack(lo)
+                    m.weight_lo_norm = __import__("reference.ref_numerics", fromlist=['_']).e4m3_unpack(lo)
     rep["loaded_from_export"] = True
     rep["algo"] = {"name": "export_policy", "applied": True, "bf16_opt_out": bf16,
                    "bf16_opt_out_exact": exact_bf16,

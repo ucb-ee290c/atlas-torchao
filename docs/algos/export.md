@@ -1,9 +1,9 @@
 # Exporting a quantized model (`--export-dir`)
 
 `--export-dir DIR` writes a quantized model as files. It works on `src/eval.py`, `src/eval_policy.py`
-and `src/eval_pi0.py`. `src/load_quantized.py` rebuilds the model from those files without
-calibration and without the float weights of the quantized layers. Code: `src/quant_export.py`,
-`src/load_quantized.py`. Tests: `tests/test_export.py`.
+and `src/eval_pi0.py`. `src/exporter/load_quantized.py` rebuilds the model from those files without
+calibration and without the float weights of the quantized layers. Code: `src/exporter/quant_export.py`,
+`src/exporter/load_quantized.py`. Tests: `tests/test_export.py`.
 
 The format is **NEW**. No source defines a file format for these numerics. Every choice that
 follows is listed in the manifest under `new_decisions`.

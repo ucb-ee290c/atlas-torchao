@@ -1,6 +1,6 @@
 import pytest
 
-import ref_loader
+import reference.ref_loader as ref_loader
 
 
 def _need_refs():

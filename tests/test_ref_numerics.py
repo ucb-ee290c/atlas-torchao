@@ -5,9 +5,9 @@ import torch
 
 from refutil import need_refs
 
-import ref_loader
-import ref_numerics as rn
-from atlas_quant import hw_bf16_to_e4m3
+import reference.ref_loader as ref_loader
+import reference.ref_numerics as rn
+from collab.atlas_quant import hw_bf16_to_e4m3
 
 SHIFTS = range(-23, 24)            # 47 shifts
 

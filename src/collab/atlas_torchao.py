@@ -5,8 +5,8 @@ import torch.nn.functional as F
 from torchao.core.config import AOBaseConfig
 from torchao.quantization import quantize_, Float8DynamicActivationFloat8WeightConfig
 from torchao.quantization.transform_module import register_quantize_module_handler
-from modelutils import load_llama, load_smolvla
-from atlas_quant import hw_bf16_to_e4m3, hw_e4m3_to_float, scale_exp_for
+from loaders.modelutils import load_llama, load_smolvla
+from collab.atlas_quant import hw_bf16_to_e4m3, hw_e4m3_to_float, scale_exp_for
 from torch.fx.passes.graph_drawer import FxGraphDrawer
 
 E8M0_BIAS = 127

@@ -386,7 +386,7 @@ class SmoothQuant(Algo):
         # post-fold calibration maxima: what the static scale (and the gain) were derived from
         self._static_exp = {}
         if self.static:
-            import ref_numerics as rn
+            import reference.ref_numerics as rn
             # On the CPU in float64 whatever device the model ran on: the calibration maxima follow
             # the model's device, the fold factors may not, and a CUDA run must give the CPU exponents.
             for fq, a in self._amax.items():

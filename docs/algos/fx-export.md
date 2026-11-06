@@ -1,6 +1,6 @@
 # FX graph export and verification
 
-`src/fx_export.py` captures a model reconstructed from the existing quantized export,
+`src/exporter/fx_export.py` captures a model reconstructed from the existing quantized export,
 saves a PyTorch `ExportedProgram` as `model.pt2`, and verifies it after reload. The
 program contains an FX computation graph, lifted tensor state and fixed input guards.
 No calibration or quantizer search runs during this export.
@@ -20,7 +20,7 @@ The output directory must not exist; existing exports and output directories are
 overwritten.
 
 ```bash
-python src/fx_export.py \
+PYTHONPATH=src python -m exporter.fx_export \
   --export-dir /absolute/path/to/verified/tinyllama/export \
   --model /absolute/path/to/tinyllama/config \
   --out-dir /absolute/path/to/new/fx-directory \
@@ -37,7 +37,7 @@ leave a diagnostic `verification.json`.
 To replay a saved graph independently:
 
 ```bash
-python src/fx_export.py --verify-dir /absolute/path/to/fx-directory --device cuda
+PYTHONPATH=src python -m exporter.fx_export --verify-dir /absolute/path/to/fx-directory --device cuda
 ```
 
 The fresh-process check imports PyTorch and SafeTensors but not the original model
