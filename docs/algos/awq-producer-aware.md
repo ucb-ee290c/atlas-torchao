@@ -94,8 +94,9 @@ gate/up/down, stock residual as the layer input. Only 2 layers are loaded (layer
 
 | layer | panel, old: alpha / damaged rows / MLP err | panel, new: alpha / damaged rows / MLP err | per-channel control: alpha / MLP err |
 |---|---|---|---|
-| 0 | 0.70 / 0 / 0.02342 | 0.90 / 0 / 0.02323 | 0.70 / 0.02342 |
+| 0 | 0.70 / 0 / 0.02342 | 0.30 / 0 / 0.02326 | 0.70 / 0.02342 |
 | 1 | 0.65 / 0 / 0.03146 | 0.35 / 0 / 0.03159 | 0.65 / 0.03146 |
 
-TinyLlama shows no panel damage at these layers, so this is a no-regression check (errors within 0.4% of each other), not a demonstration. A
+These are the numbers after the `s_in` rescale of `H_p` (commit eb76250; the first run, before it, picked layer-0 alpha 0.9 and gave 0.02323 / 0.03159).
+TinyLlama shows no panel damage at these layers, so this is a no-regression check (MLP error -0.7% on layer 0, +0.4% on layer 1), not a demonstration. A
 full TinyLlama export (about 20 min) was not run.
