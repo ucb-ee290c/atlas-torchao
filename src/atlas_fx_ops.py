@@ -1,7 +1,10 @@
 """Custom operators that carry one quantized Linear as two opaque FX nodes (fx_export --native-fp8).
 
-    atlas::quantize_act(x, mode, reduce, rule, static_exp, code_dtype) -> (codes, exp)
+    atlas::quantize_act(x, mode, reduce, rule, static_exp, code_dtype, tag="") -> (codes, exp)
     atlas::qlinear(x_codes, x_exp, w_codes, w_exp, bias, out_dtype, weight_format) -> y
+    atlas::qconv2d(x_cols_codes, x_exp, w_codes, w_exp, bias, out_dtype, weight_format, B, oh, ow) -> y
+    atlas::qk_matmul(q_codes, q_exp, k_codes, k_exp) -> scores          (float32, before the head_dim scaling)
+    atlas::pv_matmul(p_codes, p_exp, vt_codes, v_exp) -> out            (float32; vt = V^T)
 
 Importing this module registers both operators (torch.library). A saved FX bundle
 (`model.pt2`) names them as `atlas.quantize_act.default` / `atlas.qlinear.default`, so
@@ -42,12 +45,14 @@ from algos.granularity import scale_exp
 WEIGHT_FORMAT = "atlas_e4m3"
 CODE_DTYPES = {"uint8": torch.uint8, "float8_e4m3fn": torch.float8_e4m3fn}
 MODES = ("dynamic", "static")
-REDUCES = ("tensor", "token")
+REDUCES = ("tensor", "token", "head")
 RULES = ("ref", "nc")
 
 
 def _exp_shape(x: torch.Tensor, mode: str, reduce: str):
-    return [] if mode == "static" or reduce == "tensor" else list(x.shape[:-1]) + [1]
+    if mode == "static" or reduce == "tensor":
+        return []
+    return list(x.shape[:-1]) + [1] if reduce == "token" else list(x.shape[:-2]) + [1, 1]
 
 
 def _check_act(mode, reduce, rule, static_exp, code_dtype):
@@ -60,20 +65,23 @@ def _check_act(mode, reduce, rule, static_exp, code_dtype):
 
 @torch.library.custom_op("atlas::quantize_act", mutates_args=())
 def quantize_act(x: torch.Tensor, mode: str, reduce: str, rule: str, static_exp: Optional[int],
-                 code_dtype: str) -> tuple[torch.Tensor, torch.Tensor]:
+                 code_dtype: str, tag: str = "") -> tuple[torch.Tensor, torch.Tensor]:
     """BF16 activation -> (E4M3 codes, int32 power-of-two exponents), real = e4m3(code) * 2^exp.
 
     mode='dynamic': exponent from the activation itself, `scale_exp(x, dims, rule)` with dims=(-1,)
-    for reduce='token' (one exponent per row, shape [..., 1]) or None for reduce='tensor' (shape []);
+    for reduce='token' (one exponent per row, shape [..., 1]), (-2, -1) for reduce='head' (one per
+    batch x head matrix, shape [..., 1, 1]: the attention operands' reference_dims) or None for
+    reduce='tensor' (shape []);
     rule 'ref' = floor(log2(amax)) - 8, 'nc' = the no-clip rule (algos/granularity.py).
     mode='static': the fixed exponent `static_exp` (shape []). code_dtype selects uint8 or float8_e4m3fn
-    for the returned codes (the same bytes)."""
+    for the returned codes (the same bytes). `tag` is a label only (the attention operands carry
+    "<policy site>:<q|k|p|v>"); it does not change the result."""
     _check_act(mode, reduce, rule, static_exp, code_dtype)
     xb = x.to(torch.bfloat16)
     if mode == "static":
         s = torch.tensor(int(static_exp), dtype=torch.int32, device=x.device)
     else:
-        s = scale_exp(xb, (-1,) if reduce == "token" else None, rule)
+        s = scale_exp(xb, {"token": (-1,), "head": (-2, -1), "tensor": None}[reduce], rule)
     codes = rn.e4m3_vpack(xb, s)
     if code_dtype == "float8_e4m3fn":
         codes = codes.view(torch.float8_e4m3fn)
@@ -81,7 +89,7 @@ def quantize_act(x: torch.Tensor, mode: str, reduce: str, rule: str, static_exp:
 
 
 @quantize_act.register_fake
-def _(x, mode, reduce, rule, static_exp, code_dtype):
+def _(x, mode, reduce, rule, static_exp, code_dtype, tag=""):
     _check_act(mode, reduce, rule, static_exp, code_dtype)
     return (torch.empty(x.shape, dtype=CODE_DTYPES[code_dtype], device=x.device),
             torch.empty(_exp_shape(x, mode, reduce), dtype=torch.int32, device=x.device))
@@ -112,4 +120,62 @@ def _(x_codes, x_exp, w_codes, w_exp, bias, out_dtype, weight_format):
                        device=x_codes.device)
 
 
-OPS = (torch.ops.atlas.quantize_act.default, torch.ops.atlas.qlinear.default)
+@torch.library.custom_op("atlas::qconv2d", mutates_args=())
+def qconv2d(x_codes: torch.Tensor, x_exp: torch.Tensor, w_codes: torch.Tensor, w_exp: torch.Tensor,
+            bias: Optional[torch.Tensor], out_dtype: str, weight_format: str, batch: int, out_h: int,
+            out_w: int) -> torch.Tensor:
+    """Conv2d as FP8 x FP8 matmul on im2col'd codes: x_codes [B*oh*ow, in*kh*kw] (the unfolded input,
+    quantized per row), w_codes [out, in*kh*kw] (the export's flattened weight). Same contraction as
+    `qlinear`, then `RefQuantConv2d.forward`'s tail: [B*oh*ow, out] -> [B, out, oh, ow], bias added in the
+    layer dtype. The im2col (F.unfold, permute, reshape) stays a visible node before quantize_act."""
+    if weight_format != WEIGHT_FORMAT:
+        raise ValueError(f"atlas::qconv2d: weight_format {weight_format!r}, expected {WEIGHT_FORMAT!r}")
+    dtype = getattr(torch, out_dtype)
+    out_channels = w_codes.shape[0]
+    y = F.linear(rn.dequantize(x_codes, x_exp).to(dtype), rn.dequantize(w_codes, w_exp).to(dtype))
+    y = y.reshape(batch, out_h * out_w, out_channels).permute(0, 2, 1).reshape(batch, out_channels, out_h, out_w)
+    return y if bias is None else y + bias.view(1, -1, 1, 1).to(dtype=dtype, device=y.device)
+
+
+@qconv2d.register_fake
+def _(x_codes, x_exp, w_codes, w_exp, bias, out_dtype, weight_format, batch, out_h, out_w):
+    if weight_format != WEIGHT_FORMAT:
+        raise ValueError(f"atlas::qconv2d: weight_format {weight_format!r}, expected {WEIGHT_FORMAT!r}")
+    return torch.empty([batch, w_codes.shape[0], out_h, out_w], dtype=getattr(torch, out_dtype),
+                       device=x_codes.device)
+
+
+@torch.library.custom_op("atlas::qk_matmul", mutates_args=())
+def qk_matmul(q_codes: torch.Tensor, q_exp: torch.Tensor, k_codes: torch.Tensor,
+              k_exp: torch.Tensor) -> torch.Tensor:
+    """Attention scores Q.K^T on E4M3 codes, float32 out: q [..., Sq, D], k [..., Skv, D], exponents
+    [..., 1, 1] (per head), [..., Sq, 1] (per token) or []. `ref_numerics.dq_matmul_nt`, the body of
+    ref_attention._mm. The head_dim scaling, mask and softmax are separate BF16/float32 nodes."""
+    return rn.dq_matmul_nt(q_codes, q_exp, k_codes, k_exp)
+
+
+@qk_matmul.register_fake
+def _(q_codes, q_exp, k_codes, k_exp):
+    return _matmul_nt_fake(q_codes, k_codes)
+
+
+@torch.library.custom_op("atlas::pv_matmul", mutates_args=())
+def pv_matmul(p_codes: torch.Tensor, p_exp: torch.Tensor, vt_codes: torch.Tensor,
+              v_exp: torch.Tensor) -> torch.Tensor:
+    """Attention output P.V on E4M3 codes, float32 out: p [..., Sq, Skv], vt = V^T [..., Dv, Skv] (the
+    transposed view `ref_attention` hands to `_mm`), v_exp [..., 1, 1]. Same body as qk_matmul."""
+    return rn.dq_matmul_nt(p_codes, p_exp, vt_codes, v_exp)
+
+
+@pv_matmul.register_fake
+def _(p_codes, p_exp, vt_codes, v_exp):
+    return _matmul_nt_fake(p_codes, vt_codes)
+
+
+def _matmul_nt_fake(a, b):
+    batch = torch.broadcast_shapes(a.shape[:-2], b.shape[:-2])
+    return torch.empty(list(batch) + [a.shape[-2], b.shape[-2]], dtype=torch.float32, device=a.device)
+
+
+OPS = (torch.ops.atlas.quantize_act.default, torch.ops.atlas.qlinear.default, torch.ops.atlas.qconv2d.default,
+       torch.ops.atlas.qk_matmul.default, torch.ops.atlas.pv_matmul.default)

@@ -46,15 +46,15 @@ from algos import base as algo_hooks
 ATTN_KEY = "atlas_ref"
 
 
-def _mm(fm, a_q, a_s, b_q, b_s, dtype_out=torch.float32):
-    """a [..., M, K] times b [..., N, K]^T on cast operands; result * 2^(sa+sb) in float32."""
+def _mm(fm, a_q, a_s, b_q, b_s, dtype_out=torch.float32, role=None):
+    """a [..., M, K] times b [..., N, K]^T on cast operands; result * 2^(sa+sb) in float32.
+    `role` ("qk" or "pv") names the matmul for fx_export's native-FP8 capture, which swaps `_cast` and
+    `_mm`; it does not change the result."""
     if fm is not None:
         y = fm(rn.e4m3_unpack(a_q), rn.e4m3_unpack(b_q), None)
         return y * torch.exp2((a_s + b_s).float())
     # NEW: reference profile without an MXU model: matmul on the dequantized operands in float32.
-    a = rn.dequantize(a_q, a_s)
-    b = rn.dequantize(b_q, b_s)
-    return torch.matmul(a, b.transpose(-1, -2))
+    return rn.dq_matmul_nt(a_q, a_s, b_q, b_s)
 
 
 def _cast(algo, site, operand, x, dims):
@@ -80,7 +80,7 @@ def ref_attention(q, k, v, scaling, mask=None, fm_qk=None, fm_av=None, variant="
     hd = (-2, -1)
     q_q, s_q = _cast(algo, site, "q", q, hd)
     k_q, s_k = _cast(algo, site, "k", k, hd)
-    scores = _mm(fm_qk, q_q, s_q, k_q, s_k) * scaling                              # 675-677
+    scores = _mm(fm_qk, q_q, s_q, k_q, s_k, role="qk") * scaling                              # 675-677
     if variant == "vision":
         scores = scores.to(torch.bfloat16)                                         # 827-829
         if mask is not None:
@@ -112,7 +112,7 @@ def ref_attention(q, k, v, scaling, mask=None, fm_qk=None, fm_av=None, variant="
     p_q, s_p = _cast(algo, site, "p", p, hd)                                       # 689
     v_q, s_v = _cast(algo, site, "v", v, hd)                                       # 690
     v_t_q = v_q.transpose(-1, -2)                                                  # v_norm.T (696)
-    out = _mm(fm_av, p_q, s_p, v_t_q, s_v)                                         # 696
+    out = _mm(fm_av, p_q, s_p, v_t_q, s_v, role="pv")                                         # 696
     return out.to(torch.bfloat16)                                                  # 696-698
 
 
