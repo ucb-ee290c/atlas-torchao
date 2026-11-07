@@ -88,6 +88,9 @@ a consumer or the producer has residual passes, `|k| > 20`, or an exactness guar
 4. Sites still outside 122..128: `pack_fold_summary.outside_after_sites` and `verify_bundle.json pack_fold`; each has its plan (attention p: one `vmul` of
    `recip(sum)` by `2^k` per (head, 32-row block), as in pack-range-options.md 4.C1).
 5. `pack_fold.applied == false` with `reason: in_range` means nothing was needed.
+6. A site that is still outside the range but whose `pack_plan` says `cost: free` (`fold_free: true`) was REFUSED by a guard: `pack_plan` does not know the guards, so
+   its free placement is not valid for that site; read `pack_fold.reason` (for example `attention_site_called_more_than_once`, `non_static_or_attention_consumer`) and use the
+   compiler's `vmul` fallback. `verify_bundle.json` `pack_fold.planned_free_but_refused` counts them (SmolVLA: 40; TinyLlama, DiT, Pi0: 0 [DiT and Pi0 from the plan, not from a bundle]).
 
 ## Validation
 
@@ -100,6 +103,16 @@ an export made with `--pack-fold` (in-process capture) replaces the export and k
 (`atlas.quantize_act`, `qlinear`, `pv_matmul`) for several `(s, k)`, including a negative control that shows the comparison is not vacuous (leaving the
 consumer weight exponent alone, or not moving the pack exponent with the value, changes the output). Default export: no `pack_fold*` / `pv_pop_shift` keys,
 no `<dir>.unfolded`, and the FX graph of the unfolded export has no `pop_shift` argument.
+
+### Default exports against the base commit (measured)
+
+Tiny random Llama (2 layers, static recipe), exported and captured (`atlas.quantize_act` native FP8, fresh_process off) once with the code of the base commit
+4ddedee (`git archive`, scratch copy) and once with this branch, no `--pack-fold`: every one of the 49 exported tensors is `torch.equal` (dtype too); `policy.json`
+is byte identical (same `policy_sha256`); `manifest.json` is equal apart from `created_utc`, the commit / branch / argv provenance, the safetensors header-dependent file sha256 and
+three calibration timings (`hw_aware.timing_s`); `fx/graph.txt`, `graph_signature.txt`, `parity.json`, `buffer_inventory.json`, `graph_inspection.json`, the fx `policy.json`
+and all fixture tensors are byte / value identical; the saved `model.pt2` files give `torch.equal` logits. The `model.pt2` file sizes differ (1,172,121 against 1,146,521 bytes) while their
+graphs are identical; **[inference]** the cause is the source paths of the two trees that the exporter embeds in each node's stack trace (the two scratch trees have paths of
+different length); this was not isolated.
 
 ### Real TinyLlama (post-hoc fold of the existing export, no re-calibration)
 
@@ -137,6 +150,9 @@ Logits, unfolded versus folded FX bundle (`scripts/tile_flow/compare_fx_logits.p
 sequences, seed 0), 16,384,000 logits compared: **0 differing logits, max abs difference 0.0, byte identical**. This is the FX emulation with the
 framework's float32 accumulation; no BF16-accumulation or hardware run was made.
 
+Eager path on the real model: the two `fixtures.safetensors` (seed-0 cases, [1, 64] token ids, equal in both bundles) hold the eager outputs of the two exports:
+`case_0.output_0` and `case_1.output_0` are `torch.equal` (0 differing of 2,048,000 each).
+
 Not re-measured here: the byte identity of the FP8 codes on real activations (0 of 116,654,080 differing, measured in pack-range-options.md section 1);
 the end-to-end logits comparison covers it indirectly (a differing code would change a logit; the negative control above shows a wrong fold does).
 
@@ -172,7 +188,7 @@ failures (smallest effective multiplier 1.06e-6, largest 30.1); a BF16 `(1 + w)`
 
 DiT and Pi0 were not validated end to end. DiT: re-capturing even the UNFOLDED existing export with the current code fails before the fold is involved
 (`KeyError: export policy has no quantized site 'noise_predictor.transformer_blocks.0.attn'`; the export predates the DiT attention sites that `_dit_rope_attention`
-now routes through `ref_attention`), and a new DiT export is a long run. Pi0's capture takes about 1,549 s. Their P.V, LayerNorm and `(1 + w)` folds are therefore covered
+now routes through `ref_attention`), and a new DiT export is a long run. Pi0's one-step capture took 1,549 s according to docs/algos/dit-pi0-full-graph-plan.md (not re-run here). Their P.V, LayerNorm and `(1 + w)` folds are therefore covered
 by the synthetic tests and the SmolVLA / TinyLlama runs of the same code paths, not by a bundle of their own.
 
 ## Limits and open items

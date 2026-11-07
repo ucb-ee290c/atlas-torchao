@@ -198,6 +198,9 @@ def pack_fold_report(policy, plan_report):
            "admitted_range": rec.get("admitted_range")}
     s = policy.get("pack_fold_summary")
     if s:
+        # pack_plan does not know the fold guards: a site still outside whose plan says cost "free" was REFUSED (pack_fold.reason), its free
+        # placement is not valid (shared attention site, dynamic consumer, ...); the compiler's vmul fallback applies
+        out["planned_free_but_refused"] = (rec.get("outside_by_cost") or {}).get("free", 0)
         out.update({"sites_folded": s["sites_folded"], "outside_before_fold": s["outside_before"],
                     "outside_after_fold_recorded": s["outside_after"], "folded_by_class": s["folded_by_class"],
                     "recorded_matches_recomputed": s["outside_after"] == rec.get("sites_outside"),
