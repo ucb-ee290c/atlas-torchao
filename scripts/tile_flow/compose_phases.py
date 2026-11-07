@@ -18,6 +18,7 @@ usage (PYTHONPATH=<worktree>/src):
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -83,6 +84,7 @@ def compose_pi0(a):
     kv_shape = manifest["graphs"]["prefix"]["outputs"]["kv_cache"]["per_tensor_shape"]
     res = {"phases_dir": str(ph), "single_step_bundle": str(ss), "one_step": [], "ok": True}
     one = torch.tensor(1.0, dtype=torch.float32)
+    one_step_out = {}
     with torch.no_grad():
         for i, case in enumerate(parity["cases"]):
             ins = [fx_ss[k] for k in case["inputs"]]
@@ -99,6 +101,7 @@ def compose_pi0(a):
                    "single_step_graph_equals_recorded_fixture": _bytes_equal(same, want),
                    "max_abs_diff_vs_recorded_fixture": _diff(out, want)}
             res["one_step"].append(row)
+            one_step_out[i] = out
             res["ok"] &= row["composition_equals_single_step_graph_same_process"] and row["kv_shapes_match_manifest"]
         if a.eager_loop:
             sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -107,19 +110,41 @@ def compose_pi0(a):
 
             model, _ = ppc.load_pi0(a.eager_loop, a.openpi_dir, a.checkpoint_dir, a.tokenizer_path)
             loops = []
+            want_cases = range(len(parity["cases"])) if a.eager_cases is None else a.eager_cases
             for i, case in enumerate(parity["cases"]):
+                if i not in want_cases:
+                    continue
                 ins = [fx_ss[k] for k in case["inputs"]]
                 obs = ppc.SimpleNamespace(
                     images=dict(zip(ppc.KEYS, ins[:3])), image_masks=dict(zip(ppc.KEYS, ins[3:6])), state=ins[8],
                     tokenized_prompt=ins[6], tokenized_prompt_mask=ins[7], token_ar_mask=torch.zeros_like(ins[7]),
                     token_loss_mask=torch.zeros_like(ins[7]))
+                t0 = time.time()
                 eager = model.sample_actions("cpu", obs, noise=ins[9], num_steps=manifest["denoising_steps"])
+                t_eager = time.time() - t0
+                t0 = time.time()
                 pad, *kv = pre(*ins[:8])
                 graph, calls = pi0_host_loop(stp, ins[8], pad, ins[9], kv, manifest)
+                t_graph = time.time() - t0
+                neq = int((graph != eager).sum())
                 loops.append({"case": i, "step_graph_calls": calls, "prefix_graph_calls": 1,
                               "bytes_equal": _bytes_equal(graph, eager), "max_abs_diff": _diff(graph, eager),
+                              "differing_elements": neq, "elements": graph.numel(),
+                              "eager_seconds": round(t_eager, 1), "composed_loop_seconds": round(t_graph, 1),
                               "shape": list(graph.shape), "dtype": str(graph.dtype)})
+                if a.cache_dir:
+                    Path(a.cache_dir).mkdir(parents=True, exist_ok=True)
+                    torch.save({"eager": eager, "composed": graph}, Path(a.cache_dir) / f"loop_case{i}.pt")
+                if not loops[-1]["bytes_equal"]:
+                    # step-1 localisation: eager sample_actions(num_steps=1) vs the composed one-step graphs
+                    e1 = model.sample_actions("cpu", obs, noise=ins[9], num_steps=1)
+                    loops[-1]["step1_check"] = {
+                        "composed_one_step_vs_eager_num_steps_1_max_abs": _diff(one_step_out[i], e1),
+                        "differing_elements": int((one_step_out[i] != e1).sum()),
+                        "bytes_equal": _bytes_equal(one_step_out[i], e1)}
                 res["ok"] &= loops[-1]["bytes_equal"]
+                Path(a.out).write_text(json.dumps(res, indent=1))   # partial result survives a kill
+                print(json.dumps(loops[-1], indent=1), flush=True)
             res["host_loop_vs_eager_sample_actions"] = loops
     Path(a.out).write_text(json.dumps(res, indent=1))
     print(json.dumps(res, indent=1))
@@ -134,6 +159,8 @@ def main(argv=None):
     ap.add_argument("out")
     ap.add_argument("--eager-loop", metavar="EXPORT_DIR")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--eager-cases", type=int, nargs="*", default=None, help="pi0: only these case indices for the eager loop")
+    ap.add_argument("--cache-dir", default=None, help="pi0: save eager and composed loop outputs here")
     ap.add_argument("--openpi-dir")
     ap.add_argument("--checkpoint-dir")
     ap.add_argument("--tokenizer-path", default="/scratch2/lorenhung/models/big_vision/paligemma_tokenizer.model")

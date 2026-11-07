@@ -114,7 +114,7 @@ Capture wall clock (host load average about 40): prefix 40 minutes (16:05 to 16:
 One step with the existing bundle's own fixture inputs: `prefix`, then `step` at time 1.0, then `x = noise + (-1.0) * v` (the single-step bundle is `sample_actions(num_steps=1)`), against the existing single-step `model.pt2` (cameras stacked, one SigLIP call) run in the same process:
 **byte-identical on both cases, max abs difference 0.0**, 36 K/V tensors with the manifest's shape. This is also real-weight evidence that stacking the cameras equals three SigLIP calls for this bundle (the plan's section 5 item 4 had only tiny-model evidence).
 Against the *recorded fixtures* of the existing bundle both cases differ (max abs 0.036 and 0.045); the existing single-step graph itself differs from its own recorded fixture by the same amount, so as for DiT this is a property of the existing bundle in this environment, not of the phase split.
-The 10-step host loop against eager `sample_actions(num_steps=10)` (`compose_phases.py pi0 ... --eager-loop`) is implemented but **did not finish**: the run was killed at the deadline after about 20 minutes (model load plus two eager 10-step passes on a loaded host), so there is no number for it. The DiT host loop (100 steps) was run, see section 3.
+The 10-step host loop against eager `sample_actions(num_steps=10)` (`compose_phases.py pi0 ... --eager-loop`) first did not finish (killed at the deadline); it was completed afterwards, see "Pi0 10-step loop check" below. The DiT host loop (100 steps) was run, see section 3.
 
 ## How a compiler owner consumes it
 
@@ -126,7 +126,60 @@ The 10-step host loop against eager `sample_actions(num_steps=10)` (`compose_pha
 
 ## What is left / not verified
 
-* Pi0: the 10-step host loop against eager `sample_actions(num_steps=10)` was not completed (above); the Pi0 phases were composed for one step only. Size: the Pi0 `model.pt2` files are 4.3 GB (prefix) and 4.1 GB (step), as large as the single-step bundle, because a non-strict export keeps the code / exponent buffers of the modules a phase never calls as lifted graph inputs that no node reads (listed in `graph_inspection.json` `unused_quantized_modules[*].buffers_lifted_unused`); a consumer must ignore them, and the DiT strict bundles do not have them (155 MB step, 184 MB encode). Pruning them from the saved program is not done.
+* Pi0: the 10-step host loop was checked against eager on 2 recorded cases only (below), on this host with OMP/MKL threads 8. Size: the Pi0 `model.pt2` files are 4.3 GB (prefix) and 4.1 GB (step), as large as the single-step bundle, because a non-strict export keeps the code / exponent buffers of the modules a phase never calls as lifted graph inputs that no node reads (listed in `graph_inspection.json` `unused_quantized_modules[*].buffers_lifted_unused`); a consumer must ignore them, and the DiT strict bundles do not have them (155 MB step, 184 MB encode). Pruning them from the saved program is not done.
 * No unrolled whole-inference graph (plan item 6), no strict Pi0 export (items 7, 8), no hardware or RTL check; all numerics are the framework reference emulation.
-* The DiT recorded-fixture discrepancy above is open.
+* The recorded-fixture discrepancy (DiT and Pi0) is open; see "Fixture reproducibility finding" below for what was and was not ruled out.
 * The scheduler table is float32 values written as JSON floats; a consumer that recomputes the coefficients in another precision will not be byte-identical to diffusers.
+
+## Pi0 10-step loop check
+
+Run (atlas-pi0 env, torch 2.7.1, host `bwrcix-1`, `run_eager_loop.sh` in the phases directory; load average 26 at start, 45 at the end):
+
+```
+taskset -a -c 0-15 env OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 /scratch2/lorenhung/envs/atlas-pi0/bin/python scripts/tile_flow/compose_phases.py pi0 \
+  <exports-tile>/pi0/gptq_panel_static_noawq_phases <exports-tile>/pi0/gptq_panel_static_noawq <phases>/compose_phases_eager.json \
+  --eager-loop <exports-tile>/pi0/gptq_panel_static_noawq/export --openpi-dir /scratch2/lorenhung/atlas-fp8/openpi \
+  --checkpoint-dir /scratch2/lorenhung/models/openpi-pytorch/pi0_droid_jointpos_polaris --cache-dir <phases>/eager_loop_cache
+```
+
+Wall clock 18:28:41 to 18:38:25 (9.7 minutes: model load, the one-step checks, then per case an eager pass and a composed pass). **Nothing was reduced**: both cases, full
+10 steps for both the eager and the composed loop, one run each. (The earlier 20-minute kill was not a property of the loop: each 10-step pass took 63 to 65 seconds here.)
+
+| case | composed loop: 1 `prefix` + 10 `step` calls, host Euler loop of `loop_manifest.json` | eager `sample_actions(num_steps=10)`, same noise (`ins[9]`) | max abs difference | differing elements | byte-identical |
+|---|---|---|---|---|---|
+| 0 | [1, 10, 32] float32 | same | 0.0 | 0 of 320 | yes |
+| 1 | [1, 10, 32] float32 | same | 0.0 | 0 of 320 | yes |
+
+`ok: true`. Because the composed loop equals eager there was no mismatch to localise, so the step-1 comparison code (added to `compose_phases.py`: eager `num_steps=1` against the composed one-step output, run only on a mismatch) did not execute and is untested.
+The one-step checks in the same run again gave composition equals the existing single-step graph (max abs 0.0, both cases). Caveats: equality is shown in one process at one thread count (8); only the two recorded fixture inputs
+(one noise draw each) were used, not a sample of observations; the eager reference is the quantized-emulation model, so this is a consistency check of the phase split and host loop, not an accuracy check.
+`compose_phases.json` in the phases directory now holds this run (with a `run` block); the previous one-step-only file is kept as `compose_phases_onestep_omp4.json`. Script changes: `--eager-cases`, `--cache-dir`,
+partial JSON written after each case, `differing_elements` and timings per case.
+
+## Fixture reproducibility finding
+
+Hypothesis tested: the recorded `fixtures.safetensors` came from a different host, CPU or torch build. Recorded provenance (`fx/fx_manifest.json`, `bundle_manifest.json`) against this session:
+
+| | recorded | now |
+|---|---|---|
+| Pi0 single-step bundle `gptq_panel_static_noawq` | host `bwrcix-1.EECS.Berkeley.EDU`, torch `2.7.1+cu126`, python 3.11.17, torchao 0.12.0, commit `45edd84` (tile-aware, dirty: true), capture source `79628ee`; `fixtures.safetensors` mtime 2026-11-06 13:14:31 | `bwrcix-1.EECS.Berkeley.EDU`, torch `2.7.1+cu126` (atlas-pi0 env) |
+| DiT single-step bundle `atlas_v1_awq_tile_static_attn` | host `bwrcix-1.EECS.Berkeley.EDU`, torch `2.11.0+cpu`, python 3.12.15, torchao 0.18.0+cpu, commit `6b1b358` (tile-dit-attn, dirty: false); fixtures mtime 2026-11-06 13:04:34 | `bwrcix-1.EECS.Berkeley.EDU`, torch `2.11.0+cpu` (atlas-lerobot env) |
+| CPU | not recorded (no `created_utc`, no CPU model, no thread count or ISA setting in any manifest; the mtimes above are the only timestamps) | Intel Xeon Platinum 8380 (Ice Lake), AVX-512 incl. VNNI, no `avx512_bf16`, no AMX |
+
+Result: host name and torch build **match** for both bundles, so the "different host / different torch build" part of the hypothesis is not supported by the provenance. It cannot be fully excluded: the CPU model and the process
+environment of the recording run were not recorded, and a hostname does not prove the same CPU. The other hosts in `~/.ssh/config` (`workhorse`, `merlin-a/b/c`, `merlin-compute-1/2`, `merlin-w1`, `tvm-chunk-f2`) are AWS instances reached via SSM; with `BatchMode` `workhorse` timed out
+at banner exchange and the others returned `TargetNotConnected` (stopped). No bundle was produced there (paths are `/scratch2` on this host), so nothing was checked on another machine; the two `atlas-hw-*` boxes were not touched.
+
+One further observation made while doing this (not the asked hypothesis, a side finding): **the Pi0 single-step graph's output depends on the intra-op thread count.** `scripts/tile_flow/pi0_thread_repro.py N OUTDIR` (load `model.pt2`,
+run both recorded cases, `torch.set_num_threads(N)`, same process otherwise; results in `thread_repro.jsonl`), run with `taskset -c 0-15` and OMP/MKL = N:
+
+| threads | case 0 max abs vs fixture | case 1 max abs vs fixture | differing elements vs fixture |
+|---|---|---|---|
+| 1 | 0.03618 | 0.04545 | 320 of 320 (both) |
+| 4 | 0.03642 | 0.04545 | 320 of 320 (both) |
+| 8 | 0.03815 | 0.05568 | 320 of 320 (both) |
+
+Between thread counts (same graph, same inputs): case 0 differs in 320 of 320 elements for 1 vs 4 (max 0.0443), 1 vs 8 (0.0401), 4 vs 8 (0.0416); case 1: 1 vs 4 identical, 1 vs 8 and 4 vs 8 differ in 320 elements (max 0.0474).
+So a change of thread count alone moves the output by about the same size as the fixture mismatch (0.036 to 0.056), and none of the three tested counts reproduces the fixture. (The DiT section above reports thread counts 1 to 16 giving the same DiT result; that was not re-run.)
+What this supports: a fixture recorded at a different thread count, or under different CPU load, would not reproduce bit-exactly. What it does not show: the thread count (or anything else) of the recording run, nor which setting would reproduce the fixture. The recorded run's
+thread count could be probed by trying more counts (2, 3, 5 to 16, 32+), which was not done. For DiT the cause is still not found. Practical consequence stays as stated in section 3: use same-process comparisons, and fix the thread count when comparing across runs.
