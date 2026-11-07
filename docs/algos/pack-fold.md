@@ -106,6 +106,8 @@ no `<dir>.unfolded`, and the FX graph of the unfolded export has no `pop_shift` 
 Folded bundle: `/scratch2/lorenhung/atlas-fp8/exports-tile-fold/tinyllama/atlas_v1_awq_tile_static_packfold/` (`export/` folded export, `fx/` new capture
 of the folded export at `--seqlen 64`, `verify_bundle.json`, `compare_fx_logits.json`, `bundle_manifest.json`). Source (read only):
 `/scratch2/lorenhung/atlas-fp8/exports-tile/tinyllama/atlas_v1_awq_tile_static`.
+The folded export was written by commit 6998f63; re-folding with the final code reproduces its `policy.json` byte for byte (`cmp`) and the same tensors
+(`torch.equal` on every tensor; the safetensors file bytes differ only in the run-dependent header).
 
 | | before | after the fold |
 |---|---|---|
