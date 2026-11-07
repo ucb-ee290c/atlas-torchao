@@ -114,7 +114,7 @@ Capture wall clock (host load average about 40): prefix 40 minutes (16:05 to 16:
 One step with the existing bundle's own fixture inputs: `prefix`, then `step` at time 1.0, then `x = noise + (-1.0) * v` (the single-step bundle is `sample_actions(num_steps=1)`), against the existing single-step `model.pt2` (cameras stacked, one SigLIP call) run in the same process:
 **byte-identical on both cases, max abs difference 0.0**, 36 K/V tensors with the manifest's shape. This is also real-weight evidence that stacking the cameras equals three SigLIP calls for this bundle (the plan's section 5 item 4 had only tiny-model evidence).
 Against the *recorded fixtures* of the existing bundle both cases differ (max abs 0.036 and 0.045); the existing single-step graph itself differs from its own recorded fixture by the same amount, so as for DiT this is a property of the existing bundle in this environment, not of the phase split.
-10-step host loop against eager `sample_actions(num_steps=10)`: NOT RUN at the time of this commit (see the update below if present).
+The 10-step host loop against eager `sample_actions(num_steps=10)` (`compose_phases.py pi0 ... --eager-loop`) is implemented but **did not finish**: the run was killed at the deadline after about 20 minutes (model load plus two eager 10-step passes on a loaded host), so there is no number for it. The DiT host loop (100 steps) was run, see section 3.
 
 ## How a compiler owner consumes it
 
@@ -126,6 +126,7 @@ Against the *recorded fixtures* of the existing bundle both cases differ (max ab
 
 ## What is left / not verified
 
+* Pi0: the 10-step host loop against eager `sample_actions(num_steps=10)` was not completed (above); the Pi0 phases were composed for one step only. The Pi0 prefix `model.pt2` is 4.3 GB (the single-step bundle's is the same size); the two Pi0 phase bundles together are about 4.3 GB plus the step graph.
 * No unrolled whole-inference graph (plan item 6), no strict Pi0 export (items 7, 8), no hardware or RTL check; all numerics are the framework reference emulation.
 * The DiT recorded-fixture discrepancy above is open.
 * The scheduler table is float32 values written as JSON floats; a consumer that recomputes the coefficients in another precision will not be byte-identical to diffusers.
