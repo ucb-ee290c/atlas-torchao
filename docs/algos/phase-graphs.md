@@ -126,7 +126,7 @@ The 10-step host loop against eager `sample_actions(num_steps=10)` (`compose_pha
 
 ## What is left / not verified
 
-* Pi0: the 10-step host loop against eager `sample_actions(num_steps=10)` was not completed (above); the Pi0 phases were composed for one step only. The Pi0 prefix `model.pt2` is 4.3 GB (the single-step bundle's is the same size); the two Pi0 phase bundles together are about 4.3 GB plus the step graph.
+* Pi0: the 10-step host loop against eager `sample_actions(num_steps=10)` was not completed (above); the Pi0 phases were composed for one step only. Size: the Pi0 `model.pt2` files are 4.3 GB (prefix) and 4.1 GB (step), as large as the single-step bundle, because a non-strict export keeps the code / exponent buffers of the modules a phase never calls as lifted graph inputs that no node reads (listed in `graph_inspection.json` `unused_quantized_modules[*].buffers_lifted_unused`); a consumer must ignore them, and the DiT strict bundles do not have them (155 MB step, 184 MB encode). Pruning them from the saved program is not done.
 * No unrolled whole-inference graph (plan item 6), no strict Pi0 export (items 7, 8), no hardware or RTL check; all numerics are the framework reference emulation.
 * The DiT recorded-fixture discrepancy above is open.
 * The scheduler table is float32 values written as JSON floats; a consumer that recomputes the coefficients in another precision will not be byte-identical to diffusers.
