@@ -13,6 +13,7 @@ still_emulated. A saved native bundle needs `import atlas_fx_ops` before torch.e
 from __future__ import annotations
 
 import argparse
+import collections
 import contextlib
 import hashlib
 import json
@@ -477,10 +478,12 @@ def _check_act(label, act, rule, storage, depends_on_input):
                                   f"rows={getattr(rule, 'rows', 32)}")
 
 
-def _inspect_native_site(path, layer, site, rule, nodes, lifted, depends_on_input, storage):
-    """One Linear (or Conv2d) = one atlas.qlinear (atlas.qconv2d) node fed directly by the lifted code and
-    exponent buffers and by one atlas.quantize_act node whose input depends on the user input; nothing
-    else decodes or contracts in its scope (a Conv2d keeps its visible im2col)."""
+def _inspect_native_site(path, layer, site, rule, nodes, lifted, depends_on_input, storage, calls=1):
+    """One Linear (or Conv2d) call = one atlas.qlinear (atlas.qconv2d) node fed directly by the lifted code and
+    exponent buffers and by its own atlas.quantize_act node whose input depends on the user input; nothing
+    else decodes or contracts in its scope (a Conv2d keeps its visible im2col). A module the boundary calls
+    `calls` times (the eager replay's count, 1 by default) has exactly `calls` such nodes, each with its own
+    quantize_act, all sharing the one code / exponent buffer pair."""
     import atlas_fx_ops
 
     conv = type(layer).__name__ == "RefQuantConv2d"
@@ -494,43 +497,55 @@ def _inspect_native_site(path, layer, site, rule, nodes, lifted, depends_on_inpu
         raise FXVerificationError(f"{layer.layer_name}: graph consumes the float placeholder")
     mine = [n for n in nodes if n.op == "call_function" and n.target == op
             and n.args[2] is code and n.args[3] is exp]
-    if len(mine) != 1 or set(code.users) != set(mine) or set(exp.users) != set(mine):
-        raise FXVerificationError(f"{layer.layer_name}: expected exactly one {op} consuming "
+    if len(mine) != calls or set(code.users) != set(mine) or set(exp.users) != set(mine):
+        what = "exactly one" if calls == 1 else f"exactly {calls} (the eager replay's call count),"
+        raise FXVerificationError(f"{layer.layer_name}: expected {what} {op} consuming "
                                   f"the code and exponent buffers directly, found {len(mine)}")
-    q = mine[0]
-    x_codes, x_exp, _, _, q_bias, out_dtype, weight_format = q.args[:7]
-    act = _act_source(x_codes, 0)
-    if act is None or act is not _act_source(x_exp, 1):
-        raise FXVerificationError(f"{layer.layer_name}: {op} is not fed by one atlas.quantize_act")
-    _check_act(layer.layer_name, act, rule, storage, depends_on_input)
-    if out_dtype != str(layer.weight.dtype).replace("torch.", "") or weight_format != atlas_fx_ops.WEIGHT_FORMAT:
-        raise FXVerificationError(f"{layer.layer_name}: {op} dtype/format attributes differ from the layer")
-    if (layer.bias is None) != (q_bias is None) or (bias is not None and q_bias is not bias):
-        raise FXVerificationError(f"{layer.layer_name}: bias is not consumed by {op}")
+    acts = []
+    for q in mine:
+        x_codes, x_exp, _, _, q_bias, out_dtype, weight_format = q.args[:7]
+        act = _act_source(x_codes, 0)
+        if act is None or act is not _act_source(x_exp, 1) or act in acts:
+            raise FXVerificationError(f"{layer.layer_name}: {op} is not fed by one atlas.quantize_act of its own")
+        _check_act(layer.layer_name, act, rule, storage, depends_on_input)
+        if out_dtype != str(layer.weight.dtype).replace("torch.", "") or weight_format != atlas_fx_ops.WEIGHT_FORMAT:
+            raise FXVerificationError(f"{layer.layer_name}: {op} dtype/format attributes differ from the layer")
+        if (layer.bias is None) != (q_bias is None) or (bias is not None and q_bias is not bias):
+            raise FXVerificationError(f"{layer.layer_name}: bias is not consumed by {op}")
+        acts.append(act)
     scope = [n for n in nodes if n.op == "call_function" and _scope(n) == path]
     allowed = ALLOWED_NATIVE_SCOPE_TARGETS | (CONV_SCOPE_TARGETS if conv else set())
-    stray = sorted({str(n.target) for n in scope if n.target not in allowed and n not in (q, act)})
+    stray = sorted({str(n.target) for n in scope if n.target not in allowed and n not in mine and n not in acts})
     if stray:
         raise FXVerificationError(f"{layer.layer_name}: decode/contraction ops remain in the layer: {stray}")
     row = {"site": layer.layer_name, "module": path, "kind": "conv2d" if conv else "linear", "native": True,
+           "calls": calls,
            "code_buffer": prefix + "weight_codes", "scale_buffer": prefix + "weight_scale_exp",
            "code_dtype": str(layer.weight_codes.dtype).replace("torch.", ""),
-           "qlinear" if not conv else "qconv2d": q.name, "quantize_act": act.name,
+           "qlinear" if not conv else "qconv2d": mine[0].name, "quantize_act": acts[0].name,
            "activation_rule": {"mode": rule[0], "reduce": rule[1], "rule": rule[2], "static_exp": rule[3]},
            "nodes_in_scope": [n.name for n in scope]}
+    if calls > 1:                                    # per-call node names (the keys above name the first call)
+        row["qlinear_nodes" if not conv else "qconv2d_nodes"] = [n.name for n in mine]
+        row["quantize_act_nodes"] = [a.name for a in acts]
     if conv:
         row["im2col_nodes"] = [n.name for n in scope if n.target == torch.ops.aten.im2col.default]
-        if len(row["im2col_nodes"]) != 1:
-            raise FXVerificationError(f"{layer.layer_name}: expected one im2col node before quantize_act")
+        if len(row["im2col_nodes"]) != calls:
+            raise FXVerificationError(f"{layer.layer_name}: expected {calls} im2col node(s) before quantize_act, "
+                                      f"found {len(row['im2col_nodes'])}")
     return row
 
 
-def _inspect_native_attention(plan_attention, nodes, storage, depends_on_input, claimed_acts):
+def _inspect_native_attention(plan_attention, nodes, storage, depends_on_input, claimed_acts, attn_calls=None,
+                              absent=None):
     """Attention: every Q.K / P.V is an atlas.qk_matmul / atlas.pv_matmul whose operands are the codes and
     exponents of quantize_act nodes tagged "<site>:<operand>", carrying the policy's operand rules and
     depending on the user input; the P.V input depends on a Q.K output through the (visible) softmax chain.
     Matched by tag, not by module scope: a module called as `module.forward(...)` (SmolVLA's text/expert
-    stack) is not on the nn_module_stack, so its nodes carry the caller's scope. Returns one row per site."""
+    stack) is not on the nn_module_stack, so its nodes carry the caller's scope. Returns one row per site.
+    attn_calls: {site: calls per case} counted by tag in the eager replay; when given, each site has exactly that
+    many Q.K / P.V pairs (a site called N times has N pairs). absent: {module path: site} of attention modules the
+    boundary never calls; none of their tagged quantize_act nodes may be in the graph."""
     qks = [n for n in nodes if n.op == "call_function" and n.target == torch.ops.atlas.qk_matmul.default]
     pvs = [n for n in nodes if n.op == "call_function" and n.target == torch.ops.atlas.pv_matmul.default]
     acts = [n for n in nodes if n.op == "call_function" and n.target == torch.ops.atlas.quantize_act.default
@@ -561,6 +576,21 @@ def _inspect_native_attention(plan_attention, nodes, storage, depends_on_input, 
     if len(qks) != len(pvs) or covered != set(acts):
         raise FXVerificationError(f"attention: {len(qks)} Q.K, {len(pvs)} P.V and {len(acts)} unclaimed quantize_act nodes "
                                   f"do not pair up ({len(covered)} covered)")
+    if attn_calls is not None:
+        for key, n_calls in attn_calls.items():
+            have = len(per_site.get(key, {"qk_matmul": []})["qk_matmul"])
+            if have != n_calls:
+                raise FXVerificationError(f"attention site {key!r}: the eager replay called it {n_calls} time(s) per case "
+                                          f"but the graph has {have} Q.K / P.V pair(s)")
+        for key in per_site:
+            if key not in attn_calls:
+                raise FXVerificationError(f"attention site {key!r} is in the graph but the eager replay never called it")
+    for path, site in (absent or {}).items():
+        tag = (site if site is not None else "") + ":"
+        if any(str(n.args[6]).startswith(tag) for n in nodes if n.op == "call_function"
+               and n.target == torch.ops.atlas.quantize_act.default and len(n.args) > 6):
+            raise FXVerificationError(f"attention module {path} is declared never called but the graph holds its "
+                                      f"quantize_act nodes ({tag!r})")
     for pv in pvs:
         p_act = _act_source(pv.args[0], 0)
         if not any(n.target == torch.ops.atlas.qk_matmul.default for n in _ancestors(p_act, value_only=True)):
@@ -748,14 +778,20 @@ def _admission_report(policy, act_stats):
     return rep
 
 
-def inspect_graph(program, module, policy, plan=None, storage="uint8", unused=(), act_stats=None):
+def inspect_graph(program, module, policy, plan=None, storage="uint8", unused=(), act_stats=None, calls=None,
+                  attn_calls=None, unused_attention=None):
     """Verify real contraction dependencies, not buffer labels alone.
 
     plan: what `_native_sites` yielded ({"linear": {path: rule}, "conv2d": {path: rule}, "attention":
     {...} or None}) for a --native-fp8 capture. Those sites are checked by _inspect_native_site /
     _inspect_native_attention, the rest by the decode-graph rules below. `storage` is the code buffer
     dtype name the native nodes were captured with. `unused`: module paths of quantized layers the boundary
-    never calls (their buffers are not in the program); each must really be absent from the graph."""
+    never calls; each must really be absent from the graph (a strict export does not lift their buffers, a
+    non-strict one lifts them as inputs that nothing may consume).
+    calls: {module path: calls per case} of the quantized layers from the eager replay; a layer called N times
+    must have N nodes (default: 1 for every layer that is not in `unused`). attn_calls: {attention site: calls per
+    case} counted by tag (default: no count is enforced). unused_attention: {module path: site} of attention
+    modules the boundary never calls (pruned from the plan)."""
     native_paths = {**plan["linear"], **plan["conv2d"]} if plan else {}
     nodes = list(program.graph.nodes)
     by_name = {node.name: node for node in nodes}
@@ -787,13 +823,18 @@ def inspect_graph(program, module, policy, plan=None, storage="uint8", unused=()
         actual.add(site)
         if path in unused:
             prefix = path + "."
-            if lifted.get(prefix + "weight_codes") is not None or any(_scope(n) == path for n in nodes):
+            held = [lifted[prefix + b] for b in QUANT_BUFFERS if lifted.get(prefix + b) is not None]
+            if any(h.users for h in held) or any(_scope(n) == path for n in nodes):
                 raise FXVerificationError(f"{site}: never called by the eager replay but present in the graph")
-            unused_rows.append({"site": site, "module": path})
+            unused_rows.append({"site": site, "module": path,
+                                **({"buffers_lifted_unused": [h.name for h in held]} if held else {})})
             continue
+        expected_calls = 1 if calls is None else calls.get(path, 0)
+        if expected_calls < 1:
+            raise FXVerificationError(f"{site}: the eager replay called it {expected_calls} times but it is not listed as unused")
         if path in native_paths:
             rows.append(_inspect_native_site(path, layer, selected[site], native_paths[path], nodes, lifted,
-                                             depends_on_input, storage))
+                                             depends_on_input, storage, expected_calls))
             continue
         if layer.fm is not None or getattr(layer, "residual", None):
             raise FXVerificationError(f"{site}: initial FX path requires framework accumulation and no residual passes")
@@ -812,6 +853,9 @@ def inspect_graph(program, module, policy, plan=None, storage="uint8", unused=()
                 matches.append((node, node.args[left_index]))
         if not matches:
             raise FXVerificationError(f"{site}: no contraction consumes both codes and exponents")
+        if calls is not None and len(matches) != expected_calls:
+            raise FXVerificationError(f"{site}: the eager replay called it {expected_calls} time(s) but "
+                                      f"{len(matches)} contraction(s) consume its codes and exponents")
         rule = selected[site]["activation"]
         if rule.get("mode") == "static_per_step":
             raise FXVerificationError("mutable per-step activation scales are not supported")
@@ -835,7 +879,7 @@ def inspect_graph(program, module, policy, plan=None, storage="uint8", unused=()
                     raise FXVerificationError(f"{site}: live nc comparison is absent")
                 witnesses.append({"contraction": contraction.name,
                                   "frexp": sorted(node.name for node in exponents)})
-        rows.append({"site": site, "module": path, "kind": selected[site]["kind"],
+        rows.append({"site": site, "module": path, "kind": selected[site]["kind"], "calls": expected_calls,
                      "code_buffer": prefix + "weight_codes", "scale_buffer": prefix + "weight_scale_exp",
                      "contractions": [node.name for node, _ in matches],
                      "dynamic_scale_witnesses": witnesses})
@@ -853,10 +897,13 @@ def inspect_graph(program, module, policy, plan=None, storage="uint8", unused=()
                 raise FXVerificationError(f"{name}: unused float placeholder payload was retained")
     attention_rows = []
     if plan and plan["attention"]:
-        claimed = {by_name[row["quantize_act"]] for row in rows if row.get("native")}
-        attention_rows = _inspect_native_attention(plan["attention"], nodes, storage, depends_on_input, claimed)
+        claimed = {by_name[name] for row in rows if row.get("native")
+                   for name in row.get("quantize_act_nodes", [row["quantize_act"]])}
+        attention_rows = _inspect_native_attention(plan["attention"], nodes, storage, depends_on_input, claimed,
+                                                   attn_calls, unused_attention)
     report = {"weight_site_bindings": rows, "weight_sites_verified": len(rows),
               "unused_quantized_modules": unused_rows,
+              "unused_attention_modules": [{"site": site, "module": path} for path, site in sorted((unused_attention or {}).items())],
               "bf16_by_policy": _bf16_by_policy_report(program, nodes, module, policy),
               "functional_attention_sites": attention,
               "functional_attention_structural_binding": "not certified; covered by boundary output parity",
@@ -874,8 +921,11 @@ def inspect_graph(program, module, policy, plan=None, storage="uint8", unused=()
         report["native_fp8_sites"] = len(native_rows)
         report["native_fp8_linear_sites"] = sum(row["kind"] == "linear" for row in native_rows)
         report["native_fp8_conv2d_sites"] = sum(row["kind"] == "conv2d" for row in native_rows)
+        # nodes, not sites: a module called N times is one site and N qlinear nodes (calls == 1 everywhere: same numbers)
+        report["native_fp8_linear_calls"] = sum(row["calls"] for row in native_rows if row["kind"] == "linear")
+        report["native_fp8_conv2d_calls"] = sum(row["calls"] for row in native_rows if row["kind"] == "conv2d")
         report["native_fp8_attention_modules"] = attention_rows
-        report["still_emulated"] = _emulated_report(nodes, module, native_modules | set(unused))
+        report["still_emulated"] = _emulated_report(nodes, module, native_modules | set(unused) | set(unused_attention or {}))
         if not report["still_emulated"]["emulated_modules"]:
             # nothing is left to emulate, so no contraction may be fed by a decode (exp2 / frexp) anywhere
             for node in contractions:
@@ -923,16 +973,30 @@ def verify_saved(directory, device="cpu"):
     program = torch.export.load(directory / "model.pt2")
     expected_inventory = json.loads((directory / "buffer_inventory.json").read_text())
     code_dtype = STORAGE_DTYPES[native["storage"]] if native else torch.uint8
-    if not expected_inventory or _inventory(program.named_buffers(), code_dtype) != expected_inventory:
-        raise FXVerificationError("saved code/exponent inventory differs")
     inspected = json.loads((directory / "graph_inspection.json").read_text())
+    # A non-strict export lifts the buffers of quantized layers the boundary never calls as graph inputs. The saved
+    # inventory leaves them out, so they are excluded here only for modules the inspection declares unused, and only
+    # when no node consumes them.
+    declared_unused = [row["module"] for row in inspected.get("unused_quantized_modules", [])]
+    by_placeholder = {node.name: node for node in program.graph.nodes}
+    consumed = sorted(spec.target for spec in program.graph_signature.input_specs
+                      if isinstance(spec.target, str) and hasattr(spec.arg, "name")
+                      and spec.target.rpartition(".")[2] in QUANT_BUFFERS
+                      and any(spec.target.startswith(path + ".") for path in declared_unused)
+                      and by_placeholder[spec.arg.name].users)
+    if consumed:
+        raise FXVerificationError(f"declared unused, but the graph consumes: {consumed[:3]}")
+    if not expected_inventory or _without(_inventory(program.named_buffers(), code_dtype),
+                                          declared_unused) != expected_inventory:
+        raise FXVerificationError("saved code/exponent inventory differs")
     if native:
         counts = {name: sum(1 for n in program.graph.nodes if n.op == "call_function"
                             and n.target == getattr(torch.ops.atlas, name).default)
                   for name in ("qlinear", "qconv2d", "qk_matmul", "pv_matmul")}
         pairs = sum(row["pairs"] for row in inspected.get("native_fp8_attention_modules", []))
-        if (counts["qlinear"] != inspected.get("native_fp8_linear_sites")
-                or counts["qconv2d"] != inspected.get("native_fp8_conv2d_sites")
+        # per-node counts; bundles saved before call counting have one node per site
+        if (counts["qlinear"] != inspected.get("native_fp8_linear_calls", inspected.get("native_fp8_linear_sites"))
+                or counts["qconv2d"] != inspected.get("native_fp8_conv2d_calls", inspected.get("native_fp8_conv2d_sites"))
                 or counts["qk_matmul"] != pairs or counts["pv_matmul"] != pairs
                 or not any(counts.values())):
             raise FXVerificationError(f"saved graph's atlas operator counts {counts} differ from its inspection record")
@@ -960,16 +1024,47 @@ def verify_saved(directory, device="cpu"):
 
 def _observe_acts(module, cases):
     """Eager pass over the capture cases with the native quantize_act forwards installed, recording each
-    activation cast (ActStats). Run inside _native_sites; never under tracing."""
+    activation cast (ActStats) and, per case, how many times each label was cast (`stats.case_calls`).
+    Run inside _native_sites; never under tracing."""
     global _ACT_RECORDER
     _ACT_RECORDER = stats = ActStats()
+    stats.case_calls = []
     try:
         with torch.no_grad():
             for args in cases:
+                before = {label: e["calls"] for label, e in stats.sites.items()}
                 module(*args)
+                stats.case_calls.append({label: e["calls"] - before.get(label, 0) for label, e in stats.sites.items()})
     finally:
         _ACT_RECORDER = None
     return stats
+
+
+def _attention_calls(stats, plan_attention):
+    """({site: calls per case}, {module path: site} of the never-called attention modules). Counted by tag, not by
+    forward hooks: a module called as `module.forward(...)` fires no hook. Every operand of a site must be cast the
+    same number of times, in every case. Paths that share one site key (no algorithm) cannot be told apart, so they
+    are pruned only when the whole key was never cast."""
+    if not plan_attention:
+        return {}, {}
+    per_case = []
+    for counts in stats.case_calls:
+        by_key = {}
+        for label, n in counts.items():
+            key, _, operand = label.rpartition(":")
+            if ":" in label and operand in ("q", "k", "p", "v"):
+                by_key.setdefault(key, {})[operand] = n
+        for key, ops in by_key.items():
+            if sorted(ops) != ["k", "p", "q", "v"] or len(set(ops.values())) != 1:
+                raise FXVerificationError(f"attention site {key!r}: operands q, k, p, v were cast {ops} times")
+        per_case.append({key: next(iter(ops.values())) for key, ops in by_key.items()})
+    if any(c != per_case[0] for c in per_case[1:]):
+        raise FXVerificationError(f"attention sites are called a different number of times in different cases: {per_case}")
+    calls = per_case[0]
+    keys = {site if site is not None else "" for site in plan_attention["paths"].values()}
+    unused = {path: site for path, site in plan_attention["paths"].items()
+              if calls.get(site if site is not None else "", 0) == 0}
+    return {k: calls[k] for k in sorted(keys) if calls.get(k, 0)}, unused
 
 
 def capture_fx(module, cases, directory, *, policy, provenance=None, strict=True, fresh_process=True,
@@ -1004,12 +1099,15 @@ def capture_fx(module, cases, directory, *, policy, provenance=None, strict=True
         fixtures, parity, expected = {}, {"cases": []}, []
         # a quantized layer the boundary never calls has no node in the graph and its buffers are not lifted;
         # that is recorded (and checked against the eager replay), not silently tolerated
-        called = set()
-        hooks = [layer.register_forward_hook(lambda mod, inp, out, path=path: called.add(path))
+        # (the call count per quantized module, from the eager replay: 0 = absent from this graph, N = N nodes)
+        counter, case_calls = collections.Counter(), []
+        hooks = [layer.register_forward_hook(lambda mod, inp, out, path=path: counter.update([path]))
                  for path, layer in module.named_modules() if _is_quant_layer(layer)]
         with torch.no_grad():
             for i, args in enumerate(cases):
+                counter.clear()
                 leaves, spec = _leaves(module(*args))
+                case_calls.append(collections.Counter(counter))
                 outputs = [value.detach().cpu().clone() for value in leaves]
                 expected.append((outputs, spec))
                 input_keys = [f"case_{i}.input_{j}" for j in range(len(args))]
@@ -1019,13 +1117,18 @@ def capture_fx(module, cases, directory, *, policy, provenance=None, strict=True
                 parity["cases"].append({"inputs": input_keys, "outputs": output_keys, "output_spec": spec})
             for hook in hooks:
                 hook.remove()
+            if any(c != case_calls[0] for c in case_calls[1:]):
+                raise FXVerificationError("quantized modules are called a different number of times in different cases "
+                                          f"(data-dependent control flow): {[dict(c) for c in case_calls]}")
+            calls = case_calls[0]
             unused = sorted(path for path, layer in module.named_modules()
-                            if _is_quant_layer(layer) and path not in called)
+                            if _is_quant_layer(layer) and calls[path] == 0)
             report["unused_quantized_modules"] = unused
+            report["quantized_module_calls"] = {path: n for path, n in sorted(calls.items()) if n != 1}
             before = _without(_inventory(module.named_buffers()), unused)
             if not before:
                 raise FXVerificationError("no quantized weight buffers at this boundary")
-            native_info, baseline, act_stats = None, None, None
+            native_info, baseline, act_stats, attn_calls, unused_attention = None, None, None, {}, {}
             with _meta_placeholders(module):
                 if native_fp8:
                     if native_fp8 not in STORAGE_DTYPES:
@@ -1038,11 +1141,16 @@ def capture_fx(module, cases, directory, *, policy, provenance=None, strict=True
                             raise FXVerificationError("--native-fp8: no Linear site can be carried natively")
                         held = _without(_inventory(module.named_buffers(), STORAGE_DTYPES[native_fp8]), unused)
                         act_stats = _observe_acts(module, cases)
+                        attn_calls, unused_attention = _attention_calls(act_stats, plan["attention"])
+                        if unused_attention:         # absent from this graph; the export below runs without them
+                            plan["attention"] = {**plan["attention"], "paths": {
+                                p: s for p, s in plan["attention"]["paths"].items() if p not in unused_attention}}
                         program = torch.export.export(module, cases[0], strict=strict)
                     # the held buffers are a bitcast: same bytes, so same hash and shape as the uint8 codes
                     if any(held[k]["sha256"] != before[k]["sha256"] or held[k]["shape"] != before[k]["shape"]
                            for k in before):
                         raise FXVerificationError("native buffers differ in bytes from the uint8 codes")
+                    report["attention_site_calls"] = {k or "(no algorithm)": n for k, n in sorted(attn_calls.items()) if n != 1}
                     native_info = {"storage": native_fp8, "ops": ["atlas.quantize_act", "atlas.qlinear", "atlas.qconv2d", "atlas.qk_matmul",
                                            "atlas.pv_matmul"],
                                    "ops_module": "atlas_fx_ops", "weight_format": "atlas_e4m3",
@@ -1057,7 +1165,9 @@ def capture_fx(module, cases, directory, *, policy, provenance=None, strict=True
                         unused) != before:
                 raise FXVerificationError("capture changed code/exponent buffers")
             graph_report = inspect_graph(program, module, policy, plan if native_fp8 else None,
-                                         native_fp8 or "uint8", unused=unused, act_stats=act_stats)
+                                         native_fp8 or "uint8", unused=unused, act_stats=act_stats, calls=calls,
+                                         attn_calls=attn_calls if native_fp8 else None,
+                                         unused_attention=unused_attention if native_fp8 else None)
             if native_fp8:
                 for args, (outputs, spec) in zip(cases, expected):
                     _compare(program.module()(*args), _leaves(baseline.module()(*args))[0], spec)

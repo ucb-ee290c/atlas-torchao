@@ -72,6 +72,16 @@ def main(recipe_dir):
     if (d / "ppl_w16x512.json").exists():
         out.setdefault("quality", {})["ppl_file"] = "ppl_w16x512.json"
         out["quality"]["ppl"] = json.loads((d / "ppl_w16x512.json").read_text())["ppl"]
+    if (d / "loop_manifest.json").exists():       # per-phase bundles: the host loop around this graph (make_loop_manifest.py)
+        lm = json.loads((d / "loop_manifest.json").read_text())
+        phase = fxm["provenance"].get("phase")
+        graph = (lm.get("graphs") or {}).get(phase) or {}
+        out["loop_manifest"] = {"file": "loop_manifest.json", "sha256": sha(d / "loop_manifest.json"), "model": lm["model"],
+                                "denoising_steps": lm["denoising_steps"], "phase": phase,
+                                "calls_per_action_chunk": graph.get("calls_per_action_chunk"),
+                                "recorded_in_fx_manifest": fxm["provenance"].get("loop_manifest"),
+                                "matches_fx_manifest": (fxm["provenance"].get("loop_manifest") or {}).get("sha256")
+                                                       == sha(d / "loop_manifest.json")}
     (d / "bundle_manifest.json").write_text(json.dumps(out, indent=1))
     print("wrote", d / "bundle_manifest.json")
 
