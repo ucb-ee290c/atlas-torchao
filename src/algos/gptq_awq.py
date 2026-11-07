@@ -37,6 +37,10 @@ Parameters (--algo gptq_awq:k=v,...):
   damp=0.01                  GPTQ dampening (Sec. 4 Step 3: 1%)
   block=128                  GPTQ lazy-batch block (Sec. 4 Step 2: B = 128)
   grid=20                    AWQ alpha grid (Sec. 5.1)
+  dead_columns=zero|rtn      input channels with diag(H) == 0 (exactly zero calibration input): `zero` (default,
+                             the original behaviour) sets the weight column to 0; `rtn` (NEW, opt-in) casts it with
+                             plain round-to-nearest on the pinned grid and keeps it out of the error feedback
+                             (docs/algos/gptq-dead-columns.md)
   hessians=cpu|device        where the calibration Hessians are kept (NEW, default cpu). Each
                              batch's x^T x is computed on the activation's device and summed into
                              a float32 CPU accumulator; GPTQ / AWQ move one layer's H to the
@@ -55,6 +59,7 @@ column order would have to respect the blocks, which is not implemented here.
 from __future__ import annotations
 
 import hashlib
+import time
 import weakref
 
 import torch
@@ -64,12 +69,14 @@ import ref_numerics as rn
 from algos.base import Algo, Scale
 
 METHODS = ("gptq", "awq", "awq_gptq")
+DEAD_COLUMNS = ("zero", "rtn")
 # producer suffix -> consumer suffixes (relative to the decoder layer); NEW, see the docstring
 NORM_GROUPS = {
     "input_layernorm": ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"),
     "post_attention_layernorm": ("mlp.gate_proj", "mlp.up_proj"),
     "pre_feedforward_layernorm": ("mlp.gate_proj", "mlp.up_proj"),
 }
+SUBSAMPLE_TOKENS = 512        # NEW (awq_loss=cast): calibration tokens kept per fold group
 FOLD_TOL = 2.0 ** -6          # NEW: relative tolerance of the fold self-check (BF16 gamma rounding)
 
 
@@ -88,7 +95,8 @@ DAMP_RETRIES = 3              # NEW: on a failed Cholesky, retry with 10x then 1
 
 
 @torch.no_grad()
-def gptq(W: torch.Tensor, H: torch.Tensor, s, block=128, damp=0.01, actorder=True, info=None) -> torch.Tensor:
+def gptq(W: torch.Tensor, H: torch.Tensor, s, block=128, damp=0.01, actorder=True, info=None,
+         dead_columns="zero") -> torch.Tensor:
     """GPTQ Algorithm 1 (arXiv 2210.17323) with quant() = qdq(., s). W [out, in], H [in, in], s a
     scalar exponent or one per output row ([out, 1], as GPTQ's own per-row quantizer).
     Returns the dequantized weight (float32); every entry lies on the E4M3 x 2^s grid.
@@ -96,19 +104,36 @@ def gptq(W: torch.Tensor, H: torch.Tensor, s, block=128, damp=0.01, actorder=Tru
     If the dampened H cannot be factored (rounding in the float32 calibration sum can leave a
     large, badly scaled H slightly indefinite), the factorisation is retried with 10x and then 100x
     the dampening (NEW, as common GPTQ implementations do); `info["damp"]` records the value
-    used. The first attempt is exactly the paper's step, so a layer that factors is unchanged."""
+    used. The first attempt is exactly the paper's step, so a layer that factors is unchanged.
+
+    dead_columns (NEW; default "zero" is the original code path, bit for bit): a column with
+    diag(H) == 0 saw only exact zeros in calibration. "zero" sets W[:, col] = 0 (harmless on the
+    calibration data, destructive for any input that excites the channel). "rtn" keeps the column
+    and casts it with qdq(., s) on the same pinned exponent. Dead columns take no part in the error
+    feedback: H has zero cross terms for them (H[dead, dead] = 1 only), so GPTQ's own propagation
+    to and from them is zero, and the loop enforces that exactly (their error is not fed forward),
+    so the live columns are bit-identical to dead_columns="zero". `info["dead"]` = their count."""
+    if dead_columns not in DEAD_COLUMNS:
+        raise ValueError(f"gptq: dead_columns={dead_columns!r}; choose from {DEAD_COLUMNS}")
     s = torch.as_tensor(s, dtype=torch.int32, device=W.device)
     s = s.reshape(-1) if s.dim() == 2 else s                 # one exponent per entry of a column
     W = W.detach().clone().float()
+    W0 = W.clone() if dead_columns == "rtn" else None
     H = H.detach().clone().double().to(W.device)
     K = W.shape[1]
     dead = torch.diag(H) == 0
+    dead0 = dead
     H[dead, dead] = 1
-    W[:, dead] = 0
+    if dead_columns == "zero":
+        W[:, dead] = 0
+    if info is not None:
+        info["dead"] = int(dead.sum())
     perm = None
     if actorder:
         perm = torch.argsort(torch.diag(H), descending=True)
         W, H = W[:, perm], H[perm][:, perm]
+        dead = dead[perm]
+    skip_feedback = dead.tolist() if dead_columns == "rtn" and bool(dead.any()) else None
     eye = torch.eye(K, dtype=H.dtype, device=H.device)
     mean_diag = torch.mean(torch.diag(H))
     Hinv = None
@@ -137,20 +162,37 @@ def gptq(W: torch.Tensor, H: torch.Tensor, s, block=128, damp=0.01, actorder=Tru
             q = qdq(w, s)
             Q[:, i1 + i] = q
             err = (w - q) / Hinv1[i, i]
+            if skip_feedback is not None and skip_feedback[i1 + i]:
+                err = torch.zeros_like(err)                  # dead_columns=rtn: no feedback from a dead column
             W1[:, i:] -= err.unsqueeze(1) @ Hinv1[i, i:].unsqueeze(0)
             Err1[:, i] = err
         W[:, i2:] -= Err1 @ Hinv[i1:i2, i2:]
     if perm is not None:
         Q = Q[:, torch.argsort(perm)]
+    if W0 is not None and bool(dead0.any()):
+        Q[:, dead0] = qdq(W0[:, dead0], s.reshape(-1, 1) if s.dim() == 1 else s)       # dead_columns=rtn: exactly plain RTN on the pinned grid
     return Q
 
 
-def awq_search(Ws, H, sx, grid=20, exp_fn=None):
+def awq_search(Ws, H, sx, grid=20, exp_fn=None, producer=None):
     """(s, alpha, loss) minimizing sum over the group of tr(dW D H D dW^T), D = diag(1/s), with
     dW = Q(W diag(s)) - W diag(s) and Q the reference cast (exponent re-derived on W diag(s)), or
-    the cast at exp_fn(W diag(s)) when a stacked algorithm chooses the weight grid."""
+    the cast at exp_fn(W diag(s)) when a stacked algorithm chooses the weight grid.
+
+    producer (NEW, gptq_awq:producer_aware=true; default None leaves the loss untouched) is a dict
+    {"W": [I, K] producer rows, "H": [K, K] Hessian of the producer's input, "c": [I] row weights,
+    "exp_fn": the producer's weight-grid rule} and adds the quantization error of the producer
+    rows AFTER the fold, W_p[j] / s_j cast on the producer's own grid (a 32-row panel under
+    w=panel), seen through the pair: sum_j c_j e_j H_p e_j^T, e_j = s_j (Q(W_p[j] / s_j) - W_p[j] / s_j).
+    A large s_j shrinks row j inside its panel, so this term grows with the spread of s."""
     exp_fn = exp_fn or rn.po2_scale_exp
-    H = H.float().to(Ws[0].device)
+    H = H.float().to(Ws[0].device)       # [K, K], or a 1-D diagonal (NEW, used by the weights-only proxy)
+    if producer is not None:
+        p_exp = producer.get("exp_fn") or rn.po2_scale_exp
+        Wp = producer["W"]
+        Hp = producer["H"]
+        Hp = None if Hp is None else Hp.float().to(Wp.device)     # None: identity (weight-only proxy)
+        cp = producer["c"].float().to(Wp.device)
     best = (float("inf"), None, None)
     for i in range(grid):
         a = i / grid
@@ -160,10 +202,76 @@ def awq_search(Ws, H, sx, grid=20, exp_fn=None):
         for W in Ws:
             Wsc = (W.float() * s).to(W.dtype).float()        # what the folded checkpoint holds
             dW = (qdq(Wsc, exp_fn(Wsc)) - Wsc) / s
-            loss += float(((dW @ H) * dW).sum())
+            loss += float(((dW @ H) * dW).sum() if H.dim() == 2 else ((dW * dW) * H).sum())   # 1-D H: diagonal
+        if producer is not None:
+            sp = s.to(Wp.device).unsqueeze(1)
+            Wpc = (Wp.float() / sp).to(Wp.dtype).float()     # what the folded producer holds
+            e = (qdq(Wpc, p_exp(Wpc)) - Wpc) * sp
+            loss += float((((e if Hp is None else e @ Hp) * e).sum(1) * cp).sum())
         if loss < best[0]:
             best = (loss, s, a)
     return best[1], best[2], best[0]
+
+
+def producer_row_weights(Wp, Hp, Wc, Hc_diag):
+    """NEW (producer_aware): c_j for the producer term of awq_search, in the units of the consumer
+    loss (squared output error summed over calibration tokens). Row j of the producer feeds the
+    consumer input channel j; its error e_j x reaches the consumer output through ||Wc[:, j]||^2 and,
+    for an MLP (down input = act(gate) * up), is gated by act(gate_j): c_j = ||Wc[:, j]||^2 * g_j with
+    g_j = E[down_in_j^2] / E[up_j^2] = Hc_jj / (Wp[j] Hp Wp[j]^T), the second moment of the pair's
+    channel relative to the producer's alone (independence of the gate and of the error assumed;
+    no extra calibration pass). Dead channels get 0."""
+    Wp = Wp.float()
+    up2 = ((Wp if Hp is None else Wp @ Hp.float().to(Wp.device)) * Wp).sum(1)
+    g = torch.where(up2 > 0, Hc_diag.float().to(Wp.device) / up2.clamp(min=1e-30), torch.zeros_like(up2))
+    return (Wc.float() ** 2).sum(0).to(Wp.device) * g
+
+
+def act_cast_nc(x: torch.Tensor) -> torch.Tensor:
+    """NEW: the stack's run-time per-token activation cast (granularity a=token, rule=nc), dequantized:
+    x_hat = dq(vpack(bf16(x), s_token)). x is [T, K]; float32 result. Reuses algos.granularity."""
+    from algos.granularity import scale_exp
+
+    xb = x.to(torch.bfloat16)
+    exp = scale_exp(xb, (-1,), "nc")
+    return rn.dequantize(rn.e4m3_vpack(xb, exp), exp).float()
+
+
+# the activation cast used by awq_loss=cast and calib=chip (tests replace it, e.g. by the identity)
+ACT_CAST = act_cast_nc
+
+
+@torch.no_grad()
+def awq_search_cast(Ws, X, sx, grid=20, exp_fn=None, cast=None, weight_H=None):
+    """NEW (awq_loss=cast): (s, alpha, loss, weight_only_alpha) minimizing the layer OUTPUT error through
+    the run-time casts, sum over the group's Linears of || W X^T - dq(Q_w(W s)) dq(Q_a(X / s))^T ||^2,
+    X [T, K] the calibration-token subsample of the group's shared input, float32 accumulation. Same
+    alpha grid and normalization of s as awq_search. If weight_H is given, the weight-only loss of
+    awq_search is evaluated too and the alpha it picks is returned (for the report)."""
+    exp_fn = exp_fn or rn.po2_scale_exp
+    cast = cast or ACT_CAST
+    X = X.float()
+    refs = [X @ W.float().T for W in Ws]
+    best = (float("inf"), None, None)
+    wbest = (float("inf"), None)
+    for i in range(grid):
+        a = i / grid
+        s = sx.float().pow(a).clamp(min=1e-4)
+        s = s / (s.max() * s.min()).sqrt()
+        xh = cast((X / s.to(X.device)).to(torch.bfloat16))          # the producer emits x / s in BF16
+        loss, wloss = 0.0, 0.0
+        for W, ref in zip(Ws, refs):
+            Wsc = (W.float() * s).to(W.dtype).float()
+            Wq = qdq(Wsc, exp_fn(Wsc))
+            loss += float(((xh @ Wq.T - ref) ** 2).sum())
+            if weight_H is not None:
+                dW = (Wq - Wsc) / s
+                wloss += float(((dW @ weight_H) * dW).sum())
+        if loss < best[0]:
+            best = (loss, s, a)
+        if wloss < wbest[0]:
+            wbest = (wloss, a)
+    return best[1], best[2], best[0], wbest[1]
 
 
 def _fingerprint(w: torch.Tensor) -> str:
@@ -185,7 +293,8 @@ class GptqAwq(Algo):
         self.method = str(params.get("method", "gptq"))
         if self.method not in METHODS:
             raise ValueError(f"gptq_awq: method={self.method!r}; choose from {METHODS}")
-        unknown = set(params) - {"method", "actorder", "damp", "block", "grid", "hessians"}
+        unknown = set(params) - {"method", "actorder", "damp", "block", "grid", "hessians", "awq_loss", "calib", "target",
+                                 "producer_aware", "dead_columns"}
         if unknown:
             raise ValueError(f"gptq_awq: unknown parameters {sorted(unknown)}")
         self.actorder = bool(params.get("actorder", True))
@@ -195,6 +304,30 @@ class GptqAwq(Algo):
         self.hessians = str(params.get("hessians", "cpu"))
         if self.hessians not in ("cpu", "device"):
             raise ValueError(f"gptq_awq: hessians={self.hessians!r}; choose cpu or device")
+        # NEW opt-in (default off): hardware-aware calibration, see docs/algos/gptq-awq.md
+        self.awq_loss = str(params.get("awq_loss", "weight"))
+        self.calib = str(params.get("calib", "bf16"))
+        self.target = str(params.get("target", "bf16"))
+        for k, v, ok in (("awq_loss", self.awq_loss, ("weight", "cast")), ("calib", self.calib, ("bf16", "chip")),
+                         ("target", self.target, ("bf16", "fp"))):
+            if v not in ok:
+                raise ValueError(f"gptq_awq: {k}={v!r}; choose from {ok}")
+        if self.target == "fp" and self.calib != "chip":
+            raise ValueError("gptq_awq: target=fp needs calib=chip")
+        # NEW opt-in (default off): the AWQ search also sees the producer's own quantization error
+        # on its weight grid (docs/algos/awq-producer-aware.md)
+        self.producer_aware = _as_bool(params.get("producer_aware", False))
+        if self.producer_aware and self.awq_loss == "cast":
+            raise ValueError("gptq_awq: producer_aware=true is implemented for awq_loss=weight only")
+        # NEW opt-in (default zero = unchanged): dead input columns cast by RTN instead of zeroed
+        self.dead_columns = str(params.get("dead_columns", "zero"))
+        if self.dead_columns not in DEAD_COLUMNS:
+            raise ValueError(f"gptq_awq: dead_columns={self.dead_columns!r}; choose from {DEAD_COLUMNS}")
+        self.subsample = {}                         # owner fqn -> [T, K] CPU token subsample
+        self.Hhat, self.Cxx = {}, {}                # calib=chip: sum x_hat x_hat^T, sum x x_hat^T
+        self.alpha_picks = {}                       # fold group -> {"weight": a, "cast": a}
+        self.timing = {}                            # stage -> seconds (calibration, awq, chip_pass, gptq)
+        self._batches = self._run = None
         self._calib_key = None
         self.H, self.sx, self.owner = {}, {}, {}     # owner: fqn -> fqn whose H it shares
         self.fold_checks = {}                       # norm / mlp fqn -> verified consumer info
@@ -226,6 +359,12 @@ class GptqAwq(Algo):
         if key == self._calib_key:
             return {"reused": True, **self._calib_summary()}
         self._calib_key = key
+        t_start = time.time()
+        self._batches, self._run = batches, run
+        self.subsample = {}
+        self.Hhat, self.Cxx = {}, {}
+        sub_gen = torch.Generator().manual_seed(0)
+        quota = -(-SUBSAMPLE_TOKENS // max(1, len(batches)))
         self.H, self.sx, self.owner, self.fold_checks = {}, {}, {}, {}
         self._gptq_cache = {}
         n_tok = {}
@@ -267,6 +406,10 @@ class GptqAwq(Algo):
             else:
                 self.H[n] += (x2.T @ x2).to(self.H[n].device)
             self.sx[n] += x2.abs().sum(0)
+            if self.awq_loss == "cast":
+                take = min(quota, x2.shape[0])
+                idx = torch.randperm(x2.shape[0], generator=sub_gen)[:take].to(x2.device)
+                self.subsample.setdefault(n, []).append(x2[idx].cpu())
             n_tok[n] += x2.shape[0]
             if first["on"] and n.endswith("mlp.down_proj"):
                 mlp_io.setdefault(n[: -len(".down_proj")], {})["down_in"] = x.detach()[..., :]
@@ -301,6 +444,8 @@ class GptqAwq(Algo):
                 h.remove()
         for n in self.sx:
             self.sx[n] /= max(n_tok[n], 1)
+        self.subsample = {n: torch.cat(v)[:SUBSAMPLE_TOKENS] for n, v in self.subsample.items()}
+        self.timing["calibration"] = time.time() - t_start
         self.n_tok = n_tok
         self._check_norms(model, norms, norm_in, consumers)
         return self._calib_summary()
@@ -374,7 +519,9 @@ class GptqAwq(Algo):
     def prepare(self, model, mode):
         self.awq_scale = {}
         self.layers = {}
+        self.alpha_picks = {}
         if not self.uses_awq:
+            self._chip_pass(model)
             return None
         mods = dict(model.named_modules())
         folded, refused = [], {}
@@ -390,7 +537,18 @@ class GptqAwq(Algo):
                 refused[key] = "no calibration statistics"
                 continue
             Ws = [mods[c].weight.detach() for c in cons]
-            s, alpha, _ = awq_search(Ws, H, sx, self.grid, self._grid_exp_fn(cons[0]))
+            t_awq = time.time()
+            own = self.owner.get(cons[0], cons[0])
+            if self.awq_loss == "cast" and own in self.subsample:
+                s, alpha, _, a_w = awq_search_cast(Ws, self.subsample[own].to(Ws[0].device), sx, self.grid,
+                                                   self._grid_exp_fn(cons[0]), weight_H=H.float().to(Ws[0].device))
+                self.alpha_picks[key] = {"weight": a_w, "cast": alpha}
+            else:
+                producer = self._producer_term(mods, chk, cons, Ws, H) if self.producer_aware else None
+                extra = {} if producer is None else {"producer": producer}      # default call unchanged
+                s, alpha, _ = awq_search(Ws, H, sx, self.grid, self._grid_exp_fn(cons[0]), **extra)
+                self.alpha_picks[key] = {"weight": alpha}
+            self.timing["awq"] = self.timing.get("awq", 0.0) + time.time() - t_awq
             prod = mods[chk["producer"]]
             if chk["rows"]:
                 prod.weight.copy_((prod.weight.float() / s.unsqueeze(1).to(prod.weight.device)).to(prod.weight.dtype))
@@ -411,7 +569,65 @@ class GptqAwq(Algo):
                     None, getattr(cfg, "num_attention_heads", None))
                 refused[n] = ("unscaled: producer is attention; under GQA v_proj has fewer output rows "
                               "than o_proj has inputs" if gqa else "unscaled: v_proj -> o_proj fold not implemented")
-        return {"method": self.method, "awq_folded": folded, "awq_unscaled": refused}
+        self._chip_pass(model)
+        return {"method": self.method, "awq_folded": folded, "awq_unscaled": refused,
+                "alpha_picks": dict(self.alpha_picks)}
+
+    def _producer_term(self, mods, chk, cons, Ws, Hc):
+        """NEW (producer_aware): the producer-row term of awq_search for an up_proj -> down_proj
+        group; None for a norm group (its producer is a 1-D weight, cast to BF16, not an FP8 operand)."""
+        if not chk["rows"]:
+            return None
+        pname = chk["producer"]
+        own_p = self.owner.get(pname, pname)
+        Hp = self.H.get(own_p)
+        if Hp is None:
+            return None
+        Wp = mods[pname].weight.detach()
+        s_in = self.awq_scale.get(pname)       # the norm group (folded first) scaled Wp's columns by s_in
+        if s_in is not None:                   # and its input is now x / s_in: H' = D H D, as transform_weight does
+            Di = (1.0 / s_in.double()).to(Hp.device)
+            Hp = (Hp.double() * Di.unsqueeze(0) * Di.unsqueeze(1)).float()
+        c = producer_row_weights(Wp, Hp, Ws[0], torch.diag(Hc.float()))
+        return {"W": Wp, "H": Hp, "c": c, "exp_fn": self._grid_exp_fn(pname)}
+
+    @torch.no_grad()
+    def _chip_pass(self, model):
+        """NEW (calib=chip): second calibration pass on the (folded) model: every Linear input that owns
+        a Hessian is cast like the MXU operand, x_hat = dq(Q_a(x)); H_hat = sum x_hat x_hat^T and, for
+        target=fp, C = sum x x_hat^T (x: the folded model's own input). Statistics come from this
+        model's calibration batches."""
+        self.Hhat, self.Cxx = {}, {}
+        if self.calib != "chip" or self._batches is None:
+            return
+        t0 = time.time()
+        linears = {n: m for n, m in model.named_modules() if isinstance(m, nn.Linear) and n in self.H}
+        handles = []
+
+        def pre(mod, args, n):
+            if not args or not torch.is_tensor(args[0]):
+                return
+            x2 = args[0].detach().reshape(-1, args[0].shape[-1]).float()
+            xh = ACT_CAST(x2)
+            if n not in self.Hhat:
+                hdev = "cpu" if self.hessians == "cpu" else x2.device
+                self.Hhat[n] = torch.zeros(x2.shape[1], x2.shape[1], device=hdev)
+                if self.target == "fp":
+                    self.Cxx[n] = torch.zeros(x2.shape[1], x2.shape[1], device=hdev)
+            dev = self.Hhat[n].device
+            self.Hhat[n] += (xh.T @ xh).to(dev)
+            if self.target == "fp":
+                self.Cxx[n] += (x2.T @ xh).to(dev)
+
+        for n, m in linears.items():
+            handles.append(m.register_forward_pre_hook(lambda mod, a, n=n: pre(mod, a, n)))
+        try:
+            for b in self._batches:
+                self._run(model, b)
+        finally:
+            for h in handles:
+                h.remove()
+        self.timing["chip_pass"] = time.time() - t0
 
     # -- (a, b) weights ----------------------------------------------------------------------------
     def _grid(self, name, w, kind):
@@ -439,26 +655,39 @@ class GptqAwq(Algo):
         if not self.uses_gptq:
             self.layers[name] = "awq" if name in self.awq_scale else "rtn"
             return w
-        s0, gran = self._grid(name, w, kind)
-        H = self.H.get(self.owner.get(name, name))
+        own = self.owner.get(name, name)
+        H = self.H.get(own)
         if H is None:
             self.layers[name] = "rtn: not reached by the calibration data"
             return w
         D = self.awq_scale.get(name)
+        chip = self.calib == "chip" and own in self.Hhat
+        fp = chip and self.target == "fp" and own in self.Cxx
+        if fp:      # NEW target=fp: W' = W C H_hat^-1 minimizes ||W x - W' x_hat||^2 (damped as GPTQ)
+            Hh = self.Hhat[own].double()
+            Hd = Hh + self.damp * torch.mean(torch.diag(Hh)) * torch.eye(Hh.shape[0], dtype=Hh.dtype)
+            WC = w.double().cpu() @ self.Cxx[own].double()
+            w = torch.linalg.solve(Hd, WC.T).T.to(device=w.device, dtype=w.dtype)
+        s0, gran = self._grid(name, w, kind)
         key = (name, self.method, self.actorder, self.damp, self.block, _fingerprint(w),
-               _fingerprint(s0.contiguous()))
+               _fingerprint(s0.contiguous()), chip, fp, self.dead_columns)
         if key not in self._gptq_cache:
+            t_gptq = time.time()
             dev = w.device                  # one layer's H moves to the weight's device (gptq())
-            if D is not None:                # rescaled in float64: AWQ's 1/s spans many binades
+            if chip:                         # H_hat is measured on the folded model: no 1/s rescale
+                Hn = self.Hhat[own]
+            elif D is not None:              # rescaled in float64: AWQ's 1/s spans many binades
                 Di = (1.0 / D.double()).to(H.device)
                 Hn = H.double() * Di.unsqueeze(0) * Di.unsqueeze(1)
             else:
                 Hn = H
             ginfo = {}
-            wq = gptq(w, Hn, s0.to(dev), self.block, self.damp, self.actorder, info=ginfo)
+            extra = {} if self.dead_columns == "zero" else {"dead_columns": self.dead_columns}   # default call unchanged
+            wq = gptq(w, Hn, s0.to(dev), self.block, self.damp, self.actorder, info=ginfo, **extra)
             if ginfo.get("damp", self.damp) != self.damp:
                 self.damp_raised[name] = ginfo["damp"]
             self._gptq_cache[key] = wq.to(device=w.device, dtype=w.dtype)
+            self.timing["gptq"] = self.timing.get("gptq", 0.0) + time.time() - t_gptq
         out = self._gptq_cache[key]
         if not torch.equal(qdq(out, s0), out.float()):
             raise RuntimeError(f"{name}: GPTQ weight is not representable at the pinned exponent")
@@ -479,7 +708,18 @@ class GptqAwq(Algo):
             counts[v] = counts.get(v, 0) + 1
         rec["weights"] = counts
         rec["damp_raised"] = dict(self.damp_raised)
+        if self.producer_aware:
+            rec["producer_aware"] = True
+        if self.dead_columns != "zero":
+            rec["dead_columns"] = self.dead_columns
+        rec["hw_aware"] = {"awq_loss": self.awq_loss, "calib": self.calib, "target": self.target,
+                           "alpha_picks": dict(self.alpha_picks),
+                           "timing_s": {k: round(v, 2) for k, v in self.timing.items()}}
         return rec
+
+
+def _as_bool(v) -> bool:
+    return v.strip().lower() in ("1", "true", "yes", "on") if isinstance(v, str) else bool(v)
 
 
 def _alive(table, k, x) -> bool:

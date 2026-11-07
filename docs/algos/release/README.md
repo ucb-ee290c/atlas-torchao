@@ -1,5 +1,7 @@
 # Atlas FP8 v1 release records
 
+> **Corrected 2026-10-14** ([CORRECTIONS.md](CORRECTIONS.md)): `atlas_v1` rows of run 5.x are the SmoothQuant stack (`atlas_v1_sq`); SmolVLA numbers predate input normalization (ground-truth metrics invalid); AWQ vs SmoothQuant was within noise on SmolVLA and Pi0, and the Pi0 rows mixed commits; `atlas-v1.0` is a local tag (cite `5ff028e`); the release was merged to `main` (`54e1855`).
+
 The local `atlas-v1.0` tag pins verified quantization and export code at
 `5ff028ee58b28606873278236a379dcc09339b82`. The canonical DiT export gate is complete:
 eight frames, 96 byte-identical captured tensors, valid payload hashes and 75 passing
@@ -23,5 +25,7 @@ manifest. It is not a serialized FX graph or device executable. DiT chip accurac
 real-model compiler lowering, hardware performance and closed-loop robot success are
 outside the verified claims. FX graph export and MLIR handoff follow release closure.
 
-Publication is on hold. Local names and the existing tag are preserved; no change to
-upstream `main`, branch push or tag republication is part of this documentation update.
+The release was merged to `main` by pull request #1 (merge `54e1855`). The `atlas-v1.0` tag
+was not published; it exists only locally, so cite commit `5ff028e`.
+[Corrections](CORRECTIONS.md) and the [corrected structured results](reported_results_corrected.json)
+supersede labels and status in the v1.0 records, which are otherwise kept as written.

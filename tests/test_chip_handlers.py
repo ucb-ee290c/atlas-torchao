@@ -1,4 +1,5 @@
 """Op handlers of the chip router: semantics of torch, numerics of the VPU sequences."""
+import pytest
 import torch
 
 import chip_coverage as cc
@@ -107,3 +108,91 @@ def test_masked_softmax_masks():
     out = run(r, A._softmax.default, s + m, -1, False)
     assert close(out, torch.softmax(s + m, -1), atol=1e-2)
     assert (out[m < 0] == 0).all()
+
+
+def test_zero_dim_cpu_operand_follows_the_other_device():
+    """A 0-dim CPU tensor joins an op on another device as in PyTorch; a larger CPU tensor does
+    not move, so a real device mix still fails where PyTorch would."""
+    like = torch.empty(3, device="meta")
+    scalar = torch.tensor(0.5)
+    assert cc._as_f(scalar, like).device.type == "meta"
+    assert cc._as_f(torch.ones(2), like).device.type == "cpu"
+    assert cc._operand_device(scalar, like) is like
+    assert cc._operand_device(like, scalar) is like
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_scheduler_style_scalar_times_cuda_sample():
+    """diffusers' DDPM step multiplies a 0-dim CPU coefficient by a CUDA sample."""
+    r = router()
+    coef = torch.tensor(0.3)
+    sample = torch.randn(2, 8, device="cuda").bfloat16()
+    for args in ((coef, sample), (sample, coef)):
+        out = run(r, A.mul.Tensor, *args)
+        assert out.device.type == "cuda" and close(out, (coef.cuda() * sample.float()))
+    out = run(r, A.sub.Tensor, sample, coef)
+    assert out.device.type == "cuda" and close(out, sample.float() - 0.3)
+
+
+@pytest.mark.parametrize("func,args", [
+    (A.div.Tensor, (torch.tensor(0.0006), torch.tensor(0.0017))),
+    (A.rsub.Scalar, (torch.tensor(0.9994), 1)),
+    (A.pow.Tensor_Scalar, (torch.tensor(0.9983), 0.5)),
+])
+def test_one_element_fp32_schedule_arithmetic_runs_on_the_scalar_core(func, args):
+    """DDPM coefficients are one-element float32 tensors: computed in float32 on the scalar core
+    (NEW, as multitask-dit-quant chip_full.py:58-65), exactly as torch computes them."""
+    r = router()
+    name = func.overloadpacket.__name__
+    unit, handler, reason = r.classify(func, name, args, {}, None)
+    assert (unit, handler, reason) == ("scalar", None, cc.M.ONE_ELEMENT_FP32)
+    with r:
+        out = func(*args)
+    assert torch.equal(out, func(*args))
+    assert r.cov.report()["new_decisions"][0]["op"] == f"{name} (scalar)"
+
+
+def test_coefficient_times_sample_stays_on_the_vpu():
+    r = router()
+    coef, sample = torch.tensor(0.3), torch.randn(2, 8)
+    assert r.classify(A.mul.Tensor, "mul", (coef, sample), {}, None)[0] == "VPU"
+    assert r.classify(A.mul.Tensor, "mul", (torch.tensor(0.3).bfloat16(), torch.tensor(2.0).bfloat16()),
+                      {}, None)[0] == "VPU"
+
+
+def test_ddpm_sampling_on_the_chip_stays_finite():
+    """At t = 1 BF16 lanes give beta_prod_t = current_beta_t = 0, and 0 / 0 made the sample NaN."""
+    ddpm = pytest.importorskip("diffusers.schedulers.scheduling_ddpm")
+    scheduler = ddpm.DDPMScheduler(num_train_timesteps=100, beta_schedule="squaredcos_cap_v2",
+                                   prediction_type="epsilon", clip_sample=True)
+    scheduler.set_timesteps(100)
+    g = torch.Generator().manual_seed(0)
+    sample = torch.randn(1, 24, 10, generator=g)
+    r = router()
+    for t in scheduler.timesteps:
+        model_output = 0.5 * torch.randn(sample.shape, generator=g)
+        with r:
+            sample = scheduler.step(model_output, t, sample, generator=g).prev_sample
+    assert torch.isfinite(sample).all()
+    units = {(row["op"], row["unit"]) for row in r.cov.report()["ops"]}
+    assert {("div", "scalar"), ("rsub", "scalar"), ("pow", "scalar"), ("mul", "VPU")} <= units
+
+
+def test_clamp_computes_on_the_device_pytorch_would():
+    """clamp.Tensor: a 0-dim CPU bound follows the tensor; a 0-dim CPU input follows a bound on
+    another device; the compute device is never a larger CPU tensor's."""
+    big = torch.empty(3, device="meta")
+    zero = torch.tensor(0.5)
+    assert cc._operand_device(zero, big, None) is big
+    assert cc._operand_device(big, zero, zero) is big
+    assert cc._operand_device(zero, zero, big) is big
+    assert cc._operand_device(zero, zero) is zero
+
+
+def test_clamp_tensor_bounds_match_torch():
+    r = router()
+    x = torch.randn(4, 32)
+    lo, hi = torch.tensor(-0.3), torch.full((32,), 0.4)
+    assert close(run(r, A.clamp.Tensor, x, lo, hi), x.clamp(lo, hi))
+    assert close(run(r, A.clamp.Tensor, x, lo), x.clamp(lo))
+    assert close(run(r, A.clamp.Tensor, x, None, hi), x.clamp(max=hi))

@@ -7,7 +7,8 @@
           NEW ones below (each listed in `new_decisions` of the report),
   MXU     matmuls the reference_hw profile did not replace (attention scores, stray mm/bmm,
           convolutions) cast to FP8 and accumulated by the same MXU model,
-  scalar  integer/bool ops: exact, run natively,
+  scalar  integer/bool ops: exact, run natively; arithmetic whose tensor operands are all
+          one-element float32 (schedule coefficients): software float32, run natively,
   data    movement and casts: exact, run natively,
   host    no Atlas instruction: run natively and listed with the reason,
   eval    loss ops of the perplexity evaluation: listed separately.
@@ -187,6 +188,23 @@ def _tensors(args):
             yield from (t for t in a if isinstance(t, torch.Tensor))
 
 
+def _is_one_element_fp32(tensors, floats) -> bool:
+    """Every tensor operand holds one element and every float one is float32.
+
+    Python scalars may join (`1 - alpha_prod_t` is rsub(tensor, 1)): a literal never promotes a
+    float32 tensor, so the op still computes in float32. One-element integer/bool tensors may join
+    too (they promote to float32). Any operand with more than one element (a sample, an activation)
+    keeps the op on the VPU, and a BF16/FP16 or float64 one-element operand keeps its own treatment."""
+    return bool(floats) and all(t.numel() == 1 for t in tensors) \
+        and all(t.dtype == torch.float32 for t in floats)
+
+
+def _vpu_handler(func, name, unit=None):
+    """The chip handler of an op (by overload, then by packet name), optionally only on `unit`."""
+    h = _VPU_HANDLERS.get(func) or _VPU_HANDLERS.get(name)
+    return h if h is not None and unit in (None, h.unit) else None
+
+
 def _is_const(t) -> bool:
     if not isinstance(t, torch.Tensor):
         return True
@@ -278,7 +296,7 @@ class ChipRouter(TorchDispatchMode):
                 self.cov.add("host", row, _host_work(name, args, out), reason=why, new=new)
             return out
         unit, handler, reason = self.classify(func, name, args, kwargs, kind)
-        new = M.NEW_TREATMENTS.get(reason) if unit in ("host", "data") else None
+        new = M.NEW_TREATMENTS.get(reason) if unit in ("scalar", "host", "data") else None
         self._instr.clear()
         out = handler.fn(self, func, name, args, kwargs) if handler else func(*args, **kwargs)
         if unit == "VPU":
@@ -323,7 +341,13 @@ class ChipRouter(TorchDispatchMode):
         if kind == "mxu_module" and name == "exp2":
             # 2^(sx+sw) from integer scale exponents: an exponent field written by the scalar core
             return "scalar", None, "2^k from an integer scale exponent: exponent-field construction (exact)"
-        h = _VPU_HANDLERS.get(func) or _VPU_HANDLERS.get(name)
+        if _is_one_element_fp32(ts, floats) and _vpu_handler(func, name, unit="VPU") is not None:
+            # schedule arithmetic on one-element fp32 coefficients (diffusers DDPM alphas/betas): BF16
+            # lanes would round 1 - alpha_prod_t to 0 and the step would divide 0 by 0. NEW, as
+            # multitask-dit-quant chip_full.py:58-65. After the loop-scalar and exponent rules above,
+            # which keep their own (also float32) treatment of 0-d operands.
+            return "scalar", None, M.ONE_ELEMENT_FP32
+        h = _vpu_handler(func, name)
         if h is not None:
             ok, why = h.applies(self, func, name, args, kwargs)
             if ok:
@@ -379,10 +403,23 @@ class _H:
 
 
 def _as_f(x, like):
-    """Python scalar or tensor -> float32 tensor on like's device."""
+    """Python scalar or tensor -> float32 tensor on like's device.
+
+    A 0-dim CPU tensor follows like's device, as PyTorch lets a 0-dim CPU tensor take part in
+    an op on another device (e.g. a diffusers scheduler coefficient times a CUDA sample). Any
+    other device mix is left alone, so the op fails exactly where PyTorch itself would."""
     if isinstance(x, torch.Tensor):
+        if x.dim() == 0 and x.device.type == "cpu" and x.device != like.device:
+            x = x.to(like.device)
         return x.float()
     return torch.tensor(float(x), dtype=torch.float32, device=like.device)
+
+
+def _operand_device(*operands):
+    """The operand an op computes on: the first that is not a 0-dim CPU tensor (PyTorch's rule),
+    else the first tensor."""
+    tensors = [x for x in operands if isinstance(x, torch.Tensor)]
+    return next((x for x in tensors if not (x.dim() == 0 and x.device.type == "cpu")), tensors[0])
 
 
 def _bcast2(a, b):
@@ -414,7 +451,8 @@ def _binary(op):
         dt = _dtype_of(func, args, kwargs)
         if name == "rsub":
             a, b = b, a
-        fa, fb = _as_f(a, args[0]), _as_f(b, args[0])
+        like = _operand_device(a, b)
+        fa, fb = _as_f(a, like), _as_f(b, like)
         if alpha != 1:
             fb = r.vpu.mul(*_bcast2(fb, _as_f(alpha, fb)))
         if op in ("add", "sub") and r.vadd is not None and r.vadd.wants(r.ctx, name, fa, fb):
@@ -487,7 +525,10 @@ def _clamp(r, func, name, args, kwargs):
     hi = kwargs.get("max", args[2] if len(args) > 2 else None)
     if name == "clamp_max":
         lo, hi = None, args[1]
-    f = x.float()
+    # clamp.Tensor takes tensor bounds: compute on the device PyTorch would, so a 0-dim CPU
+    # operand follows the others and any other device mix fails as it does natively
+    like = _operand_device(x, lo, hi)
+    f = _as_f(x, like)
     if lo is not None:
         f = r.vpu.pairwise_max(*_bcast2(f, _as_f(lo, f)))
     if hi is not None:

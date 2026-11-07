@@ -7,8 +7,9 @@ that every member sees exactly what it would see alone on the model the earlier 
 Order. Members run in a FIXED order whatever order the spec lists them in (ORDER below):
   1. weight / fold transforms: smoothquant, then gptq_awq (GPTQ rounds the weights smoothing left)
   2. scale choices: granularity, static_calib
-  3. layer exclusions: mixed_precision
-Model level (algos.quantize): bf16_layers of every member (union), then per member in that order
+  3. layer exclusions: mixed_precision, keep_bf16
+Model level (algos.quantize): bf16_layers and bf16_exact of every member (union; one reason per
+exact site, the first member's), then per member in that order
 calibrate (if it needs calibration) on the model as transformed by the earlier members' prepare,
 then its own prepare.
 
@@ -43,10 +44,11 @@ ORDER = {
     "granularity": 30,
     "static_calib": 40,
     "mixed_precision": 50,
+    "keep_bf16": 55,
 }
 _UNKNOWN_RANK = 25
 STAGE = {0: "transform", 10: "transform", 20: "transform", 25: "transform",
-         30: "scale", 40: "scale", 50: "exclusion"}
+         30: "scale", 40: "scale", 50: "exclusion", 55: "exclusion"}
 
 
 class StackConflict(ValueError):
@@ -109,6 +111,13 @@ class Stack(Algo):
             for n in m.bf16_layers(model, mode) or []:
                 if n not in out:
                     out.append(n)
+        return out
+
+    def bf16_exact(self, model, mode):
+        out = {}
+        for m in self.members:
+            for n, why in (m.bf16_exact(model, mode) or {}).items():
+                out.setdefault(n, why)
         return out
 
     # calibrate / prepare are interleaved per member by algos.quantize (see _run_members there)

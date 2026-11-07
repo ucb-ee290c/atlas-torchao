@@ -46,15 +46,19 @@ from algos import base as algo_hooks
 ATTN_KEY = "atlas_ref"
 
 
-def _mm(fm, a_q, a_s, b_q, b_s, dtype_out=torch.float32, role=None):
+def _mm(fm, a_q, a_s, b_q, b_s, dtype_out=torch.float32, role=None, pop_shift=0):
     """a [..., M, K] times b [..., N, K]^T on cast operands; result * 2^(sa+sb) in float32.
     `role` ("qk" or "pv") names the matmul for fx_export's native-FP8 capture, which swaps `_cast` and
-    `_mm`; it does not change the result."""
+    `_mm`; it does not change the result. `pop_shift` (NEW, default 0, only the pv matmul of a folded attention
+    site passes it; docs/algos/pack-fold.md): the result is multiplied by 2^pop_shift (exact in float32)."""
     if fm is not None:
         y = fm(rn.e4m3_unpack(a_q), rn.e4m3_unpack(b_q), None)
+        if pop_shift:
+            return y * torch.exp2((a_s + b_s + int(pop_shift)).float())
         return y * torch.exp2((a_s + b_s).float())
     # NEW: reference profile without an MXU model: matmul on the dequantized operands in float32.
-    return rn.dq_matmul_nt(a_q, a_s, b_q, b_s)
+    y = rn.dq_matmul_nt(a_q, a_s, b_q, b_s)
+    return y if not pop_shift else y * (2.0 ** int(pop_shift))
 
 
 def _cast(algo, site, operand, x, dims):
@@ -68,19 +72,38 @@ def _cast(algo, site, operand, x, dims):
     return q, s
 
 
-def ref_attention(q, k, v, scaling, mask=None, fm_qk=None, fm_av=None, variant="text", algo=None, site=""):
+def _mm_two_term(fm, x, x_q, x_s, b_q, b_s, algo, site, operand, dims):
+    """Two-term pass pair for the streamed operand x (Q or P; the resident K or V stays single-term).
+    x1 = dq(Q(x)) is the single-term cast already in (x_q, x_s); r = x - x1 (BF16 truncating vsub);
+    returns bf16 fm(x1, b) + fm(Q(r), b) (each pass carries its own 2^(sx+sb) rescale; BF16 vadd)."""
+    import hw_two_term as tt
+
+    x1 = rn.dequantize(x_q, x_s).to(torch.bfloat16)
+    r_q, r_s = _cast(algo, site, operand, tt.vsub(x, x1), dims)
+    y1 = _mm(fm, x_q, x_s, b_q, b_s).to(torch.bfloat16)
+    y2 = _mm(fm, r_q, r_s, b_q, b_s).to(torch.bfloat16)
+    return tt.vadd(y1, y2)
+
+
+def ref_attention(q, k, v, scaling, mask=None, fm_qk=None, fm_av=None, variant="text", algo=None, site="",
+                  two_term=None):
     """q [B, H, Sq, D], k [B, H, Skv, D], v [B, H, Skv, Dv] (GQA already expanded).
 
     mask: text variant - bool [B, Sq, Skv] or [B, 1|H, Sq, Skv] (True = attend), or an additive float
     mask of the same shapes; vision variant - additive float [B, 1|H, Sq, Skv] or None.
     Returns bf16 [B, H, Sq, Dv]. `algo` (src/algos; None under --algo none) gets the operand casts
     as act_cast(site, x, "attention.q|k|p|v"); with no hook they are the per-(b, h) casts below.
+    two_term (NEW, opt-in, hw_two_term): None (default, unchanged), "q" (S = fm(Q1,K) + fm(Q2,K)) or
+    "qp" (also O = fm(P1,V) + fm(P2,V)); K and V stay single-term.
     """
     q, k, v = q.to(torch.bfloat16), k.to(torch.bfloat16), v.to(torch.bfloat16)    # 649-651, 815-817
     hd = (-2, -1)
     q_q, s_q = _cast(algo, site, "q", q, hd)
     k_q, s_k = _cast(algo, site, "k", k, hd)
-    scores = _mm(fm_qk, q_q, s_q, k_q, s_k, role="qk") * scaling                              # 675-677
+    if two_term:
+        scores = _mm_two_term(fm_qk, q, q_q, s_q, k_q, s_k, algo, site, "q", hd).float() * scaling
+    else:
+        scores = _mm(fm_qk, q_q, s_q, k_q, s_k, role="qk") * scaling               # 675-677
     if variant == "vision":
         scores = scores.to(torch.bfloat16)                                         # 827-829
         if mask is not None:
@@ -112,7 +135,15 @@ def ref_attention(q, k, v, scaling, mask=None, fm_qk=None, fm_av=None, variant="
     p_q, s_p = _cast(algo, site, "p", p, hd)                                       # 689
     v_q, s_v = _cast(algo, site, "v", v, hd)                                       # 690
     v_t_q = v_q.transpose(-1, -2)                                                  # v_norm.T (696)
-    out = _mm(fm_av, p_q, s_p, v_t_q, s_v, role="pv")                                         # 696
+    pv_shift = algo_hooks.attn_pv_shift(algo, site)         # NEW: folded pack exponent of the o_proj input (0 = unchanged)
+    if two_term == "qp":
+        out = _mm_two_term(fm_av, p, p_q, s_p, v_t_q, s_v, algo, site, "p", hd)
+        if pv_shift:
+            out = out * (2.0 ** pv_shift)                   # exact: power of two on a BF16 value
+    elif pv_shift:
+        out = _mm(fm_av, p_q, s_p, v_t_q, s_v, role="pv", pop_shift=pv_shift)
+    else:
+        out = _mm(fm_av, p_q, s_p, v_t_q, s_v, role="pv")                          # 696
     return out.to(torch.bfloat16)                                                  # 696-698
 
 
@@ -144,7 +175,7 @@ def _hf_attention(module, query, key, value, attention_mask, scaling=None, dropo
     k, v = _expand_kv(key, n_rep), _expand_kv(value, n_rep)
     scaling = scaling if scaling is not None else query.shape[-1] ** -0.5
     out = ref_attention(query, k, v, scaling, attention_mask, cfg["fm_qk"], cfg["fm_av"], cfg["variant"],
-                        cfg.get("algo"), cfg.get("site", ""))
+                        cfg.get("algo"), cfg.get("site", ""), cfg.get("two_term"))
     return out.to(query.dtype).transpose(1, 2).contiguous(), None                  # 852-853
 
 
@@ -173,9 +204,23 @@ def _smolvla_text_attention(self_inner, attention_mask, batch_size, head_dim,
     k = _expand_kv(key_states.transpose(1, 2), n_heads // n_kv)
     v = _expand_kv(value_states.transpose(1, 2), n_heads // n_kv)
     out = ref_attention(q, k, v, head_dim ** -0.5, attention_mask, cfg["fm_qk"], cfg["fm_av"], "text",
-                        cfg.get("algo"), cfg.get("site", ""))
+                        cfg.get("algo"), cfg.get("site", ""), cfg.get("two_term"))
     dv = out.shape[-1]
     return out.permute(0, 2, 1, 3).reshape(batch_size, -1, n_heads * dv)          # 723
+
+
+def _dit_rope_attention(self, x):
+    """RoPEAttention.forward (lerobot multi_task_dit) with its F.scaled_dot_product_attention call
+    routed through ref_attention. Fused qkv_proj, plain BF16 RoPE on q and k, no mask, not causal,
+    default scale head_dim ** -0.5 (self.scale); q and k are quantized after the rotation. Dropout is
+    not modelled (eval: p = 0)."""
+    cfg = self._atlas_ref_attn
+    B, T, _ = x.shape  # noqa: N806
+    qkv = self.qkv_proj(x).reshape(B, T, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+    q, k = self.rope(qkv[0], qkv[1])
+    out = ref_attention(q, k, qkv[2], self.scale, None, cfg["fm_qk"], cfg["fm_av"], cfg["variant"],
+                        cfg.get("algo"), cfg.get("site", ""), cfg.get("two_term"))
+    return self.out_proj(out.to(q.dtype).transpose(1, 2).reshape(B, T, self.hidden_size))
 
 
 def _algo_cfg(site) -> dict:
@@ -193,7 +238,9 @@ def patch_attention(model: nn.Module, fm_factory=None, skip=()) -> list:
       - modules driven by a transformers config with an attention-interface key: the config is
         switched to ATTN_KEY (eager-style masks). SmolVLM vision layers use the vision variant;
         everything else (Llama-family decoders) the text variant.
-    Models with neither (e.g. custom attention modules) are left unchanged.
+      - Multi-Task DiT `RoPEAttention` (lerobot): instance `forward` replaced (_dit_rope_attention),
+        vision variant (the reference mtdit_inout routes DiT SDPA through its vision routine).
+    Models with none of these (e.g. other custom attention modules) are left unchanged.
     """
     if any(type(m).__name__ == "PaliGemmaWithExpertModel" for m in model.modules()):
         return patch_pi0_attention(model, fm_factory, skip)
@@ -218,6 +265,12 @@ def patch_attention(model: nn.Module, fm_factory=None, skip=()) -> list:
         mod._atlas_ref_attn = {"fm_qk": new_fm(), "fm_av": new_fm(), "variant": variant, **_algo_cfg(name)}
         configs[id(cfg)] = cfg
         sites.append({"site": name, "kind": type(mod).__name__, "variant": variant})
+    for name, mod in model.named_modules():
+        # Multi-Task DiT's own blocks: fused qkv_proj, no config; the instance forward is replaced
+        if type(mod).__name__ == "RoPEAttention" and hasattr(mod, "qkv_proj") and hasattr(mod, "rope"):
+            mod._atlas_ref_attn = {"fm_qk": new_fm(), "fm_av": new_fm(), "variant": "vision", **_algo_cfg(name)}
+            mod.forward = types.MethodType(_dit_rope_attention, mod)
+            sites.append({"site": name, "kind": "RoPEAttention", "variant": "vision"})
     if configs:
         register_hf_attention()
         for cfg in configs.values():
@@ -252,7 +305,7 @@ def _pi0_gemma_eager(module, query, key, value, attention_mask, scaling, dropout
     n_rep = module.num_key_value_groups                                           # 925-926 repeat_kv
     k, v = _expand_kv(key, n_rep), _expand_kv(value, n_rep)
     out = ref_attention(query, k, v, scaling, attention_mask, cfg["fm_qk"], cfg["fm_av"], "pi0",
-                        cfg.get("algo"), cfg.get("site", ""))
+                        cfg.get("algo"), cfg.get("site", ""), cfg.get("two_term"))
     cfg["calls"]["gemma_eager"] = cfg["calls"].get("gemma_eager", 0) + 1
     return out.to(query.dtype).transpose(1, 2).contiguous(), None                  # 982-1005
 
@@ -265,7 +318,7 @@ def _pi0_siglip_eager(module, query, key, value, attention_mask, scaling, dropou
     if cfg is None:
         return _PI0_ORIG["siglip"](module, query, key, value, attention_mask, scaling, dropout, **kwargs)
     out = ref_attention(query, key, value, scaling, attention_mask, cfg["fm_qk"], cfg["fm_av"], "vision",
-                        cfg.get("algo"), cfg.get("site", ""))
+                        cfg.get("algo"), cfg.get("site", ""), cfg.get("two_term"))
     cfg["calls"]["siglip_eager"] = cfg["calls"].get("siglip_eager", 0) + 1
     return out.to(query.dtype).transpose(1, 2).contiguous(), None                  # 1151-1165
 
@@ -284,7 +337,7 @@ def _pi0_sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False,
         sq, skv = query.shape[-2], key.shape[-2]
         mask = torch.ones(sq, skv, dtype=torch.bool, device=query.device).tril()[None, None]
     out = ref_attention(query, key, value, scale, mask, cfg["fm_qk"], cfg["fm_av"], "pi0",
-                        cfg.get("algo"), cfg.get("site", ""))
+                        cfg.get("algo"), cfg.get("site", ""), cfg.get("two_term"))
     cfg["calls"]["sdpa"] = cfg["calls"].get("sdpa", 0) + 1
     return out.to(query.dtype)                                                     # 804
 

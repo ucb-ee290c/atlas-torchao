@@ -13,10 +13,20 @@ Several algorithms can be stacked with `+`, e.g.
 `--algo smoothquant:alpha=0.5+gptq_awq:method=gptq+granularity:w=channel,a=token,rule=nc`. The
 order, the conflict rule and the record are in [stacking.md](stacking.md) (NEW).
 
-Named recipes expand to documented stacks: `--algo atlas_v1` (AWQ+GPTQ with the exact DiT BF16
-patch exception), `atlas_v1_static` (fallback), `atlas_v1_awq` (historical AWQ alias without the
-exception), and `atlas_v1_sq` (the historical smoothing recipe)
-([atlas_v1.md](atlas_v1.md), NEW).
+Named recipes expand to documented stacks that never change meaning: `atlas_v1_awq`
+(AWQ+GPTQ+granularity), `atlas_v1_sq` (SmoothQuant+GPTQ+granularity) and `atlas_v1_static`
+(static fallback). `atlas_v1` is an alias, currently for `atlas_v1_awq`; what it meant at each
+historical tag is listed in [atlas_v1.md](atlas_v1.md) (NEW). No recipe keeps a layer in BF16 except
+`atlas_v1_tile`; [`keep_bf16:rule=input_conv`](keep-bf16.md) (NEW) is the opt-in rule for convolutions that
+read image pixels directly.
+
+Three **tile-aware** recipes (NEW) use only scales that are constant along K, which the Atlas matrix unit can
+apply at the output pop: `atlas_v1_awq_tile` (`gptq_awq` + `granularity:w=panel,a=block,rows=32,rule=nc`),
+`atlas_v1_tile` (the same plus `keep_bf16:rule=input_conv`) and `atlas_v1_awq_tile_static` (`w=panel` weights with
+static activations). `w=panel` is a 32-channel group (option name `panel`; the atlas-kernels "panel" means a
+launch of up to 2048 columns sharing one exponent). See [tile-aware.md](tile-aware.md).
+The step-by-step flow from any model through AWQ / GPTQ calibration to the verified native FP8 FX graph (commands, files, checklist, limitations) is in
+[howto-model-to-fx-graph.md](howto-model-to-fx-graph.md).
 
 The [verified release records](release/README.md) retain results, export verification,
 the presentation and the shared-document replacement. The code tag remains pinned at
@@ -35,6 +45,7 @@ Model-level hooks run in `algos.quantize` for every mode except `bf16`, in this 
 | Hook | | Purpose |
 |---|---|---|
 | `bf16_layers(model, mode) -> [fqn]` | (e) | Layers kept in BF16. They are passed to the profile as extra `skip` entries and listed in `algo.bf16_opt_out`. The chip coverage report counts them as host work on their own `<op>@bf16_opt_out` rows. They are never silent: the MXU has no BF16-operand mode. |
+| `bf16_exact(model, mode) -> {fqn: reason}` | (e, exact; NEW) | `nn.Conv2d` sites kept in BF16 by exact fqn (no substring siblings), validated before calibration. Listed in `algo.bf16_opt_out_exact`, with the rule's own reason in `algo.bf16_opt_out_reasons` and in an export's `policy.json` (`match: exact`). Used by [`keep_bf16`](keep-bf16.md). |
 | `calibrate(model, batches, run) -> dict` | (f) | Runs on the unquantized model. `run(model, batch)` is one forward. Called only if `needs_calibration` is true. Whatever it returns is stored in `algo.calibration.result`. |
 | `prepare(model, mode) -> dict` | (d, folded) | In-place transforms folded into the weights or norms, such as smoothing or rotations. Runs before any layer is quantized. |
 

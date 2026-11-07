@@ -9,6 +9,8 @@ Units (examples/atlas/.../isa_include/atlas_isa_green_card.md, "GC" below):
   scalar  RV32I integer ALU only: add/sub/and/or/xor/shifts/slt (ScalarALU.scala:26-36,
           Instructions.scala:24-44). No multiply/divide (no M extension) and no floating point.
           Integer ops are exact, so they run natively in 32-bit-compatible integer arithmetic.
+          Arithmetic whose tensor operands are all one-element float32 (schedule coefficients such
+          as the DDPM alphas/betas) is a software float32 routine here, run natively (NEW).
   data    data movement with no arithmetic: DMA, vload/vstore, vmov, vtrpose.xlu, scalar address
           computation (GC 3: 07/0-1, 57/40, 6B/00, 7B). Bit-preserving, run natively; a cast to BF16 is
           the RNE rounding the reference adapter applies on load (vector_rtl_forward.py:66-73).
@@ -232,7 +234,17 @@ LOOP_SCALAR = ("loop-carried 0-d float scalar updated in place (flow-matching `t
                "host with the loop comparison it feeds (NEW)")
 MASK_BUILD = ("where(mask, c1, c2) with two constant branches: the additive attention mask itself, "
               "built once from the boolean mask (NEW)")
+MTDIT = "multitask-dit-quant mtdit_inout"
+ONE_ELEMENT_FP32 = "one-element fp32 scheduler arithmetic on the scalar core (NEW)"
 NEW_TREATMENTS = {
+    ONE_ELEMENT_FP32: {
+        "choice": "scalar core, software float32 (run natively), not the BF16 VPU",
+        "analogue": f"{MTDIT}/chip_full.py:58-65 and op_emulation.py:177-179,209-217 (one-element fp32 "
+                    "operands stay on the scalar core in fp32)",
+        "reason": "diffusers' DDPM alphas_cumprod is float32; in BF16 0.9994 and 0.9983 both round to 1.0, so "
+                  "at t = 1 beta_prod_t = current_beta_t = 0 and div becomes vmul(0, vrcp(0)) = 0 * inf = NaN, "
+                  "which spreads to the sample. Python-scalar operands may join; any multi-element tensor "
+                  "operand keeps the op on the VPU"},
     LOOP_SCALAR: {"choice": "host (float32), not vadd",
                   "analogue": f"{QV_PI0}:136-171 (TARGET_OPS has no add_, so the reference keeps it in "
                               f"float32); {OP}/pi0_pytorch.py:407,419",
@@ -315,8 +327,11 @@ MODEL_OPS = [
     ("dit", "DiT RoPE", "sin/cos tables, mul, add, cat", "VPU", BF16, f"{QV}:170-171", "REF"),
     ("dit", "timestep sinusoidal embedding", "arange, mul, exp, sin, cos, cat", "VPU", BF16, f"{QV}:170-174", "REF"),
     ("dit", "DiT MLP (GELU)", "gelu, Linear", "VPU + MXU", f"{BF16}; {FP8}", f"{QV}:186", "REF"),
-    ("dit", "DDPM step arithmetic", "mul, sub, add, div, pow, sqrt, clamp, randn", "VPU (+ host RNG)", BF16,
+    ("dit", "DDPM step arithmetic on the sample", "mul, sub, add, div, clamp, randn", "VPU (+ host RNG)", BF16,
      f"{QV}:150-176; clamp via vmaximum/vminimum (ISA)", "REF/ISA"),
+    ("dit", "DDPM step coefficients (alphas_cumprod, betas: one-element fp32)", "rsub, pow, div, mul, clamp",
+     "scalar", "float32", f"{MTDIT}/chip_full.py:58-65; in BF16 1 - alpha_prod_t cancels to 0 and 0 / 0 is NaN",
+     "NEW"),
     # Pi0 (openpi PI0Pytorch, pi0=True; transformers 4.53.2 + openpi transformers_replace). Reference:
     # pi0-quant patch_vector_ops (quant_vector.py:136-171 TARGET_OPS, 360-433 dispatch); the vector
     # sequences are vpu_decomp.py (identical to smolVLA-quant's apart from broadcasting, 218-225).
@@ -360,8 +375,9 @@ MODEL_OPS = [
      "REF/NEW"),
     ("pi0", "flow-matching Euler step x + dt v", "mul, add", "VPU", BF16, f"{OP}/pi0_pytorch.py:418; {QV_PI0}:138,143",
      "REF"),
-    ("pi0", "flow time update and loop test", "add_ (0-d), neg, div, ge, _local_scalar_dense", "host + VPU",
-     "float32", f"{OP}/pi0_pytorch.py:402-419; -dt/2 on the VPU ({QV_PI0}:148,160), time += dt and the "
+    ("pi0", "flow time update and loop test", "add_ (0-d), neg, div, ge, _local_scalar_dense", "host + scalar",
+     "float32", f"{OP}/pi0_pytorch.py:402-419; -dt/2 in float32 on the scalar core (NEW one-element fp32 rule; "
+     f"the reference puts it on the VPU, {QV_PI0}:148,160; the loop count is unchanged), time += dt and the "
      "compare on the host (NEW, as the reference: add_ is not in its TARGET_OPS)", "NEW"),
     ("pi0", "initial noise", "normal (randn)", "host", "float32", "RNG on the host", "HOST"),
 ]
