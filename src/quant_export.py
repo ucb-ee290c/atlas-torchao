@@ -151,6 +151,14 @@ def add_args(ap) -> None:
                    help="declare in policy.json that Linear / Conv2d sites of a static recipe without "
                         "calibration data (e.g. an unused lm_head) may keep the dynamic per-tensor rule; "
                         "undeclared sites make verify_bundle.py fail 'static recipe is fully static'")
+    g.add_argument("--pack-fold", action="store_true",
+                   help="after the export, fold the static activation pack exponents into the compiler's admitted E8M0 range "
+                        "122..128 where the producer already multiplies by a constant (RMSNorm gamma, up_proj weight exponent, "
+                        "PV pop rescale, a Linear feeding a Linear); exact, no re-calibration (docs/algos/pack-fold.md). "
+                        "Default off: the export is unchanged. The unfolded export is kept in <export-dir>.unfolded")
+    g.add_argument("--pack-fold-graph", default=None,
+                   help="with --pack-fold: fx/ directory (graph.txt, graph_signature.txt) of a native-FP8 capture of this model's "
+                        "export; default: capture the graph in process (causal LMs only)")
     g.add_argument("--from-export", default=None,
                    help="build every quantized mode from this export (load_quantized.py) instead of "
                         "quantizing: no calibration, no float weights of the quantized layers")
@@ -772,4 +780,34 @@ def export(model: nn.Module, export_dir, *, mode: str, report: dict, algo, algo_
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2, allow_nan=False) + "\n")
     print(f"export: wrote {out} ({manifest['files']['model.safetensors']['bytes'] / 2**20:.1f} MiB, "
           f"{manifest['counts']['quantized']} quantized sites)", flush=True)
+    if getattr(options, "pack_fold", False):
+        manifest = _pack_fold_in_place(out, model, policy, getattr(options, "pack_fold_graph", None))
     return manifest
+
+
+def _pack_fold_in_place(out: Path, model, policy: dict, graph_dir) -> dict:
+    """--pack-fold: replace the export in `out` by its folded twin (src/pack_fold.py); the unfolded export stays in
+    <out>.unfolded. The producer classes come from an FX capture of the unfolded export."""
+    import os
+
+    import pack_fold
+
+    if graph_dir:
+        graph, sig = (Path(graph_dir) / "graph.txt").read_text(), (Path(graph_dir) / "graph_signature.txt").read_text()
+    else:
+        graph, sig = pack_fold.capture_graph_text(model, policy)
+    unfolded = out.with_name(out.name + ".unfolded")
+    if unfolded.exists():
+        raise FileExistsError(f"--pack-fold: {unfolded} exists")
+    os.replace(out, unfolded)
+    try:
+        summary = pack_fold.fold_export_dir(unfolded, out, graph, sig)
+    except BaseException:
+        if out.exists():
+            import shutil
+            shutil.rmtree(out)
+        os.replace(unfolded, out)
+        raise
+    print(f"export: pack fold {summary['outside_before']} -> {summary['outside_after']} static sites outside "
+          f"{summary['admitted_range']} ({summary['sites_folded']} folded); unfolded export kept in {unfolded}", flush=True)
+    return json.loads((out / "manifest.json").read_text())

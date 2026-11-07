@@ -5,6 +5,8 @@ Facts only. This implements the exporter side of `docs/algos/pack-range-options.
 admission range 122..128 (`tile_native.PACK_ADMISSION`) and the existing `compiler_pack_scale_admission` report, including its
 `not_checked_dynamic` status for exports with no static activation exponent, are unchanged.
 
+The opt-in pass that applies the free folds (changes weights, exponents and the policy; exact) is [pack-fold.md](pack-fold.md); this plan stays reporting only.
+
 ## What is recorded
 
 A static activation exponent `s` means `real = e4m3(byte) * 2^s`; the pack code is `c = 127 + s`. Multiplying the value by `2^k` at its

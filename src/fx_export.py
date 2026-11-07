@@ -422,11 +422,11 @@ def _native_sites(module, policy, storage, *, attention=True, conv=True):
                 nrule = REFERENCE_OPERAND if algo is None else sites[site][operand]
                 return _qact(x, nrule, storage, f"{site}:{operand}", label=f"{site}:{operand}")
 
-            def mm(fm, a_q, a_s, b_q, b_s, dtype_out=torch.float32, role=None):
+            def mm(fm, a_q, a_s, b_q, b_s, dtype_out=torch.float32, role=None, pop_shift=0):
                 if fm is not None or role not in ("qk", "pv"):
-                    return original_mm(fm, a_q, a_s, b_q, b_s, dtype_out, role)
+                    return original_mm(fm, a_q, a_s, b_q, b_s, dtype_out, role, **({"pop_shift": pop_shift} if pop_shift else {}))
                 op = torch.ops.atlas.qk_matmul if role == "qk" else torch.ops.atlas.pv_matmul
-                return op(a_q, a_s, b_q, b_s)
+                return op(a_q, a_s, b_q, b_s, int(pop_shift)) if pop_shift else op(a_q, a_s, b_q, b_s)
             patched = [("_cast", original_cast), ("_mm", original_mm)]
             ref_attention._cast, ref_attention._mm = cast, mm
         yield plan

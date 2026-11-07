@@ -191,6 +191,13 @@ def weight_cast(algo, name, w, kind):
     return q, s, sc.block
 
 
+def attn_pv_shift(algo, name) -> int:
+    """NEW (docs/algos/pack-fold.md): integer k such that the PV pop rescale of attention site `name` is 2^(sp+sv+k), the
+    folded pack exponent of the o_proj input. 0 for every algorithm and export without a fold."""
+    f = getattr(algo, "pv_pop_shift", None)
+    return int(f(name)) if f is not None else 0
+
+
 def act_cast(algo, name, x, kind, dims=None):
     """(codes, exp, block) of an activation. algo None: rn.quantize(x, dims)."""
     if algo is None:
