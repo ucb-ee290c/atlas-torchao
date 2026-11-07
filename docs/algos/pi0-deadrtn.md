@@ -127,11 +127,20 @@ Stock BF16 actions are identical between the runs of the two exports (`actions`,
 |---|---|---|---|---|---|---|---|
 | 4 | previous export (GPTQ panel, no AWQ) | 0.0564 | 0.99868 | 0.0288 | 0.00545 | 0.0051, 0.0048, 0.0053, 0.0064 | 0.00708 (stock 0.00747) |
 | 4 | new export (+ dead_columns=rtn) | 0.0594 | 0.99834 | 0.0346 | 0.00574 | 0.0056, 0.0056, 0.0059, 0.0058 | 0.00725 (stock 0.00747) |
+| 8 | previous export (GPTQ panel, no AWQ) | 0.0574 | 0.99839 | 0.0408 | 0.00694 | 0.0051, 0.0048, 0.0053, 0.0064, 0.0120, 0.0052, 0.0072, 0.0056 | 0.01700 (stock 0.01656) |
+| 8 | new export (+ dead_columns=rtn) | 0.0539 | 0.99857 | 0.0390 | 0.00652 | 0.0056, 0.0056, 0.0059, 0.0058, 0.0104, 0.0045, 0.0069, 0.0051 | 0.01691 (stock 0.01656) |
+
+Reading (N = 8 contains the N = 4 frames as its first four; the 4-obs rows are separate runs of the same frames and reproduce the first four per-frame values exactly):
+on 4 observations the new export is 5% worse than the previous one in `delta_rel_l2` (0.0594 vs 0.0564); on 8 it is 6% better (0.0539 vs 0.0574). Per frame (abs-space rel L2 against stock) the new export is lower on 5 of 8 frames
+(frames 3 to 7) and higher on 3 (frames 0 to 2). The sign of the difference changes with the number of observations, so with 8 observations the two exports are not separable; both are within 0.0539 to 0.0594 of stock in delta space
+(cosine 0.9983 to 0.9987), and both are below the stock policy's own distance to the recorded actions (MSE vs recorded delta 0.0170 and 0.0169 vs stock 0.0166 on 8 frames, i.e. quantization adds at most 2.7% of MSE there). Frame 4 (index 4) is the
+largest error for both (0.0120 previous, 0.0104 new).
+Not shown by this proxy: whether the fc2 fix helps. The fc2 real-input check above found the captured frame does not excite the zeroed columns, and the action metric has the same property on these 8 frames within the spread seen here.
 
 ## Not measured
 
-- No closed-loop rollout, no success rate, no quality number against ground truth beyond the MSE/MAE vs recorded deltas printed above, which are dominated by the policy's own error (stock BF16 delta MSE 0.00747 on 4 frames).
-- No repeat of any export with the same recipe, so the run-to-run spread of GPTQ on this host is unknown; the 3% / 7% Gemma drift difference and the action-error difference between the previous and the new export are not attributed to either the option or noise.
+- No closed-loop rollout, no success rate, no quality number against ground truth beyond the MSE/MAE vs recorded deltas printed above, which are dominated by the policy's own error (stock BF16 delta MSE 0.00747 on 4 frames, 0.01656 on 8).
+- No repeat of any export with the same recipe, so the run-to-run spread of GPTQ on this host is unknown; the 3% / 7% Gemma drift difference and the action-error difference between the previous and the new export are not attributed to either the option or noise (the action-error difference changed sign between 4 and 8 observations).
 - No export with `dead_columns=rtn` and AWQ on; no export with the default (`zero`) from today's code, so "previous vs new" also differs by the code between `45edd84` and `4ddedee` and the run itself.
 - Drift is measured on one frame (episode 252 frame 30), Gemma q inputs at layers 0, 9, 17 only; the SigLIP and the action expert are not in the drift metric.
 - fc2 real-input errors use one frame (2 images) outside the calibration set; the export's own calibration `H` was not reproduced, so the in-sample comparison is only in the (single image 0) check above, not for the export.
