@@ -559,3 +559,17 @@ def test_the_comparison_is_not_vacuous_a_fold_without_the_weight_compensation_ch
     assert not torch.equal(run(gamma * (2.0 ** k), s + k, we), y0)                  # consumer weight exponent left alone
     assert torch.equal(run(gamma * (2.0 ** k), s + k, we - k), y0)
     assert not torch.equal(run(gamma * (2.0 ** k), s, we), y0)                      # pack exponent not moved with the value
+
+
+def test_attention_site_with_two_pv_nodes_is_not_folded():
+    """pv_pop_shift is stored per attention SITE: a site whose module is called twice has two P.V nodes and the shift would reach both
+    (SmolVLA's shared text attention has 24). The group is refused and nothing of it changes."""
+    policy, t = _policy_and_tensors()
+    g = _graph() + _n("pv_again", "torch.ops.atlas.pv_matmul.default", "%ga5, %gb5, %vt, %vs")
+    info = pf.graph_info(g, _SIG, policy, set(t))
+    groups = pf.plan_folds(policy, info)
+    grp = groups[info["a.o_proj"]["src"]]
+    assert grp["reason"].startswith("attention_site_called_more_than_once") and "2 atlas.pv_matmul" in grp["reason"]
+    new_t, new_p, _ = pf.apply_folds(t, policy, groups)
+    assert "pv_pop_shift" not in new_p["sites"]["model.a.attn"] and new_p["sites"]["a.o_proj"]["activation"]["exp"] == -6
+    assert torch.equal(new_t["a.o_proj.weight_scale_exp"], t["a.o_proj.weight_scale_exp"])

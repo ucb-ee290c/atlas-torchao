@@ -2,9 +2,9 @@
 the maximum absolute difference, and whether the outputs are byte-identical. Used to show that a pack-fold bundle
 (src/pack_fold.py, docs/algos/pack-fold.md) equals its unfolded twin.
 usage: compare_fx_logits.py FX_A FX_B OUT_JSON [--random N] [--seed S]     (run with PYTHONPATH=<worktree>/src)
-Inputs: the capture-case inputs stored in FX_A/fixtures.safetensors (case_*.input_*) plus N random token-id sequences of the
-same shape drawn below the vocabulary size seen in those inputs' model (max token id of the fixtures is not a bound, so
-the vocabulary is read from the output's last dimension)."""
+Inputs: the capture-case inputs stored in FX_A/fixtures.safetensors (case_*.input_*, every positional input) plus, for a
+causal LM (one integer input per case), N random token-id sequences of the same shape drawn below the vocabulary size (read from the
+output's last dimension). Other boundaries (SmolVLA flow loss, DiT) are compared on the capture cases only."""
 import argparse
 import json
 import sys
@@ -38,19 +38,20 @@ def main(argv=None):
     fa, fb = Path(args.fx_a), Path(args.fx_b)
     fixtures = load_file(str(fa / "fixtures.safetensors"))
     cases = sorted({k.split(".")[0] for k in fixtures if k.endswith(".input_0")})
-    inputs = {c: fixtures[f"{c}.input_0"] for c in cases}
+    inputs = {c: tuple(fixtures[f"{c}.input_{j}"] for j in range(sum(1 for k in fixtures if k.startswith(f"{c}.input_"))))
+              for c in cases}
     prog_a = torch.export.load(str(fa / "model.pt2")).module()
     prog_b = torch.export.load(str(fb / "model.pt2")).module()
     res = {"fx_a": str(fa), "fx_b": str(fb), "cases": {}}
     with torch.no_grad():
-        first = prog_a(inputs[cases[0]])
-        vocab = int(first.shape[-1])
-        g = torch.Generator().manual_seed(args.seed)
-        shape = inputs[cases[0]].shape
-        for i in range(args.random):
-            inputs[f"random_{i}"] = torch.randint(0, vocab, tuple(shape), generator=g, dtype=inputs[cases[0]].dtype)
+        first = inputs[cases[0]]
+        if len(first) == 1 and not first[0].is_floating_point():
+            vocab = int(prog_a(*first).shape[-1])
+            g = torch.Generator().manual_seed(args.seed)
+            for i in range(args.random):
+                inputs[f"random_{i}"] = (torch.randint(0, vocab, tuple(first[0].shape), generator=g, dtype=first[0].dtype),)
         for name, ids in inputs.items():
-            res["cases"][name] = _cmp(prog_a(ids), prog_b(ids))
+            res["cases"][name] = _cmp(prog_a(*ids), prog_b(*ids))
             print(name, res["cases"][name]["differing_logits"], res["cases"][name]["max_abs_difference"], flush=True)
     c = res["cases"].values()
     res["total_logits"] = sum(x["elements"] for x in c)

@@ -92,6 +92,12 @@ def graph_info(graph_text: str, signature_text: str, policy: dict, tensor_names=
     users = _users(nodes, order)
     acts_of_src = collections.defaultdict(list)
     per_key = collections.defaultdict(list)
+    pv_calls = collections.Counter()                    # atlas.pv_matmul nodes per attention site (pv_pop_shift is per SITE)
+    for n in order:
+        if nodes[n]["t"] == "atlas.pv_matmul":
+            p_act = pp._real(nodes, nodes[n]["refs"][0])
+            pa = [x.strip() for x in nodes[p_act]["args"].split(",")] if p_act in nodes else []
+            pv_calls[pp._match_site(pa[6].rpartition(":")[0], attn_names) if len(pa) > 6 and ":" in pa[6] else None] += 1
     site_calls = collections.Counter()                  # qlinear / qconv2d nodes per weight site (a module called twice shows 2)
     for n in order:
         if nodes[n]["t"] in ("atlas.qlinear", "atlas.qconv2d"):
@@ -129,7 +135,7 @@ def graph_info(graph_text: str, signature_text: str, policy: dict, tensor_names=
         extra = sorted({t for t in pp._leaves(nodes, users, src)
                         if t not in ("atlas.quantize_act", "aten._assert_tensor_metadata.default")})
         info[key] = {"class": cls, "other_consumers": extra, "node": first["node"], "nodes": len(rows), "src": src,
-                     "desc": pd, "site_calls": dict(site_calls), "consumer_site": next(iter(first["consumers"])) if len(first["consumers"]) == 1 else None,
+                     "desc": pd, "site_calls": dict(site_calls), "pv_calls": dict(pv_calls), "consumer_site": next(iter(first["consumers"])) if len(first["consumers"]) == 1 else None,
                      "consumer_sites": sorted(first["consumers"]), "group_acts": acts_of_src[src],
                      "producer": _producer(nodes, users, buffers, params, src, cls, pd, qsites, attn_names, tensor_names)}
         info[key]["producer"] = _single_user(nodes, users, info[key]["producer"], params)
@@ -275,8 +281,12 @@ def _group_reason(policy, g, k, max_abs_k) -> str | None:
             return f"producer_has_residual_passes:{prod['site']}"
         if g["class"] == "gated_product" and prod["qlinear_consumers"] != ["aten.mul.Tensor"]:
             return "producer_output_has_other_consumers:" + ",".join(prod["qlinear_consumers"])
-    if prod["kind"] == "pv_shift" and not prod["site"]:
-        return "attention_site_unresolved"
+    if prod["kind"] == "pv_shift":
+        if not prod["site"]:
+            return "attention_site_unresolved"
+        n_pv = next(iter(infos))["pv_calls"].get(prod["site"], 0)
+        if n_pv != 1:                       # the shift lives in the policy site, so it would reach every P.V node of the site
+            return f"attention_site_called_more_than_once: {n_pv} atlas.pv_matmul nodes share the site {prod['site']}"
     return None
 
 
