@@ -88,6 +88,34 @@ own `model.pt2` run now on its own recorded case-0 inputs gives the same 121 dif
 Forcing `ATEN_CPU_CAPABILITY=avx2` or `ONEDNN_MAX_CPU_ISA=AVX2` changes both cases (138 / 140 elements differ), so the replay depends on the CPU kernel dispatch of BF16 contractions. The `src` files the replay imports are identical between the capture commit `6b1b358` and
 `4ddedee` (diff of `src` touches only `algos/gptq_awq.py`, `fx_export.py`, `pack_plan.py`, `quant_export.py`). The root cause of the case-0 difference was not found. The in-process comparison above is therefore the equivalence evidence; do not use the recorded case-0 fixture as a bit-exact reference across machines or kernel dispatch settings.
 
+## 4. Pi0 phase bundles
+
+`prefix` = `_preprocess_observation` + openpi's `embed_prefix` (3 SigLIP calls, cameras NOT stacked: with the call counting each SigLIP module has 3 nodes, which removes the one-tower deviation of the single-step bundle)
++ the PaliGemma prefix pass with `use_cache=True`; outputs `prefix_pad_masks` [1, 868] and 36 K/V tensors of [1, 1, 868, 256]. `step` = `denoise_step` with the 36 tensors rebuilt into a `DynamicCache` (inputs state, `prefix_pad_masks`, `x_t`, `time`, K/V; output `v_t` [1, 10, 32]).
+Driver `scripts/tile_flow/pi0_phase_capture.py` (copy in the phases directory), non-strict export under torch 2.7.1 (atlas-pi0 env), native FP8 uint8, the same `aten.conv2d.padding` driver workaround as the single-step bundle.
+Capture wall clock (host load average about 40): prefix 40 minutes (16:05 to 16:45), step 8.5 minutes.
+
+| | prefix | step | existing single-step bundle |
+|---|---|---|---|
+| quantized Linear sites in graph (of 420) | 289 | 131 | 420 |
+| of which called 3 times | 163 (27 SigLIP layers x 6 Linear + the projector) | 0 | 0 (cameras stacked) |
+| attention sites in graph (of 63) | 45 (27 SigLIP, 3 pairs each; 18 PaliGemma, 1 pair) | 18 (action expert) | 63 |
+| declared unused (Linear / attention) | 131 / 18 | 289 / 45 | |
+| `atlas.qlinear` / `qk_matmul` / `pv_matmul` / `quantize_act` | 615 / 99 / 99 / 1,011 | 131 / 18 / 18 / 203 | |
+| native graph nodes | 9,662 | 3,985 | 8,149 |
+| `verify_bundle.py` | 25 of 25, `ok: true` | 25 of 25, `ok: true` | |
+| capture status, same-process and fresh-process replay | passed, passed | passed, passed | |
+| `still_emulated.emulated_modules` | empty | empty | |
+
+(615 = 289 + 2 x 163; 1,011 = 615 + 4 x 99; both from the same graph counts.) Both bundles have `bundle_manifest.json` with `loop_manifest.matches_fx_manifest: true`; the loop manifest records `siglip_calls_per_prefix_call: 3`.
+
+### Pi0 equivalence (`compose_phases.py pi0`, `compose_phases.json`)
+
+One step with the existing bundle's own fixture inputs: `prefix`, then `step` at time 1.0, then `x = noise + (-1.0) * v` (the single-step bundle is `sample_actions(num_steps=1)`), against the existing single-step `model.pt2` (cameras stacked, one SigLIP call) run in the same process:
+**byte-identical on both cases, max abs difference 0.0**, 36 K/V tensors with the manifest's shape. This is also real-weight evidence that stacking the cameras equals three SigLIP calls for this bundle (the plan's section 5 item 4 had only tiny-model evidence).
+Against the *recorded fixtures* of the existing bundle both cases differ (max abs 0.036 and 0.045); the existing single-step graph itself differs from its own recorded fixture by the same amount, so as for DiT this is a property of the existing bundle in this environment, not of the phase split.
+10-step host loop against eager `sample_actions(num_steps=10)`: NOT RUN at the time of this commit (see the update below if present).
+
 ## How a compiler owner consumes it
 
 1. Read `loop_manifest.json` first: `denoising_steps`, `graphs.<name>.calls_per_action_chunk`, `graphs.<name>.inputs/outputs` (shapes, dtypes), `loop` (pseudo-code), `host_operations`, and `scheduler.per_step` (DiT) or `euler.times` (Pi0).
