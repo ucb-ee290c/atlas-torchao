@@ -233,3 +233,41 @@ no policy site and are not quantized (the 24 attention sites are the CLIP text a
 (no storage, no users in the graph; `fresh_process_verification.json`: `unused_float_weights_not_materialized: true`).
 After the change the same verifier, run read-only on the same bundles, passes 25 of 25 checks for both (DiT: 7 declared contractions, 1 BF16-by-policy conv and 6 unquantized attention; Pi0: 1 declared conv and 420 tolerated meta placeholders), and still 25 of 25 for TinyLlama `atlas_v1_awq_tile` and `atlas_v1_awq_tile_static` (the extra check is `static_recipe_fully_static`). The bundles' own `policy.json` files were written before `uncalibrated_fallback` existed; their count is derived by the verifier (0).
 Pi0 and DiT quality was not measured (no comparable old number; the old DiT and Pi0 exports were never produced).
+
+## 9. Optional steps added after the first bundles (2026-11-06)
+
+All are off by default; none changes a default export (checked byte for byte against the base commit for the pack fold).
+
+### 9.1 `dead_columns=rtn` (GPTQ, any model with ReLU/GELU-gated inputs)
+GPTQ zeroes every weight column whose calibration Hessian diagonal is zero. When calibration never excites an input channel, that channel's weights
+are lost for good (Pi0 SigLIP `fc2`: 3.5k to 4.2k of 4,304 columns per layer in layers 17 to 25). `dead_columns=rtn` rounds those columns to nearest on
+the same exponents and gives no error feedback; live columns are bit-identical to the default. Put it in the `gptq_awq` stage options. The Pi0 candidate recipe:
+
+```
+gptq_awq:method=gptq,actorder=true,dead_columns=rtn+granularity:w=panel,a=defer,attn=defer,rows=32,rule=nc+static_calib+keep_bf16:rule=input_conv
+```
+Pi0 export (atlas-pi0 env, about 35 min on a loaded CPU host):
+`python -u src/eval_pi0.py --obs droid --n-obs 32 --seed 0 --modes ref_conv --algo "$R" --export-dir export --export-only --device cpu --openpi-dir ... --checkpoint-dir ... --tokenizer-path ...`
+with `R` set to the recipe string above. Why AWQ is off for Pi0: AWQ with panel exponents damages salient producer rows (`tile-pi0-awq-diag.md`). Result and the exact bundle: `pi0-deadrtn.md`.
+Check afterwards: count all-zero weight columns per tensor (`scripts/tile_diag/fc2_export_compare.py`).
+
+### 9.2 Pack-range fold (`--pack-fold`)
+The compiler's `lowerPack` accepts activation codes 122..128. The fold moves out-of-range static exponents into range by an exact power-of-two change in the producer
+(RMSNorm/LayerNorm/`(1+w)` weights, `up_proj`, `pv_pop_shift` for P.V into `o_proj`) and compensates in the consumer, so FP8 bytes and the pop constant are unchanged.
+Post-hoc on an existing export, no re-calibration:
+```bash
+python src/pack_fold.py --export-dir <E>/export --fx-dir <E>/fx --out-dir <F>/export
+python src/fx_export.py --export-dir <F>/export --out-dir <F>/fx --native-fp8 --seqlen 64       # re-capture
+python scripts/tile_flow/verify_bundle.py <F>/export <F>/fx <F>/verify_bundle.json
+python scripts/tile_flow/compare_fx_logits.py <E>/fx <F>/fx <F>/compare_fx_logits.json --random 6
+python scripts/tile_flow/make_bundle_manifest.py <F>
+```
+TinyLlama: 114 of 176 sites outside the range becomes 22 (attention `p`), 0 of 16.4M logits differ. Needs the compiler importer to accept the new trailing `pop_shift`
+argument of `atlas.pv_matmul`. Refused sites (shared producers, BF16 `(1+w)`, dynamic consumers, shared attention sites) are listed per site in `policy.json` (`pack_fold`). Details: `pack-fold.md`.
+
+### 9.3 Per-phase graphs for iterative policies (DiT, Pi0)
+Diffusion and flow policies loop; a single graph cannot hold the loop. The default taken: one graph per phase and a host-owned loop described by `loop_manifest.json`
+(DiT: `encode` once, `step` 100 times; Pi0: `prefix` once, `step` 10 times). Build the manifest with `scripts/tile_flow/make_loop_manifest.py dit|pi0 --single-step-bundle DIR --out PATH`,
+capture the phases with `scripts/tile_flow/policy_fx_capture_phases.py` (DiT) or `scripts/tile_flow/pi0_phase_capture.py` (Pi0), verify each phase with `verify_bundle.py`,
+and compare the composition with the single-step graph using `scripts/tile_flow/compose_phases.py`. A quantized module that a graph calls N times is now allowed (N node sets, each with its own
+`quantize_act`); one that is never called is recorded as absent. Exact commands and expected numbers: `phase-graphs.md`. The Pi0 10-step loop against eager is not finished.
