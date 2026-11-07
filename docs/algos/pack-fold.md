@@ -91,7 +91,7 @@ a consumer or the producer has residual passes, `|k| > 20`, or an exactness guar
 
 ## Validation
 
-### Tiny random Llama (tests/test_pack_fold.py, 71 tests, all passed together with test_pack_plan.py, test_tile_flow_defects.py and test_algo_tile.py: 183 passed, 0 skipped)
+### Tiny random Llama (tests/test_pack_fold.py, 72 tests, all passed together with test_pack_plan.py, test_tile_flow_defects.py and test_algo_tile.py: 184 passed, 0 skipped)
 
 Static recipe `atlas_v1_awq_tile_static`, 2 layers: 16 static sites, 16 outside, after the fold 2 outside (the two attention p sites; 14 folded:
 10 norm_affine, 2 gated_product, 2 attn_out_pv). Eager logits of the folded and unfolded exports are `torch.equal`; the native-FP8 FX captures of both give
@@ -138,23 +138,40 @@ framework's float32 accumulation; no BF16-accumulation or hardware run was made.
 Not re-measured here: the byte identity of the FP8 codes on real activations (0 of 116,654,080 differing, measured in pack-range-options.md section 1);
 the end-to-end logits comparison covers it indirectly (a differing code would change a logit; the negative control above shows a wrong fold does).
 
-### Other bundles (post-hoc plan applied to the real tensors in memory; nothing written; counts only, NOT validated end to end unless stated)
+### Other bundles
 
-| bundle | static sites | outside before | free sites folded | outside after | outside after, by class |
-|---|---|---|---|---|---|
-| TinyLlama | 176 | 114 | 92 | 22 | attn_p 22 |
-| SmolVLA | 316 | 244 | 213 | 31 | attn_p 13, bare_activation 6, linear_to_linear 9, modulation_add 1, raw_input 2 |
-| Multi-Task DiT | 203 | 88 | 24 | 64 | attn_p 24, x_sigmoid_product 17, bare_activation 13, attn_out_sdpa 6, modulation_add 1, index 1, sin 1, raw_input 1 |
-| Pi0 | 483 | 127 | 61 | 66 | attn_p 63, raw_input 2, bare_activation 1 |
+| bundle | static sites | outside before | folded | outside after | outside after, by class | end to end |
+|---|---|---|---|---|---|---|
+| TinyLlama | 176 | 114 | 92 | 22 | attn_p 22 | yes (above) |
+| SmolVLA | 316 | 244 | 181 (145 norm_affine, 24 gated_product, 12 attn_out_pv) | 63 | attn_out_pv 32, attn_p 13, linear_to_linear 9, bare_activation 6, raw_input 2, modulation_add 1 | yes (below) |
+| Multi-Task DiT | 203 | 88 | 24 (attn_out_pv) | 64 | attn_p 24, x_sigmoid_product 17, bare_activation 13, attn_out_sdpa 6, modulation_add 1, index 1, sin 1, raw_input 1 | **no**, counts only |
+| Pi0 | 483 | 127 | 61 (27 attn_out_pv, 24 norm_affine (1 + w), 7 gated_product, 3 layer_norm) | 66 | attn_p 63, raw_input 2, bare_activation 1 | **no**, counts only |
 
-Differences from the research estimate (92 / 221 / 24 / 61 free): SmolVLA 213 instead of 221. The 8 `linear_to_linear` sites that the research counted as
-free are the VLM `v_proj` outputs; the same tensor is also packed by a dynamic attention-v `quantize_act` in the same graph, so scaling the producer would
-change the attention numerics (the dynamic v exponent follows the scale and the PV output is then `2^k` too large unless `pop_shift = -k` is also
-set on that attention site). The pass refuses them (`non_static_or_attention_consumer`) and the 9th has a non-pack consumer (`expand_as`). Pi0: all 24
-Gemma `(1 + w)` norms fold (the parameters are float32 and `fl32(w' + 1) == 2^k fl32(w + 1)` held for every element), the 3 LayerNorms fold, 0 BF16-range
-failures (smallest effective multiplier 1.06e-6, largest 30.1); for BF16 `(1 + w)` parameters (SmolVLA has none that are not plain gamma) the fold would be refused.
-SmolVLA: 65 gamma tensors scaled, smallest `|2^k gamma|` 3.0e-3, largest 5.5, 0 failures. DiT: its 24 free sites are all P.V outputs (no norm or gated product).
-DIT_PLACEHOLDER
+SmolVLA, end to end (post-hoc fold of the existing export, fresh `fx_export.py --boundary smolvla_flow_loss --native-fp8 --seqlen 8` capture of the
+folded export into `/scratch2/lorenhung/atlas-fp8/exports-tile-fold/smolvla/atlas_v1_awq_tile_static_packfold/`): capture passed (302 qlinear, 1 qconv2d,
+36 qk_matmul, 36 pv_matmul nodes, fresh-process reload byte identical), `verify_bundle.py` 25 of 25 (unfolded: 25 of 25), `pack_fold` report 63 sites still out of range,
+recorded equals recomputed. The flow-loss outputs of the two bundles on the same 2 capture cases (2 x 1600 values): eager outputs stored in the two `fixtures.safetensors`
+are `torch.equal`, and the two `model.pt2` graphs give 0 differing values, max abs difference 0.0 (`compare_fx_outputs.json`). 65 gamma tensors scaled, smallest
+`|2^k gamma|` 3.0e-3, largest 5.5, 0 BF16-range failures.
+
+A bug this end-to-end run found (fixed, regression test `test_attention_site_with_two_pv_nodes_is_not_folded`): `pv_pop_shift` is stored per attention SITE, and
+SmolVLA's shared text attention site has 24 `atlas.pv_matmul` nodes (module called 24 times). The first version folded the groups of that site, so the shift
+reached all 24 nodes and the outputs differed (all 1600 values, max abs difference 81.7 in the first case). A fresh-process bisect over the folded classes showed
+`gated_product` and `norm_affine` exact and `attn_out_pv` not. The pass now refuses a P.V fold when the attention site has more than one `pv_matmul` node
+(`attention_site_called_more_than_once`): 24 groups, 32 sites in SmolVLA. TinyLlama, DiT and Pi0 have one `pv_matmul` per site (counted from the graphs), so their counts do not change.
+A per-node shift would need the shift to live on the node, not the policy site; not implemented.
+
+Differences from the research estimate (92 / 221 / 24 / 61 free): SmolVLA 181 instead of 221 (-32 shared-attention P.V sites above, -8 below); TinyLlama, DiT and Pi0 equal the estimate.
+The 8 SmolVLA `linear_to_linear` sites that the research counted as free are the VLM `v_proj` outputs; the same tensor is also packed by a dynamic attention-v
+`quantize_act` in the same graph, so scaling the producer would change the attention numerics (the dynamic v exponent follows the scale and the PV output is then `2^k` too
+large unless `pop_shift = -k` is also set). The pass refuses them (`non_static_or_attention_consumer`); the 9th has a non-pack consumer (`expand_as`).
+Pi0: all 24 Gemma `(1 + w)` norms fold (the parameters are float32 and `fl32(w' + 1) == 2^k fl32(w + 1)` held for every element), the 3 LayerNorms fold, 0 BF16-range
+failures (smallest effective multiplier 1.06e-6, largest 30.1); a BF16 `(1 + w)` parameter would be refused. DiT: its 24 free sites are all P.V outputs (no norm or gated product).
+
+DiT and Pi0 were not validated end to end. DiT: re-capturing even the UNFOLDED existing export with the current code fails before the fold is involved
+(`KeyError: export policy has no quantized site 'noise_predictor.transformer_blocks.0.attn'`; the export predates the DiT attention sites that `_dit_rope_attention`
+now routes through `ref_attention`), and a new DiT export is a long run. Pi0's capture takes about 1,549 s. Their P.V, LayerNorm and `(1 + w)` folds are therefore covered
+by the synthetic tests and the SmolVLA / TinyLlama runs of the same code paths, not by a bundle of their own.
 
 ## Limits and open items
 
@@ -174,7 +191,7 @@ DIT_PLACEHOLDER
 * The offline guard cannot see activation magnitudes: `2^k x` overflowing BF16 is excluded only by the calibrated range (`|x| <= 448 * 2^s`, so
   `|2^k x| <= 448 * 2^(s+k)`, with `s + k <= 1`), not measured per element.
 * `--pack-fold` inside the export CLIs needs the FX graph: causal LMs are captured in process; for other models pass `--pack-fold-graph <fx dir>` from a capture
-  of that model's unfolded export, or use the post-hoc CLI `python src/pack_fold.py` (the path used for every number above). Only causal-LM and DiT folded
+  of that model's unfolded export, or use the post-hoc CLI `python src/pack_fold.py` (the path used for every number above). Only causal-LM (TinyLlama) and SmolVLA folded
   bundles were exercised end to end here; the export CLI flag itself was exercised only on the tiny Llama.
 * The eval result JSON files (`--out`) list `vars(args)`, so they gain two keys (`pack_fold`, `pack_fold_graph`); the export files (`policy.json`, `manifest.json`,
   `model.safetensors`) of a default run are not affected.
@@ -188,5 +205,8 @@ python src/fx_export.py --export-dir <fold>/export --out-dir <fold>/fx --native-
 python scripts/tile_flow/verify_bundle.py <fold>/export <fold>/fx <fold>/verify_bundle.json                   # 10.7 s, 25 of 25
 python scripts/tile_flow/compare_fx_logits.py <tinyllama>/fx <fold>/fx <fold>/compare_fx_logits.json --random 6
 python scripts/tile_flow/make_bundle_manifest.py <fold>
-python -m pytest tests/test_pack_fold.py tests/test_pack_plan.py tests/test_tile_flow_defects.py tests/test_algo_tile.py -q   # 183 passed, 219 s
+# SmolVLA: same pack_fold.py call, then
+python src/fx_export.py --export-dir <fold-smolvla>/export --out-dir <fold-smolvla>/fx --boundary smolvla_flow_loss --native-fp8 --seqlen 8   # about 9 min
+python scripts/tile_flow/verify_bundle.py ... ; python scripts/tile_flow/compare_fx_logits.py <smolvla>/fx <fold-smolvla>/fx <fold-smolvla>/compare_fx_outputs.json
+python -m pytest tests/test_pack_fold.py tests/test_pack_plan.py tests/test_tile_flow_defects.py tests/test_algo_tile.py -q   # 184 passed, 225 s
 ```
