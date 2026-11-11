@@ -1222,6 +1222,99 @@ class CausalLogits(torch.nn.Module):
         return self.model(input_ids, use_cache=False).logits
 
 
+def phase_positions_and_mask(input_ids, past_length):
+    """Positions and the additive BF16 causal mask of one phase, built by the host (outside the graph):
+    ids [B, Q] int64 appended after `past_length` cached tokens -> positions [B, Q] int64, mask [B, 1, Q, past + Q]."""
+    batch, query = input_ids.shape
+    positions = torch.arange(past_length, past_length + query, device=input_ids.device)[None].expand(batch, -1)
+    keys = torch.arange(past_length + query, device=input_ids.device)
+    allowed = keys[None, None, None, :] <= positions[:, None, :, None]
+    return positions.contiguous(), torch.where(allowed, 0.0, torch.finfo(torch.bfloat16).min).to(torch.bfloat16)
+
+
+class _AppendTensorCache:
+    """Per-call stand-in for HF's cache object: the K/V state is only tensors (inputs and outputs of the graph).
+    K is stored after RoPE and before GQA expansion."""
+
+    def __init__(self, pairs):
+        self.pairs = list(pairs)
+        self.updated = [False] * len(self.pairs)
+
+    def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
+        del cache_kwargs          # part of HF's cache interface (RoPE / sliding-window hints); unused here
+        if self.updated[layer_idx]:
+            raise FXVerificationError("a layer appended to its K/V cache twice")
+        old_key, old_value = self.pairs[layer_idx]
+        if old_key is None:
+            key, value = key_states, value_states
+        else:
+            key = torch.cat((old_key, key_states), dim=-2)
+            value = torch.cat((old_value, value_states), dim=-2)
+        self.pairs[layer_idx] = (key.contiguous(), value.contiguous())
+        self.updated[layer_idx] = True
+        return self.pairs[layer_idx]
+
+    def get_seq_length(self, layer_idx=0):
+        key = self.pairs[layer_idx][0]
+        return 0 if key is None else key.shape[-2]
+
+    def tensors(self):
+        if not all(self.updated):
+            raise FXVerificationError("a layer did not append to its K/V cache")
+        return tuple(tensor for pair in self.pairs for tensor in pair)
+
+
+class CausalLogitsPhase(torch.nn.Module):
+    """Causal-LM boundary with the mask, the positions and the K/V cache as explicit tensors.
+
+    prefill (`past_len == 0`):  (input_ids [B,Q], position_ids [B,Q], attention_mask [B,1,Q,Q])
+                                -> (logits, K0, V0, ..., Kn, Vn)
+    decode  (`past_len > 0`):   (input_ids [B,1], position_ids [B,1], attention_mask [B,1,1,P+1], K0, V0, ..., Kn, Vn)
+                                -> (logits, K0', V0', ..., Kn', Vn')   with K', V' of length P + 1
+    Positions and mask are inputs, so none of HF's mask or position code is traced. K/V are [B, Hkv, L, D] in the
+    model dtype. The same input / output order as the Merlin whole-model `TensorCacheLogits`."""
+
+    def __init__(self, model, past_len):
+        super().__init__()
+        self.model = model
+        self.past_len = past_len
+        self.layers = model.config.num_hidden_layers
+
+    def forward(self, input_ids, position_ids, attention_mask, *cache):
+        inner = self.model.model
+        if self.past_len:
+            pairs = tuple(zip(cache[::2], cache[1::2]))
+        else:
+            pairs = tuple((None, None) for _ in range(self.layers))
+        store = _AppendTensorCache(pairs)
+        hidden = inner.embed_tokens(input_ids)
+        position_embeddings = inner.rotary_emb(hidden, position_ids)
+        for layer in inner.layers:
+            hidden = layer(hidden, attention_mask=attention_mask, position_ids=position_ids, past_key_values=store,
+                           position_embeddings=position_embeddings, use_cache=True)
+        return (self.model.lm_head(inner.norm(hidden)), *store.tensors())
+
+
+def causal_phase_cases(boundary, model, vocab, seqlen, seed, device, count=2):
+    """Fixed input tuples for CausalLogitsPhase. A decode case takes its K/V from a real eager prefill of
+    `seqlen` random tokens (never made-up cache values), then appends one random token at position `seqlen`."""
+    prefill = CausalLogitsPhase(model, 0).eval()
+    cases = []
+    for i in range(count):
+        g = torch.Generator().manual_seed(seed + i)
+        ids = torch.randint(vocab, (1, seqlen), generator=g).to(device)
+        positions, mask = phase_positions_and_mask(ids, 0)
+        if boundary == "causal_lm_prefill":
+            cases.append((ids, positions, mask))
+            continue
+        with torch.no_grad():
+            cache = prefill(ids, positions, mask)[1:]
+        nxt = torch.randint(vocab, (1, 1), generator=g).to(device)
+        positions, mask = phase_positions_and_mask(nxt, seqlen)
+        cases.append((nxt, positions, mask, *cache))
+    return cases
+
+
 class SmolVLAFlowLoss(torch.nn.Module):
     """Tensor-in / tensor-out boundary of a LeRobot SmolVLA policy: the flow-matching loss forward
     (`VLAFlowMatching.forward`) for given images, language tokens, state, actions, noise and time. It runs the
@@ -1275,8 +1368,11 @@ def main(argv=None):
                         help="dtype of the held weight-code buffers with --native-fp8. uint8 (default) keeps the "
                              "export bytes; float8_e4m3fn is a bitcast of the same bytes, refused when a layer "
                              "holds a code on which torch and ref_numerics decode differently")
-    parser.add_argument("--boundary", choices=("causal_lm", "smolvla_flow_loss"), default="causal_lm",
-                        help="capture boundary: causal-LM logits (default) or the SmolVLA flow-matching loss forward")
+    parser.add_argument("--boundary", choices=("causal_lm", "causal_lm_prefill", "causal_lm_decode",
+                                               "smolvla_flow_loss"), default="causal_lm",
+                        help="capture boundary: causal-LM logits (default); causal_lm_prefill / causal_lm_decode: "
+                             "mask, positions and the K/V cache as explicit tensors (decode: one token after a "
+                             "--seqlen long cache); or the SmolVLA flow-matching loss forward")
     parser.add_argument("--n-images", type=int, default=1, help="cameras at the smolvla_flow_loss boundary")
     parser.add_argument("--verify-dir", help="fresh-process replay of an existing FX bundle")
     args = parser.parse_args(argv)
@@ -1291,7 +1387,7 @@ def main(argv=None):
 
         _, policy, manifest = load_quantized.read_export(args.export_dir)
         kind = (manifest.get("model") or {}).get("kind", "causal_lm")
-        if (kind == "causal_lm") != (args.boundary == "causal_lm"):
+        if (kind == "causal_lm") != args.boundary.startswith("causal_lm"):
             parser.error(f"export kind {kind!r} does not match --boundary {args.boundary}; the CLI captures causal-LM "
                          "logits or the SmolVLA flow-loss forward (policy action sampling is a separate boundary)")
         if args.boundary == "smolvla_flow_loss":
@@ -1308,9 +1404,15 @@ def main(argv=None):
             model, _, _ = load_quantized.load_quantized(args.model, args.export_dir, args.device,
                                                        mode="ref_conv", seqlen=args.seqlen)
             vocab = model.config.vocab_size
-            cases = [(torch.randint(vocab, (1, args.seqlen), generator=torch.Generator().manual_seed(args.seed + i))
-                      .to(args.device),) for i in range(2)]
-            boundary, config_dict = CausalLogits(model).eval(), model.config.to_dict()
+            if args.boundary == "causal_lm":
+                cases = [(torch.randint(vocab, (1, args.seqlen), generator=torch.Generator().manual_seed(args.seed + i))
+                          .to(args.device),) for i in range(2)]
+                boundary = CausalLogits(model).eval()
+            else:
+                cases = causal_phase_cases(args.boundary, model, vocab, args.seqlen, args.seed, args.device)
+                past_len = args.seqlen if args.boundary == "causal_lm_decode" else 0
+                boundary = CausalLogitsPhase(model, past_len).eval()
+            config_dict = model.config.to_dict()
         report = capture_fx(boundary, cases, args.out_dir, policy=policy,
                             strict=not args.non_strict,
                             native_fp8=args.native_storage if args.native_fp8 else None,
