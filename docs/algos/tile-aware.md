@@ -406,8 +406,10 @@ operations, each read from the checkpoint or the code. Build it with `src/script
 `capture_fx` now counts calls per module: a module called N times yields N node sets (each with its own `quantize_act`) on one
 weight buffer pair, a module never called is recorded as absent (`unused_quantized_modules`, `unused_attention_modules`). The
 Pi0 `prefix` therefore calls SigLIP three times (one per camera) instead of stacking the cameras into one call as the
-single-step bundle does. The two phase bundles of a model hold disjoint quantized sites; the union is the model. Tests:
-`tests/test_loop_manifest.py`, `tests/test_fx_calls.py`, `tests/test_verify_bundle_phases.py`.
+single-step bundle does. The phase bundles of a model hold disjoint quantized sites; the union is the model. Tests:
+`tests/test_loop_manifest.py`, `tests/test_fx_calls.py`, `tests/test_verify_bundle_phases.py`, `tests/test_dit_hoist.py`. The
+DiT's adaLN modulation now has its own phase ([DiT modulation phase](#dit-modulation-phase)); the rows below are the two-graph
+layout.
 
 Equivalence (in-process, reference emulation):
 
@@ -427,6 +429,80 @@ DiT results depend on CPU kernel dispatch; the Pi0 output changes with the threa
 Strict Pi0 export under torch 2.7.1 (pinned by openpi) is blocked by six issues in the driver, openpi and `fx_export`; the
 compilers' own exports are non-strict, so this is not blocking.
 
+#### DiT modulation phase
+
+In the Multi-Task DiT, `time_mlp` and every block's `adaLN_modulation` (SiLU, then Linear 4416 -> 3072 with bias) read only
+the timestep and `conditioning_vec`, never the noisy actions (lerobot `DiffusionTransformer.forward`,
+`TransformerBlock.forward`). The timesteps come from the scheduler and `conditioning_vec` from `encode`, so all 100 steps'
+modulations are known before the loop. The hoisted layout, now the default of `make_loop_manifest.py dit`
+(`--layout two_phase` keeps the old one), has three graphs:
+
+| graph | calls per chunk | inputs | output |
+|---|---|---|---|
+| `encode` | 1 | observation | `conditioning_vec` [1, 4160] |
+| `modulate` | 1 | `conditioning_vec`, `timesteps` int64 [100] | `modulation` [6, 100, 1, 3072] |
+| `step` | 100 | `noisy_actions`, `modulation[:, i]` [6, 1, 3072] | predicted noise |
+
+`modulation[l, i]` is block `l`'s adaLN output at the i-th scheduler timestep (the six chunks shift, scale and gate for
+attention and MLP, in lerobot's order). The step graph is the noise predictor without `time_mlp` and `adaLN_modulation`;
+the host passes the step's slice. `modulate` calls each of its 8 Linears in calls of `steps_per_call` timesteps (default 25,
+so 4 calls of 25 rows); the manifest records `steps_per_call`, `calls_per_site` and the hoisted sites. The three bundles hold
+disjoint quantized sites; their union is the model.
+
+Weight bytes read from the captured graphs (`phase_sizes.py`; E4M3 codes, int32 exponents and BF16 bias of the noise
+predictor's quantized Linears, `atlas_v1_awq_tile_static+keep_bf16:rule=input_conv`):
+
+| | per step | modulate per chunk | noise predictor per chunk |
+|---|---|---|---|
+| two graphs (`step` holds `time_mlp` and adaLN) | 96.2 MiB (34 `qlinear`) | | 9,615 MiB |
+| hoisted | 18.2 MiB (26 `qlinear`) | 311.9 MiB (8 sites x 4 calls; 78.0 MiB once) | 2,129 MiB |
+
+Exactness conditions (the hoisted loop must give the step-by-step result byte for byte):
+
+- Static or per-token activation scales on the hoisted sites: each row is quantized on its own, so a step's rows get the
+  codes the per-step graph gives them. A dynamic scale that spans rows (`a=block` per 32 rows, per tensor) would put several
+  steps in one scale group and change the codes, so the capture refuses `steps_per_call` > 1 for such a recipe;
+  `--steps-per-call 1` keeps the per-step grouping and is exact, but then reads the adaLN weights 100 times per chunk unless
+  the compiler batches the calls.
+- Row count of the reference emulation's matmul: the hardware computes each output row on its own, but the CPU BF16 matmul
+  behind `atlas::qlinear` is not row-count invariant. On the real checkpoint (8 threads), 2 to 25 rows per call give the
+  one-row results exactly; 50 and 100 rows differ in 57 of 1,843,200 adaLN outputs (max 0.0078), which changes the chunk
+  (84 to 97 of 112 action elements, max 0.098). Hence 25 by default.
+- The adaLN Linear is not split into its time and observation halves: that would change the accumulation and the rounding.
+  Computing the observation half once per chunk is a possible follow-up, not an exact one.
+
+Checks: `tests/test_dit_hoist.py` (tiny lerobot DiT: the hoisted step equals the stock noise predictor; the hoisted 100-step
+loop equals `conditional_sample` for 1, 25 and 100 steps per call; the captured modulate and step graphs reproduce the eager
+loop; the dynamic recipe is refused when batched and exact with one step per call). On the real checkpoint,
+`dit_hoist_check.py` compares `policy._generate_actions` with the hoisted loop on frames of the evaluation protocol (CPU,
+8 threads, exports calibrated on 8 frames): 0 differing elements with 1 and 25 steps per call under
+`atlas_v1_awq_tile_static` and `atlas_v1_awq` (per-token scales), and with 1 step per call under `atlas_v1_awq_tile`
+(batching refused); 4 frames per recipe. The hoisted phase bundles (static recipe) pass
+`verify_bundle.py` (25 of 25 each); one step through them equals the stock noise prediction on 4 cases (timesteps 99, 62,
+25, 88), and the 100-step host loop over the three graphs equals eager `conditional_sample`, max abs difference 0.0.
+
+```bash
+python src/scripts/tile_flow/make_loop_manifest.py dit --single-step-bundle B --out P/loop_manifest.json   # hoisted, 25
+for ph in encode modulate step; do
+  python src/scripts/tile_flow/policy_fx_capture_phases.py dit $ph --export-dir E --single-step-bundle B \
+      --loop-manifest P/loop_manifest.json --out P/$ph
+done
+python src/scripts/tile_flow/compose_phases.py dit P B P/compose.json --eager-loop E
+python src/scripts/tile_flow/phase_sizes.py P --out P/sizes.json
+python src/scripts/tile_flow/dit_hoist_check.py --export-dir E --out check.json [--write-cases B]   # B without a graph
+```
+
+Without a captured single-step bundle, `dit_hoist_check.py --write-cases B` writes capture cases (real frames, stock noise
+prediction) in that layout; `compose_phases.py` then compares one step against those recorded outputs instead of a graph.
+
+Other models: SmolVLA's action expert runs `k_proj` and `v_proj` of each cross-attention layer (8 of 16) over the 177 cached
+prefix K/V rows at every one of its 10 steps (`smolvlm_with_expert.py` `forward_cross_attn_layer`), although that input is
+the same for all steps; computing them once in a prefix phase would be exact (same inputs, same row count). There is no
+SmolVLA prefix / step capture yet (`fx_export --boundary smolvla_flow_loss` is a training forward), so this needs the phase
+boundaries, manifest, composer and tests first. Pi0's step re-projects nothing from the prefix (the cache holds the
+projected, rotated K/V); its only per-step invariant is `state_proj(state)` (32 -> 1024, read from lerobot's port; openpi's
+source was not on the build host).
+
 ## Compiler handoff
 
 ### What a bundle contains
@@ -445,6 +521,7 @@ RoPE outer product and BF16 / float32 softmax, norm and residual nodes are ordin
 | SmolVLA | `atlas_v1_awq_tile_static` | flow-loss forward, 1 image | 302 | 1 | 36 | 447 | 25 of 25 |
 | Multi-Task DiT | `atlas_v1_awq_tile_static_attn` | encoder plus one noise-predictor call | 179 | 0 | 30 (24 CLIP, 6 DiT) | 299 | 25 of 25 |
 | Multi-Task DiT phases | `..._attn_phases/{encode,step}` + `loop_manifest.json` | `encode` once, `step` 100 times | see [Per-phase graphs and loop manifest](#per-phase-graphs-and-loop-manifest) | | | | 25 of 25 each |
+| Multi-Task DiT hoisted phases | `atlas_v1_awq_tile_static` (calibration 8 frames), `{encode,modulate,step}` + `loop_manifest.json` | `encode` once, `modulate` once, `step` 100 times | 145 / 32 (8 sites x 4) / 26 | 0 | 24 / 0 / 6 | 241 / 32 / 50 | 25 of 25 each |
 | Pi0 | `gptq_panel_static_noawq_deadrtn` (candidate) | one sampler step, non-strict | 420 | 0 | 63 | 672 | 25 of 25 |
 | Pi0 phases | `gptq_panel_static_noawq_phases/{prefix,step}` + `loop_manifest.json` | `prefix` once, `step` 10 times | see [Per-phase graphs and loop manifest](#per-phase-graphs-and-loop-manifest) | | | | 25 of 25 each |
 
