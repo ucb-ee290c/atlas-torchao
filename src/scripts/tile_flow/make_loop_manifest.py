@@ -214,8 +214,12 @@ def pi0_manifest(single_step_bundle, checkpoint_dir, openpi_dir, stack_cameras=F
     pi0_py = openpi / "src/openpi/models_pytorch/pi0_pytorch.py"
     default_steps, def_line = sample_actions_default_steps(pi0_py)
     shim = Path(__file__).resolve().parents[3] / "src" / "loaders" / "pi0_model.py"
+    # the single-step driver pi0_fx.py sits in a captured single-step bundle; a cases-only bundle (make_pi0_cases.py) has none,
+    # and the camera order then comes from pi0_phase_capture.KEYS (the order the phase graphs take the images in)
+    driver = bundle / "pi0_fx.py"
+    driver = driver if driver.is_file() else None
     shim_steps = {int(m) for m in re.findall(r"num_steps\s*=\s*(\d+)", shim.read_text())} | \
-                 {int(m) for m in re.findall(r"predict\([^)]*,\s*(\d+)\)", (bundle / "pi0_fx.py").read_text())}
+                 ({int(m) for m in re.findall(r"predict\([^)]*,\s*(\d+)\)", driver.read_text())} if driver else set())
     if shim_steps != {default_steps}:
         raise SystemExit(f"step counts disagree: sample_actions default {default_steps}, shim / driver {sorted(shim_steps)}")
     dt, times = euler_times(default_steps)
@@ -227,7 +231,8 @@ def pi0_manifest(single_step_bundle, checkpoint_dir, openpi_dir, stack_cameras=F
     vision = CONFIG_MAPPING["paligemma"]().vision_config
     tokens_per_image = (vision.image_size // vision.patch_size) ** 2
     inputs, values = _fixture_specs(bundle / "fx", with_values=("input_3", "input_4", "input_5"))
-    keys_assign = [n for n in ast.walk(ast.parse((bundle / "pi0_fx.py").read_text()))
+    keys_src = driver or Path(__file__).resolve().parent / "pi0_phase_capture.py"
+    keys_assign = [n for n in ast.walk(ast.parse(keys_src.read_text()))
                    if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") == "KEYS"]
     cameras = list(ast.literal_eval(keys_assign[0].value))
     prompt_len = inputs["input_6"]["shape"][1]
@@ -250,8 +255,10 @@ def pi0_manifest(single_step_bundle, checkpoint_dir, openpi_dir, stack_cameras=F
         "schema": SCHEMA, "model": "pi0", "objective": "flow matching, Euler",
         "sources": {"checkpoint_config": str(cfg_path), "checkpoint_config_sha256": _sha(cfg_path),
                     "step_count": f"num_steps default {default_steps}: {pi0_py}:{def_line} (def sample_actions); the reference shim passes "
-                                  f"the same value: {_line_range(shim, 'self.num_steps =')}, "
-                                  f"{_line_range(bundle / 'pi0_fx.py', 'pi0_model.predict(')}",
+                                  f"the same value: {_line_range(shim, 'self.num_steps =')}"
+                                  + (f", {_line_range(driver, 'pi0_model.predict(')}" if driver else
+                                     " (no single-step driver in the cases bundle)"),
+                    "camera_order": f"KEYS in {keys_src}",
                     "loop": f"{pi0_py}: sample_actions (dt = -1/num_steps, float32 tensors, while time >= -dt/2)",
                     "kv_geometry": "openpi/src/openpi/models/gemma.py get_config", "torch": torch.__version__,
                     "single_step_bundle": str(bundle), "capture_input_shapes": "that bundle's fx/fixtures.safetensors case_0"},

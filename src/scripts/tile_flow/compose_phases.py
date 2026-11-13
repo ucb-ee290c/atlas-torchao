@@ -78,11 +78,14 @@ def compose_pi0(a):
     manifest = json.loads((ph / "loop_manifest.json").read_text())
     pre = torch.export.load(ph / "prefix" / "fx" / "model.pt2").module()
     stp = torch.export.load(ph / "step" / "fx" / "model.pt2").module()
-    single = torch.export.load(ss / "fx" / "model.pt2").module()
+    # a cases-only bundle (make_pi0_cases.py) has no single-step graph: the same-process comparison is then not available and
+    # only the --eager-loop comparison (same process) decides `ok` besides the KV shapes
+    single = torch.export.load(ss / "fx" / "model.pt2").module() if (ss / "fx" / "model.pt2").is_file() else None
     fx_ss = load_file(str(ss / "fx" / "fixtures.safetensors"))
     parity = json.loads((ss / "fx" / "parity.json").read_text())
     kv_shape = manifest["graphs"]["prefix"]["outputs"]["kv_cache"]["per_tensor_shape"]
-    res = {"phases_dir": str(ph), "single_step_bundle": str(ss), "one_step": [], "ok": True}
+    res = {"phases_dir": str(ph), "single_step_bundle": str(ss), "one_step": [], "ok": True,
+           "single_step_graph": "present" if single is not None else "absent (cases-only bundle): no same-process one-step comparison"}
     one = torch.tensor(1.0, dtype=torch.float32)
     one_step_out = {}
     with torch.no_grad():
@@ -91,18 +94,18 @@ def compose_pi0(a):
             pad, *kv = pre(*ins[:8])
             v = stp(ins[8], pad, ins[9], one.expand(1), *kv)
             out = ins[9] + torch.tensor(-1.0, dtype=torch.float32) * v
-            same, want = single(*ins), fx_ss[case["outputs"][0]]
+            same, want = (single(*ins) if single is not None else None), fx_ss[case["outputs"][0]]
             row = {"case": i, "kv_tensors": len(kv), "kv_shapes_match_manifest": all(list(k.shape) == kv_shape for k in kv)
                    and len(kv) == manifest["graphs"]["prefix"]["outputs"]["kv_cache"]["tensors"],
                    "prefix_pad_masks_shape": list(pad.shape),
-                   "composition_equals_single_step_graph_same_process": _bytes_equal(out, same),
-                   "max_abs_diff_vs_single_step_graph": _diff(out, same),
+                   "composition_equals_single_step_graph_same_process": _bytes_equal(out, same) if same is not None else None,
+                   "max_abs_diff_vs_single_step_graph": _diff(out, same) if same is not None else None,
                    "composition_equals_recorded_fixture": _bytes_equal(out, want),
-                   "single_step_graph_equals_recorded_fixture": _bytes_equal(same, want),
+                   "single_step_graph_equals_recorded_fixture": _bytes_equal(same, want) if same is not None else None,
                    "max_abs_diff_vs_recorded_fixture": _diff(out, want)}
             res["one_step"].append(row)
             one_step_out[i] = out
-            res["ok"] &= row["composition_equals_single_step_graph_same_process"] and row["kv_shapes_match_manifest"]
+            res["ok"] &= row["kv_shapes_match_manifest"] and (same is None or row["composition_equals_single_step_graph_same_process"])
         if a.eager_loop:
             sys.path.insert(0, str(Path(__file__).resolve().parent))
             sys.path.insert(0, str(ss))
@@ -132,6 +135,13 @@ def compose_pi0(a):
                               "differing_elements": neq, "elements": graph.numel(),
                               "eager_seconds": round(t_eager, 1), "composed_loop_seconds": round(t_graph, 1),
                               "shape": list(graph.shape), "dtype": str(graph.dtype)})
+                if single is None:
+                    # stands in for the missing single-step graph: the composed one step against eager sample_actions(num_steps=1)
+                    e1 = model.sample_actions("cpu", obs, noise=ins[9], num_steps=1)
+                    loops[-1]["one_step_vs_eager_num_steps_1"] = {
+                        "bytes_equal": _bytes_equal(one_step_out[i], e1), "max_abs_diff": _diff(one_step_out[i], e1),
+                        "differing_elements": int((one_step_out[i] != e1).sum())}
+                    res["ok"] &= loops[-1]["one_step_vs_eager_num_steps_1"]["bytes_equal"]
                 if a.cache_dir:
                     Path(a.cache_dir).mkdir(parents=True, exist_ok=True)
                     torch.save({"eager": eager, "composed": graph}, Path(a.cache_dir) / f"loop_case{i}.pt")
