@@ -15,7 +15,7 @@ Modes:
   atlas       AtlasQConfig: Atlas FP8 E4M3 rules, power-of-two per-tensor scales
   atlas_hw    as atlas, with activations through the hardware cast (subnormals flushed)
   torchao     stock TorchAO Float8DynamicActivationFloat8WeightConfig, per-tensor
-              (native FP8; needs compute capability >= 8.9, e.g. L40 / H100)
+              (native FP8; needs compute capability >= 8.9, Ada Lovelace, Hopper or newer GPUs)
 
 Normalization (src/loaders/policy_norm.py): --norm-stats checkpoint (default) uses the processors as saved;
 --norm-stats dataset (NEW) overrides their stats with the evaluated dataset's, as a lerobot fine-tune
