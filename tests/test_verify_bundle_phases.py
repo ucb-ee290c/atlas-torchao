@@ -83,3 +83,28 @@ def test_a_declared_call_count_that_disagrees_with_the_graph_fails(vb, tmp_path)
     res = _run(vb, phase, _tampered(tmp_path, phase, edit), tmp_path / "v.json")
     assert not res["ok"] and "graph_qlinear_count_equals_quantized_linears" in res["failed"]
     assert res["checks"]["graph_qlinear_count_equals_quantized_linears"]["detail"]["sites_called_more_than_once"] == {}
+
+
+# -- hoisted layout (encode, modulate, step) ------------------------------------------------------------------------------
+HOISTED = Path(os.environ.get("ATLAS_DIT_HOISTED_PHASES",
+                              "/scratch2/lorenhung/atlas-fp8/exports-tile/multitask-dit/atlas_v1_awq_tile_static_hoisted_phases"))
+
+
+@pytest.mark.parametrize("phase", ["modulate", "step"])
+def test_hoisted_phase_bundle_verifies(vb, tmp_path, phase):
+    """modulate holds only time_mlp and the adaLN Linears (each called calls_per_site times) and no attention site; the
+    hoisted step holds the rest of the noise predictor, each once."""
+    if not (HOISTED / phase / "fx" / "model.pt2").exists():
+        pytest.skip(f"no hoisted {phase} bundle")
+    lm = json.loads((HOISTED / "loop_manifest.json").read_text())
+    res = vb.run(HOISTED / phase / "export", HOISTED / phase / "fx", tmp_path / "v.json")
+    assert res["ok"], res["failed"]
+    gi = json.loads((HOISTED / phase / "fx" / "graph_inspection.json").read_text())
+    calls = {r["site"]: r["calls"] for r in gi["weight_site_bindings"]}
+    hoisted = set(lm["graphs"]["modulate"]["hoisted_sites"])
+    if phase == "modulate":
+        assert set(calls) == hoisted and set(calls.values()) == {lm["graphs"]["modulate"]["calls_per_site"]}
+        assert res["graph_attention"]["sites_in_graph"] == 0
+    else:
+        assert not set(calls) & hoisted and set(calls.values()) == {1}
+        assert all(s.startswith("noise_predictor.") for s in calls)
