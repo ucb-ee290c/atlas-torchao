@@ -1,5 +1,5 @@
 """Multi-Task DiT's own attention blocks (lerobot RoPEAttention) as native FP8 attention sites
-(docs/algos/dit-own-attention.md): instance-forward replacement in src/reference/ref_attention.py."""
+(docs/algos/tile-aware.md#smolvla-multi-task-dit-and-pi0-graphs): instance-forward replacement in src/reference/ref_attention.py."""
 import copy
 import json
 

@@ -1,4 +1,4 @@
-"""k_order: permute the K axis of every Llama MLP down_proj, function-preserving (NEW; docs/algos/k-order.md).
+"""k_order: permute the K axis of every Llama MLP down_proj, function-preserving (NEW; docs/algos/tile-aware.md#k-order).
 
 Opt-in only: no recipe includes it. The hardware accumulates K tiles in the order software issues
 them (BF16 partial sum carried from tile to tile), so the order of the K channels is a free offline

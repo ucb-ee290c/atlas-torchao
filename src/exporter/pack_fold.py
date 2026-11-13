@@ -1,4 +1,4 @@
-"""Pack-range fold (mitigation A of docs/algos/pack-range-options.md), an OPT-IN exporter pass.
+"""Pack-range fold (mitigation A of docs/algos/tile-aware.md#pack-scale-admission-range), an OPT-IN exporter pass.
 
 A static activation exponent s means real = e4m3(byte) * 2^s and the pack code is c = 127 + s. The compiler admits
 c in 122..128. Packing 2^k * x at exponent s + k gives byte-identical FP8 codes to packing x at s, so for every static
@@ -21,7 +21,7 @@ Nothing is re-calibrated and no FP8 code changes. Classes that are not free (att
 constant rewrites; one vmul per tile; host) are NOT touched and stay reported as out of range with their plan.
 
 All sites that read one producer must agree on k: the group's k is the smallest-|k| shift that brings every member into
-122..128 (a member that is already in range stays in range). Docs: docs/algos/pack-fold.md.
+122..128 (a member that is already in range stays in range). Docs: docs/algos/tile-aware.md#pack-fold.
 """
 from __future__ import annotations
 

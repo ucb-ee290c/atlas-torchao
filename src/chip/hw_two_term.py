@@ -2,7 +2,7 @@
 
 Each term is its own per-token power-of-two cast, as the layer's own activation rule makes it
 (algos.base.act_cast with the layer's algorithm). The pair represents a BF16 activation to about
-8 mantissa bits, which removes the activation half of the FP8 layer error (docs/algos/two-term.md).
+8 mantissa bits, which removes the activation half of the FP8 layer error (docs/algos/tile-aware.md#two-term-activations).
 On Atlas the second MXU pass reuses the resident weight tile (two accumulators, two weight slots), so
 weights are loaded once; only MXU passes and a little VPU work double (hw_cost.two_term_layer_cost).
 

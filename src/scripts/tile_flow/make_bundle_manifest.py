@@ -61,7 +61,7 @@ def main(recipe_dir):
         "hardware_equivalence": "not claimed: numerics are the framework's exact float32 accumulation unless quality.json "
                                 "accumulation_models says otherwise (sa / ipt isolated layers only); no RTL run",
     }
-    if "pack_fold_summary" in pol:                      # src/exporter/pack_fold.py (docs/algos/pack-fold.md), opt-in
+    if "pack_fold_summary" in pol:                      # src/exporter/pack_fold.py (docs/algos/tile-aware.md#pack-fold), opt-in
         ps = pol["pack_fold_summary"]
         out["pack_fold"] = {k: ps[k] for k in ("static_sites", "outside_before", "outside_after", "sites_folded", "folded_by_class",
                                                "outside_after_by_class", "outside_after_by_cost", "exact")}

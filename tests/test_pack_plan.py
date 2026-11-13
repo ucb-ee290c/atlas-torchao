@@ -1,4 +1,4 @@
-"""Pack-scale plan (src/exporter/pack_plan.py, docs/algos/pack-plan.md): REPORTING ONLY. Unit tests on synthetic exponents and a synthetic
+"""Pack-scale plan (src/exporter/pack_plan.py, docs/algos/tile-aware.md#pack-plan): REPORTING ONLY. Unit tests on synthetic exponents and a synthetic
 FX graph text, bit-identical-export checks, and an end-to-end tiny Llama (static recipe, native-FP8 FX capture, verify_bundle)."""
 import importlib.util
 import json

@@ -179,7 +179,7 @@ def pv_matmul(p_codes: torch.Tensor, p_exp: torch.Tensor, vt_codes: torch.Tensor
               v_exp: torch.Tensor, pop_shift: int = 0) -> torch.Tensor:
     """Attention output P.V on E4M3 codes, float32 out: p [..., Sq, Skv], vt = V^T [..., Dv, Skv] (the
     transposed view `ref_attention` hands to `_mm`), v_exp [..., 1, 1]. Same body as qk_matmul.
-    pop_shift (NEW, last, default 0; docs/algos/pack-fold.md): the output is multiplied by 2^pop_shift, i.e. the PV pop
+    pop_shift (NEW, last, default 0; docs/algos/tile-aware.md#pack-fold): the output is multiplied by 2^pop_shift, i.e. the PV pop
     rescale constant is 2^(sp + sv + pop_shift). Exact in float32; `fx_export` passes it only when it is non-zero, so every
     other node (and every bundle saved before it existed) keeps its old argument list."""
     y = rn.dq_matmul_nt(p_codes, p_exp, vt_codes, v_exp)

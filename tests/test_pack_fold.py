@@ -1,4 +1,4 @@
-"""Pack fold (src/exporter/pack_fold.py, docs/algos/pack-fold.md): exactness on synthetic layers and a synthetic FX graph, k agreement
+"""Pack fold (src/exporter/pack_fold.py, docs/algos/tile-aware.md#pack-fold): exactness on synthetic layers and a synthetic FX graph, k agreement
 across shared-input groups, the BF16 range guard, negative cases (non-free classes, second consumers), the off-by-default
 contract, and an end-to-end tiny Llama (export, fold, FX capture, verify_bundle, bit-identical logits)."""
 import copy

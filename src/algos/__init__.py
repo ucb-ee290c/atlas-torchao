@@ -80,7 +80,7 @@ RECIPES = {
                              "attention operands per (batch, head), never-clip rule",
         "new_decisions": ["NEW: tile-aware granularity w=panel (32 output channels over all K) and "
                           "a=block (32 tokens over all K); both constant along K, so the MXU pop applies "
-                          "them (docs/algos/tile-aware.md); no CPU quality result yet"],
+                          "them (docs/algos/tile-aware.md#recipes; TinyLlama perplexity in #tinyllama-quality)"],
     },
     "atlas_v1_tile": {
         # atlas_v1_awq_tile plus the structural input-convolution BF16 exception (what v1.0 `atlas_v1`

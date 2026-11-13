@@ -1,4 +1,4 @@
-"""k_order (docs/algos/k-order.md): a function-preserving K permutation of Llama MLP down_proj."""
+"""k_order (docs/algos/tile-aware.md#k-order): a function-preserving K permutation of Llama MLP down_proj."""
 import copy
 
 import pytest

@@ -1,7 +1,7 @@
 """Pack-scale plan (REPORTING ONLY): for every static activation site, the E8M0 pack code, whether the compiler admits it,
 the exact power-of-two fold that would bring it into the admitted range, which producer would absorb the fold and what
 that costs. Nothing here changes a weight, an exponent, the FX graph or any export byte; the plan is written next to the
-existing `compiler_pack_scale_admission` report (docs/algos/pack-plan.md, research: docs/algos/pack-range-options.md 4.A, 6).
+existing `compiler_pack_scale_admission` report (docs/algos/tile-aware.md#pack-plan, options: docs/algos/tile-aware.md#pack-scale-admission-range).
 
 A static activation exponent s means real = e4m3(byte) * 2^s, pack code c = 127 + s. Folding 2^k into the producer and packing
 at c' = c + k gives the same bytes (`pack(2^k x, s + k) == pack(x, s)`), so the consumer's dequant exponent stays s.
@@ -19,7 +19,7 @@ import re
 from exporter.tile_native import E8M0_BIAS, PACK_ADMISSION
 
 SCHEMA = "atlas_torchao.pack_plan.v1"
-UNIT_CODE = 127                       # the compiler's unit pack code, default fold target (pack-range-options.md 4.A)
+UNIT_CODE = 127                       # the compiler's unit pack code, default fold target (docs/algos/tile-aware.md#pack-scale-admission-range)
 MAX_ABS_K = 20                        # spec item 2: a fold larger than this is not planned
 
 # cost values (what the fold adds on the device), in the order summaries print them
@@ -132,7 +132,7 @@ def plan_record(exp: int, producer: dict | None = None, *, target="nearest", lo:
                         **({"mixed_classes": producer["mixed_classes"]} if (producer or {}).get("mixed_classes") else {})},
            "placement": placement, "cost": cost, "fold_free": cost == COST_FREE, "how": how}
     if cls == "attn_p":
-        rec["note"] = "attention p needs a vmul on recip(sum): p is normalized and recip(sum) is data (pack-range-options.md 4.A)"
+        rec["note"] = "attention p needs a vmul on recip(sum): p is normalized and recip(sum) is data (docs/algos/tile-aware.md#pack-scale-admission-range)"
     if shared_input:
         rec["shared_input"] = shared_input
     return rec
@@ -310,7 +310,7 @@ def with_plan(policy: dict, producers: dict | None = None, shared: dict | None =
 
 
 # ---------------------------------------------------------------------------------------------
-# FX graph side: producer class of every packed tensor (port of docs/algos/pack-range-options/fx_pack_census.py)
+# FX graph side: producer class of every packed tensor (ported from a one-off census script, removed with the research notes)
 # ---------------------------------------------------------------------------------------------
 
 PASS = {"aten.to.dtype", "aten.to.dtype_layout", "aten.view.default", "aten.reshape.default", "aten.contiguous.default",

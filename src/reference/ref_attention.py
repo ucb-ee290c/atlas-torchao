@@ -71,7 +71,7 @@ def _mm(fm, a_q, a_s, b_q, b_s, dtype_out=torch.float32, role=None, pop_shift=0)
     """a [..., M, K] times b [..., N, K]^T on cast operands; result * 2^(sa+sb) in float32.
     `role` ("qk" or "pv") names the matmul for fx_export's native-FP8 capture, which swaps `_cast` and
     `_mm`; it does not change the result. `pop_shift` (NEW, default 0, only the pv matmul of a folded attention
-    site passes it; docs/algos/pack-fold.md): the result is multiplied by 2^pop_shift (exact in float32).
+    site passes it; docs/algos/tile-aware.md#pack-fold): the result is multiplied by 2^pop_shift (exact in float32).
     Under attn_fisher() `a_s` is None (clean operands, see _cast): a plain matmul, still times 2^pop_shift."""
     if a_s is None: 
         y = torch.matmul(a_q, b_q.transpose(-1, -2).to(a_q.dtype)).to(dtype_out)

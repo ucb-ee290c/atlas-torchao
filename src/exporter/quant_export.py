@@ -154,7 +154,7 @@ def add_args(ap) -> None:
     g.add_argument("--pack-fold", action="store_true",
                    help="after the export, fold the static activation pack exponents into the compiler's admitted E8M0 range "
                         "122..128 where the producer already multiplies by a constant (RMSNorm gamma, up_proj weight exponent, "
-                        "PV pop rescale, a Linear feeding a Linear); exact, no re-calibration (docs/algos/pack-fold.md). "
+                        "PV pop rescale, a Linear feeding a Linear); exact, no re-calibration (docs/algos/tile-aware.md#pack-fold). "
                         "Default off: the export is unchanged. The unfolded export is kept in <export-dir>.unfolded")
     g.add_argument("--pack-fold-graph", default=None,
                    help="with --pack-fold: fx/ directory (graph.txt, graph_signature.txt) of a native-FP8 capture of this model's "
@@ -515,7 +515,7 @@ def build_policy(model, mode, report, algo, options, skip, bf16_opt_out, opt_out
         "compiler_pack_scale_admission": tile_native.pack_admission_report(static_act, weight_ranges),
         "pending_hardware_rulings": PENDING_RULINGS,
     }
-    # REPORTING ONLY (docs/algos/pack-plan.md): per static activation site the pack code, in-range flag, fold k and cost.
+    # REPORTING ONLY (docs/algos/tile-aware.md#pack-plan): per static activation site the pack code, in-range flag, fold k and cost.
     # The producer class needs the FX graph (capture_fx fills it into fx/policy.json); here it is 'unknown' except attention p.
     pack_plan.attach(policy, pack_plan.build_plan(policy))
     return policy

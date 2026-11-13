@@ -2,7 +2,7 @@
 (no quantize_act tagged '<site>:<operand>') and must equal the declared graph_inspection.unused_attention_modules; the qlinear node count
 per site is derived from the graph and must equal the declared `calls`. The positive cases run the real bundles (skipped when absent),
 the negative cases tamper a copy of one bundle's inspection and must fail the matching check
-(docs/algos/phase-graphs.md)."""
+(docs/algos/tile-aware.md#per-phase-graphs-and-loop-manifest)."""
 import json
 import os
 import shutil

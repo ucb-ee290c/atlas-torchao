@@ -1,4 +1,4 @@
-"""CPU screen of the k_order step on real TinyLlama data (docs/algos/k-order.md).
+"""CPU screen of the k_order step on real TinyLlama data (docs/algos/tile-aware.md#k-order).
 
 For down_proj of layers 0, 7, 14, 21: 64 WikiText-2 test tokens x 16 random output channels.
 Operands are the real FP8 codes (per-token nc activation cast, per-row nc weight cast of the BF16

@@ -5,7 +5,7 @@ for the one-step comparison.
   (a) one step: step(encode(obs), noisy_actions, timestep) against (1) the single-step bundle's graph (fx/model.pt2) run in the same
       process on the same inputs and (2) that bundle's recorded fixture output, byte for byte, and encode's output against the
       encode bundle's own fixture. Only (1) decides `ok`: a recorded fixture is a different process's run, and the eager original
-      boundary can itself differ from it on this host (see docs/algos/phase-graphs.md).
+      boundary can itself differ from it on this host (see docs/algos/tile-aware.md#per-phase-graphs-and-loop-manifest).
   (b) --eager-loop EXPORT_DIR: the host loop of loop_manifest.json (100 steps, DDPM arithmetic from the per_step table, variance noise
       from the global RNG in the same order diffusers draws it) over the step graph, against DiffusionObjective.conditional_sample
       of the eagerly rebuilt quantized policy with the same seed.

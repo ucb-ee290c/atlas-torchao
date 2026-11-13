@@ -1,6 +1,6 @@
 """Write loop_manifest.json: what the host has to do around the per-phase FX graphs of the Multi-Task DiT and of Pi0.
 Every number is read from a config, a source file, a scheduler object or a fixture of an existing bundle; none is typed in
-(docs/algos/phase-graphs.md). The manifest says how many denoising steps the real model takes, the scheduler / Euler constants,
+(docs/algos/tile-aware.md#per-phase-graphs-and-loop-manifest). The manifest says how many denoising steps the real model takes, the scheduler / Euler constants,
 which inputs change per call, which operations stay on the host and how often each graph is called.
 
 usage (run with PYTHONPATH=<worktree>/src):
@@ -111,7 +111,7 @@ def dit_manifest(single_step_bundle):
     cond = {"shape": [spec["state"]["shape"][0], cond_dim], "dtype": spec["state"]["dtype"],
             "derivation": f"({cams} cameras x {vision_dim} CLIP CLS + {state_dim} state + {cfg['hidden_dim']} text) x "
                           f"{cfg['n_obs_steps']} obs steps = {cond_dim}; ObservationEncoder._setup_vector_output",
-            "check": "equals the encode graph output shape (verified at equivalence time, see phase-graphs.md)"}
+            "check": "equals the encode graph output shape (verified at equivalence time, see tile-aware.md#per-phase-graphs-and-loop-manifest)"}
     start, end = cfg["n_obs_steps"] - 1, cfg["n_obs_steps"] - 1 + cfg["n_action_steps"]
     return {
         "schema": SCHEMA, "model": "multi_task_dit", "objective": "diffusion (DDPM)",

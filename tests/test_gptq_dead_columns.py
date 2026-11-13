@@ -1,5 +1,5 @@
 """gptq_awq:dead_columns=rtn: input channels with exactly zero calibration input are cast by plain
-round-to-nearest on the pinned grid instead of being zeroed (docs/algos/gptq-dead-columns.md).
+round-to-nearest on the pinned grid instead of being zeroed (docs/algos/tile-aware.md#dead-columns).
 The default (`zero`) is the original code path, bit for bit."""
 import pytest
 import torch

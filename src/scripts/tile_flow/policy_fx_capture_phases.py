@@ -1,5 +1,5 @@
 """Per-phase FX capture for the Multi-Task DiT (and Pi0, see below): the encoder and one denoising step as two separate
-graphs, with the host owning the loop (docs/algos/phase-graphs.md, docs/algos/dit-pi0-full-graph-plan.md items 2, 3, 5).
+graphs, with the host owning the loop (docs/algos/tile-aware.md#per-phase-graphs-and-loop-manifest).
 
   dit encode:  DiTEncode  (state, images, input_ids, attention_mask)           -> conditioning_vec
                = observation_encoder.encode(batch)   (CLIP towers, patch-embedding Conv2d)

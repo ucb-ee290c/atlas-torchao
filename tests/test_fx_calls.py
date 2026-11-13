@@ -1,7 +1,7 @@
 """capture_fx counts how often the eager replay calls each quantized module and expects the graph to agree:
 0 calls = the module is absent from this graph, 1 call = exactly one node set (the existing strict check), N calls = N node
 sets, each with its own quantize_act. Linear, Conv2d and attention sites, strict and non-strict export, plus the negative
-cases that show the relaxed checks still fail on a graph that disagrees with the count (docs/algos/phase-graphs.md)."""
+cases that show the relaxed checks still fail on a graph that disagrees with the count (docs/algos/tile-aware.md#per-phase-graphs-and-loop-manifest)."""
 import json
 
 import algos

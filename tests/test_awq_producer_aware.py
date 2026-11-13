@@ -1,5 +1,5 @@
 """gptq_awq:producer_aware=true: the AWQ search also scores the producer's quantization error on the
-producer's own weight grid (docs/algos/awq-producer-aware.md). Default off is bit-identical."""
+producer's own weight grid (docs/algos/tile-aware.md#producer-aware-awq). Default off is bit-identical."""
 import copy
 
 import pytest

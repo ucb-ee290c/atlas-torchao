@@ -1,5 +1,5 @@
 """Per-phase FX capture for Pi0 (openpi PyTorch): the prefix (SigLIP + PaliGemma prefix producing the KV cache) and one action-expert
-denoising step reading that cache, as two graphs with the host owning the Euler loop (docs/algos/phase-graphs.md).
+denoising step reading that cache, as two graphs with the host owning the Euler loop (docs/algos/tile-aware.md#per-phase-graphs-and-loop-manifest).
 
   prefix: Pi0Prefix (img x3, image_mask x3, tokenized_prompt, tokenized_prompt_mask) -> (prefix_pad_masks, k_0, v_0, ..., k_17, v_17)
           = _preprocess_observation + embed_prefix + paligemma_with_expert.forward(inputs_embeds=[prefix, None], use_cache=True)

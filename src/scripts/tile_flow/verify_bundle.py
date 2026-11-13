@@ -12,7 +12,7 @@ ops is DECLARED, and reported in graph.allowed_non_atlas_contractions, when it i
   - a plain BF16 scaled_dot_product_attention whose module is NOT in or around any policy attention site (the
     ALLOWED_PLAIN_OPS allow-list). These are counted in graph.unquantized_attention, never hidden.
 Pack plan (informational): `pack_plan` in the result recomputes the per-site pack-scale plan from policy.json and
-fx/graph.txt (src/exporter/pack_plan.py, docs/algos/pack-plan.md) and compares it with the recorded `pack_plan_summary`; it never fails
+fx/graph.txt (src/exporter/pack_plan.py, docs/algos/tile-aware.md#pack-plan) and compares it with the recorded `pack_plan_summary`; it never fails
 a check. With --require-pack-range the check `pack_range_plan_present` fails when a static activation site is outside the
 admitted E8M0 range 122..128 and its recorded plan (fx/policy.json, else export/policy.json) is missing or infeasible.
 Everything else (a BF16 matmul / mm / bmm / Linear with a quantized or unknown weight, an SDPA inside a policy

@@ -2,7 +2,7 @@
 boundary never calls (lm_head), a module called as module.forward() (no scope on the graph nodes) so one attention site holds
 many qk/pv pairs, a Conv2d next to the Linears, and the wrapper attribute 'policy.' instead of 'model.'.
 The positive cases build on a real tiny capture; the real SmolVLA bundle is used when present. Negative cases show the
-relaxation does not accept an undeclared or inconsistent bundle (docs/algos/smolvla-verify.md)."""
+relaxation does not accept an undeclared or inconsistent bundle (docs/algos/tile-aware.md#verify)."""
 import json
 import shutil
 from pathlib import Path

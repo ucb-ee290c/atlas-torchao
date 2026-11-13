@@ -1,6 +1,6 @@
 """Compare the outputs of two captured FX bundles (model.pt2) on the same inputs: the number of differing logits (bit pattern),
 the maximum absolute difference, and whether the outputs are byte-identical. Used to show that a pack-fold bundle
-(src/exporter/pack_fold.py, docs/algos/pack-fold.md) equals its unfolded twin.
+(src/exporter/pack_fold.py, docs/algos/tile-aware.md#pack-fold) equals its unfolded twin.
 usage: compare_fx_logits.py FX_A FX_B OUT_JSON [--random N] [--seed S]     (run with PYTHONPATH=<worktree>/src)
 Inputs: the capture-case inputs stored in FX_A/fixtures.safetensors (case_*.input_*, every positional input) plus, for a
 causal LM (one integer input per case), N random token-id sequences of the same shape drawn below the vocabulary size (read from the

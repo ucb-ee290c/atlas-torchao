@@ -1,7 +1,7 @@
 """Pack-plan census of existing tile static exports, READ-ONLY on the exports: recomputes the per-site pack plan from each
 bundle's export/policy.json and fx/graph.txt (+ fx/graph_signature.txt) with src/exporter/pack_plan.py and writes a JSON and a markdown
 table to the given output paths (never into the exports root). Compares with the research census
-(docs/algos/pack-range-options.md section 3 / 4.A) and prints every mismatch.
+(docs/algos/tile-aware.md#pack-scale-admission-range) and prints every mismatch.
 usage: PYTHONPATH=src python pack_plan_census.py EXPORTS_ROOT OUT_JSON OUT_MD [OUT_MD ...]"""
 import json
 import sys
@@ -11,10 +11,10 @@ import exporter.pack_plan as pack_plan
 
 BUNDLE = "atlas_v1_awq_tile_static"
 MODELS = ("tinyllama", "smolvla", "multitask-dit", "pi0")
-# research census (pack-range-options.md): static sites, outside 122..128, attention p, no-added-instruction (free) sites
+# research census (tile-aware.md#pack-scale-admission-range): static sites, outside 122..128, attention p, no-added-instruction (free) sites
 RESEARCH = {"tinyllama": dict(sites=176, outside=114, p=22, free=92), "smolvla": dict(sites=316, outside=244, p=13, free=221),
             "multitask-dit": dict(sites=203, outside=88, p=24, free=24), "pi0": dict(sites=483, outside=127, p=63, free=61)}
-RESEARCH_CLASS = {   # producer class -> outside sites (T, S, D, P), research section 3 table (norm = RMSNorm + LayerNorm rows)
+RESEARCH_CLASS = {   # producer class -> outside sites (T, S, D, P), research census table (norm = RMSNorm + LayerNorm rows)
     "norm_affine": (59, 145, 0, 24), "layer_norm": (0, 0, 0, 3), "attn_p": (22, 13, 24, 63), "attn_out_pv": (22, 44, 24, 27),
     "attn_out_sdpa": (0, 0, 6, 0), "gated_product": (11, 24, 0, 7), "x_sigmoid_product": (0, 0, 17, 0),
     "bare_activation": (0, 6, 13, 1), "linear_to_linear": (0, 9, 0, 0), "modulation_add": (0, 1, 1, 0),

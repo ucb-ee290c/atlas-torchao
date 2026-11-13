@@ -40,7 +40,7 @@ Parameters (--algo gptq_awq:k=v,...):
   dead_columns=zero|rtn      input channels with diag(H) == 0 (exactly zero calibration input): `zero` (default,
                              the original behaviour) sets the weight column to 0; `rtn` (NEW, opt-in) casts it with
                              plain round-to-nearest on the pinned grid and keeps it out of the error feedback
-                             (docs/algos/gptq-dead-columns.md)
+                             (docs/algos/tile-aware.md#dead-columns)
   hessians=cpu|device        where the calibration Hessians are kept (NEW, default cpu). Each
                              batch's x^T x is computed on the activation's device and summed into
                              a float32 CPU accumulator; GPTQ / AWQ move one layer's H to the
@@ -315,7 +315,7 @@ class GptqAwq(Algo):
         if self.target == "fp" and self.calib != "chip":
             raise ValueError("gptq_awq: target=fp needs calib=chip")
         # NEW opt-in (default off): the AWQ search also sees the producer's own quantization error
-        # on its weight grid (docs/algos/awq-producer-aware.md)
+        # on its weight grid (docs/algos/tile-aware.md#producer-aware-awq)
         self.producer_aware = _as_bool(params.get("producer_aware", False))
         if self.producer_aware and self.awq_loss == "cast":
             raise ValueError("gptq_awq: producer_aware=true is implemented for awq_loss=weight only")

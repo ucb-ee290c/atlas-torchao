@@ -754,7 +754,7 @@ def _tile_native_report(module, policy, native_paths, plan, act_stats):
 
 def _pack_plan(program, policy):
     """REPORTING ONLY: the pack plan of the policy's static activations with the producer class of each packed tensor read
-    from the captured graph (docs/algos/pack-plan.md). Returns (policy copy carrying the plan, plan, summary). A graph without
+    from the captured graph (docs/algos/tile-aware.md#pack-plan). Returns (policy copy carrying the plan, plan, summary). A graph without
     atlas.quantize_act nodes (decode-based capture) gives producer class 'unknown'."""
     producers, shared = pack_plan.producers_from_graph(str(program.graph), str(program.graph_signature), policy)
     with_plan = pack_plan.with_plan(policy, producers, shared)
