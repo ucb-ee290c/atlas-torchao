@@ -56,7 +56,7 @@ def available() -> str | None:
 
 
 def _runtime():
-    import pi0_model
+    import loaders.pi0_model as pi0_model
 
     return pi0_model.runtime(openpi_dir())          # serve_quant with the reference JAX stubs
 

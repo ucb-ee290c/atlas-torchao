@@ -57,7 +57,7 @@ profiles the convolution is host / VPU work: BF16 has no MXU operand path (pendi
 Run 5.2 measured the DiT patch embedding in BF16 on the SmoothQuant candidate at `ref_conv` only
 (200 frames: 0.1394 -> 0.0883 rel L2 vs BF16; the incremental gain is within the separate
 harness's 0.0559 floor). It has not been measured on the AWQ stack or on chip; run 6
-(`l40s-run-6`) measures `atlas_v1_awq+keep_bf16:rule=input_conv` on the DiT at `ref_conv` and
+(`5731fc0`) measures `atlas_v1_awq+keep_bf16:rule=input_conv` on the DiT at `ref_conv` and
 `chip`.
 
 ## Tests

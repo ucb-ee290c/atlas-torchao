@@ -63,7 +63,7 @@ from __future__ import annotations
 
 import torch
 
-import ref_numerics as rn
+import reference.ref_numerics as rn
 from algos.base import Algo, Scale
 
 E4M3_MAX = 448.0                     # FP8Pack saturation value (fp8_e4m3.py:15-16)
@@ -272,7 +272,7 @@ def _count_token_cast(x: torch.Tensor, out_cols: int) -> None:
     (algos.base.cast_with -> chip_profile.count_algo_cast)."""
     import sys
 
-    cp = sys.modules.get("chip_profile")
+    cp = sys.modules.get("chip.chip_profile")
     if cp is None or not hasattr(cp, "count_algo_vpu"):
         return
     n = x.numel()

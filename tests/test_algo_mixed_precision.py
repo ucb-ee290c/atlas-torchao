@@ -11,7 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import algos
-import ref_numerics as rn
+import reference.ref_numerics as rn
 from algos.mixed_precision import check_exact, select
 from refutil import need_refs
 from test_ladder import FAST, tiny_llama
@@ -236,7 +236,7 @@ def test_fp8x3_with_token_channel_scales_on_mxu_model(mxu):
     algos.base.output_scale: x_hi.w_hi with both tables, x_hi.w_lo with the per-token row only,
     x_lo.w_hi with the per-channel column only, summed in BF16."""
     need_refs()
-    import accum_torch as at
+    import mxu.accum_torch as at
     from algos.granularity import scale_exp
 
     torch.manual_seed(0)

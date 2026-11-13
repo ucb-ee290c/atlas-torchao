@@ -9,9 +9,9 @@ import pytest
 import torch
 
 import algos
-import chip_coverage as cc
-import chip_numerics as cn
-import chip_ops
+import chip.chip_coverage as cc
+import chip.chip_numerics as cn
+import chip.chip_ops as chip_ops
 from refutil import need_refs
 from test_ladder import FAST, tiny_llama
 

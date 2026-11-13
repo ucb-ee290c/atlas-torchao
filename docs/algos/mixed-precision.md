@@ -8,7 +8,7 @@ residuals (`keep_as=fp8x3` / `fp8x2_w`).
 ## Usage
 
 ```
-python scripts/rank_layers.py --model $TINYLLAMA --seqlen 512 --calib-n 4 --calib-seed 1234 --device cuda \
+python src/scripts/rank_layers.py --model $TINYLLAMA --seqlen 512 --calib-n 4 --calib-seed 1234 --device cuda \
     --out rank.json
 python src/eval.py --model $TINYLLAMA --modes bf16 ref_linear chip \
     --algo mixed_precision:rank_file=rank.json,k=1                  # or mac_budget=0.05
@@ -18,7 +18,7 @@ python src/eval.py ... --algo "mixed_precision:units=model.layers.2.mlp.down_pro
 
 | Parameter | Meaning |
 |---|---|
-| `rank_file` | JSON from `scripts/rank_layers.py`. Required unless `units` is given. |
+| `rank_file` | JSON from `src/scripts/rank_layers.py`. Required unless `units` is given. |
 | `score` | `fisher_out` (default), `hawq_w` or `iso_rel_rmse`. |
 | `k` / `mac_budget` | Top k layers, or the top layers fitting into a share of the ranked layers' MACs (greedy in score order). Give exactly one. |
 | `units` | Explicit fqns separated by `;` (no ranking). |
@@ -100,12 +100,12 @@ This change is on `algo/mixed-precision` only, kept to two files for integration
 
 - **`src/algos/base.py`:** `Algo.residual_passes(name, kind) -> None | "w" | "wx"`, a no-op by
   default, added to `module_hooks`.
-- **`src/ref_profile.py`:** `RefQuantLinear` reads the hook once at construction. If the hook
+- **`src/reference/ref_profile.py`:** `RefQuantLinear` reads the hook once at construction. If the hook
   returns non-None, it builds the residual weight buffers and routes forward through
   `_forward_residual`.
   - With `--algo none` (`algo is None`) or any algorithm that does not override the hook, the
     existing code paths are untouched.
-  - tests/test_algo_base.py (bit-identity to l40s-run-2.1) and the example_identity test pass.
+  - tests/test_algo_base.py (bit-identity to the baseline commit fcfd7d8) and the example_identity test pass.
 - **Conflicts with the granularity branch:** none. It does not touch `algos.base.output_scale` or
   `chip_profile.count_algo_vpu`, the two points the granularity branch changed. The coverage
   accounting comes from the existing `_GuardedFM` MXU counting and VPU dispatch.

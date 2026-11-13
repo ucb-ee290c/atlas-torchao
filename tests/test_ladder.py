@@ -171,9 +171,9 @@ def test_eval_subset_compare_and_duplicate(monkeypatch, tmp_path):
     import sys
     from types import SimpleNamespace
 
-    import datautils
+    import loaders.datautils as datautils
     import eval as ev
-    import modelutils
+    import loaders.modelutils as modelutils
 
     def load(path, seqlen=None, device="cpu"):
         m = tiny_llama()

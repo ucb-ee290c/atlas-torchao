@@ -16,7 +16,7 @@ Reference numerics win unless the RTL clearly contradicts them; the RTL cited is
 | `ref_attn` | as `ref_linear`, + attention Q·Kᵀ / P·V per head | framework (NEW) | framework | model_patcher.py:624-723 |
 | `ref_conv` (alias `reference`) | as `ref_attn`, + Conv2d | `F.linear` on dequantized values (NEW) | framework | model_patcher.py:282-375 |
 | `reference_hw` | as `reference` | MXU model, `--mxu ipt` (default) or `sa` | framework | quant_linear.py:145-172; functional_models.py:79-108 |
-| `chip` | as `reference_hw` | as `reference_hw` | VPU (bit-exact to `VectorRTLFunctions`), scalar core, or reported host fallback; RoPE / timestep tables host constants (NEW default) | src/chip_profile.py, src/op_unit_map.py |
+| `chip` | as `reference_hw` | as `reference_hw` | VPU (bit-exact to `VectorRTLFunctions`), scalar core, or reported host fallback; RoPE / timestep tables host constants (NEW default) | src/chip/chip_profile.py, src/chip/op_unit_map.py |
 | `chip_rope_vpu` | as `chip` | as `chip` | as `chip`, tables computed on the VPU | quant_vector.py:170-171 |
 | `torchao` | torchao per-tensor float8, dynamic | native FP8 matmul (CC >= 8.9) | framework | torchao 0.18 |
 
@@ -89,7 +89,7 @@ eval skips `lm_head`, which was the collaborator's choice (eval.py:66).
 5. **Bias.** It stays BF16 and is added after the rescale (quant_linear.py:164-172).
 6. **Rescale.** The MXU's BF16 output is multiplied by 2^(sx+sw) in float32, which is exact, then cast to the layer dtype (quant_linear.py:169-170).
 7. **fp32 layers** are cast through BF16 (quant_linear.py:136-137; hw_float_ops.py:89).
-8. **MXU models.** The torch ports in src/accum_torch.py use pure integer bit-field arithmetic. They are bit-exact to:
+8. **MXU models.** The torch ports in src/mxu/accum_torch.py use pure integer bit-field arithmetic. They are bit-exact to:
    - `ipt`: ipt_numba, i.e. `IPTLinearRTLFunction(32, 32)` in _numba_kernels.py:234-317. The 32-bit aligned total is rounded to BF16 once, as the RTL does: FPUtils.scala:228-236 uses `INToRecFN` with `round_near_even`. This is the reference author's run (smolVLA run_eval.py:50).
    - `sa`: systolic_c, i.e. `SARTLLinearFunction(32, 32)`. Each K element goes through one E4M3ProdAddBF16 (systolic_array_model.h:97-233).
    - The reference C models (`--mxu-impl ref_cpu`) are the oracles. With the torch implementation, `--crosscheck` (on by default) recomputes a seeded sample of the run's own calls with them. Any differing bit marks the result `valid: false`.
@@ -145,19 +145,19 @@ For the reference author:
 - **R5.** The weight-cache key can alias freed temporaries (F-cache).
 - **R6.** ipt_c double-rounds and uses a 30-bit sum (F-IPT). Should it match ipt_numba and the RTL?
 
-## Must be re-verified on the L40S (CUDA)
+## Must be re-verified on a CUDA GPU
 
-This host has no GPU. Everything above was tested with CPU torch, using the same ops. On the L40S, re-check the following:
+This host has no GPU. Everything above was tested with CPU torch, using the same ops. On a CUDA GPU, re-check the following:
 
 1. **Bit-exactness on CUDA.** Run `pytest tests/test_accum_torch.py` and `ATLAS_TEST_COMPILE=1 pytest tests/test_accum_torch.py -k compile`.
-2. **The benchmark.** Run `scripts/bench_accum.py --device cuda --compile --check --ref`. Its `--check` compares CUDA bits against CPU bits.
+2. **The benchmark.** Run `src/scripts/bench_accum.py --device cuda --compile --check --ref`. Its `--check` compares CUDA bits against CPU bits.
 3. **The cross-check in every reference_hw/chip result JSON:** `layers.<mode>.crosscheck.ok` must be true with `bit_mismatches == 0`.
 4. **BF16 rounding.** The vpack port and the scale rule use `.to(torch.bfloat16)` (RNE) and integer ops, so they should be device-independent. Spot-check them by running tests/test_ref_numerics.py with CUDA tensors.
 5. **Determinism of the non-MXU float ops** (softmax, norms and the `reference` F.linear) across two runs.
    - The MXU ports are integer-only, so TF32 and reduction order cannot affect them.
    - `accum_torch.enforce_exact_settings()` is not called, so the rest of the model keeps PyTorch defaults: TF32 is off for float32 matmul but on for cuDNN float32 convolutions.
 
-CPU microbenchmark (from scripts/bench_accum.py; shared 160-core host under load, so rough figures):
+CPU microbenchmark (from src/scripts/bench_accum.py; shared 160-core host under load, so rough figures):
 
 | Model | M × K × N | MAC/s |
 |---|---|---|
@@ -167,4 +167,4 @@ CPU microbenchmark (from scripts/bench_accum.py; shared 160-core host under load
 | reference systolic_c | 16×2048×256 | 4.1e7 |
 | reference ipt_c | 16×2048×256 | 3.7e7 |
 
-The L40S estimates are not measured: SA eager about 2e9 MAC/s, SA compiled 1e10–5e10. TinyLlama is about 0.97 GMAC per token.
+The GPU estimates are not measured: SA eager about 2e9 MAC/s, SA compiled 1e10–5e10. TinyLlama is about 0.97 GMAC per token.

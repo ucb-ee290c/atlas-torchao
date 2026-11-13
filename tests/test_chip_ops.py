@@ -9,8 +9,8 @@ NaN are compared as "both NaN".
 import pytest
 import torch
 
-import chip_ops as co
-import ref_loader
+import chip.chip_ops as co
+import reference.ref_loader as ref_loader
 from refutil import need_refs
 
 

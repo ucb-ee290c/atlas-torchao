@@ -1,6 +1,6 @@
 # FX graph export and verification
 
-`src/fx_export.py` captures a model reconstructed from the existing quantized export,
+`src/exporter/fx_export.py` captures a model reconstructed from the existing quantized export,
 saves a PyTorch `ExportedProgram` as `model.pt2`, and verifies it after reload. The
 program contains an FX computation graph, lifted tensor state and fixed input guards.
 No calibration or quantizer search runs during this export.
@@ -20,7 +20,7 @@ The output directory must not exist; existing exports and output directories are
 overwritten.
 
 ```bash
-python src/fx_export.py \
+PYTHONPATH=src python -m exporter.fx_export \
   --export-dir /absolute/path/to/verified/tinyllama/export \
   --model /absolute/path/to/tinyllama/config \
   --out-dir /absolute/path/to/new/fx-directory \
@@ -37,7 +37,7 @@ leave a diagnostic `verification.json`.
 To replay a saved graph independently:
 
 ```bash
-python src/fx_export.py --verify-dir /absolute/path/to/fx-directory --device cuda
+PYTHONPATH=src python -m exporter.fx_export --verify-dir /absolute/path/to/fx-directory --device cuda
 ```
 
 The fresh-process check imports PyTorch and SafeTensors but not the original model
@@ -48,7 +48,7 @@ established by this check.
 ## Native-FP8 option (`--native-fp8`)
 
 The default graph above decodes every quantized Linear, Conv2d and attention operand into aten ops. With
-`--native-fp8` the quantized contractions become opaque nodes from `src/atlas_fx_ops.py`, fed directly by the
+`--native-fp8` the quantized contractions become opaque nodes from `src/exporter/atlas_fx_ops.py`, fed directly by the
 weight code and exponent buffers:
 
 | Site | Nodes in the graph |
@@ -64,21 +64,21 @@ weight code and exponent buffers:
 
 No `convert`, `exp2`, `mul`, bit operation, `frexp` or float weight remains in those scopes, and `inspect_graph`
 fails closed otherwise. The activation rule is read from `policy.json` (reference, dynamic token / tensor /
-per-head with rule `ref` or `nc`, or static). The eager bodies call the reference code (`ref_numerics`,
+per-head with rule `ref` or `nc`, or static). The eager bodies call the reference code (`reference.ref_numerics`,
 `algos.granularity.scale_exp`, `F.linear` with the bias after, `ref_numerics.dq_matmul_nt`, which
-`ref_attention._mm` also calls), so outputs are byte-identical to eager replay and to the decode graph;
+`reference.ref_attention._mm` also calls), so outputs are byte-identical to eager replay and to the decode graph;
 `capture_fx` captures the decode graph in memory as well and compares both on every input case. Capture
-swaps `ref_attention._cast` / `_mm` and each layer's `forward` inside a restoring context only.
+swaps `reference.ref_attention._cast` / `_mm` and each layer's `forward` inside a restoring context only.
 
 ```bash
-python src/fx_export.py --export-dir EXPORT --model CONFIG --out-dir NEW_DIR --device cpu --seqlen 8 --native-fp8
-python src/fx_export.py --verify-dir NEW_DIR --device cpu       # imports atlas_fx_ops itself
-python src/fx_export.py --export-dir SMOLVLA_EXPORT --out-dir NEW_DIR --device cpu --native-fp8 \
+PYTHONPATH=src python -m exporter.fx_export --export-dir EXPORT --model CONFIG --out-dir NEW_DIR --device cpu --seqlen 8 --native-fp8
+PYTHONPATH=src python -m exporter.fx_export --verify-dir NEW_DIR --device cpu       # imports exporter.atlas_fx_ops itself
+PYTHONPATH=src python -m exporter.fx_export --export-dir SMOLVLA_EXPORT --out-dir NEW_DIR --device cpu --native-fp8 \
     --boundary smolvla_flow_loss --n-images 1
 ```
 
-- **Loading a saved native bundle.** `model.pt2` names the `atlas.*` operators. Run `import atlas_fx_ops` (from
-  `src/`) before `torch.export.load`, or the load fails with an unknown-operator error. `verify_saved` does
+- **Loading a saved native bundle.** `model.pt2` names the `atlas.*` operators. Run `import exporter.atlas_fx_ops` (with
+  `src/` on `PYTHONPATH`) before `torch.export.load`, or the load fails with an unknown-operator error. `verify_saved` does
   this when `fx_manifest.json` has a `native_fp8` record and checks the operator counts against
   `graph_inspection.json`; tests/test_fx_native.py checks that a bare load fails and the verifier passes.
 - **Storage dtype.** `--native-storage uint8` (default) holds the export bytes as uint8 and the operators carry

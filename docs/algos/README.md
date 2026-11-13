@@ -6,8 +6,8 @@ runs with the algorithm's hooks, and each result entry records it under `algo` n
 unchanged `ladder` record.
 
 `--algo none` (the default) creates no algorithm object: the quantized modules take exactly the
-code paths of `l40s-run-2.1`. `tests/test_algo_base.py` checks this bit for bit on every ladder
-step against an export of that tag.
+code paths of the baseline commit `fcfd7d8`. `tests/test_algo_base.py` checks this bit for bit on
+every ladder step against an export of that commit.
 
 Several algorithms can be stacked with `+`, e.g.
 `--algo smoothquant:alpha=0.5+gptq_awq:method=gptq+granularity:w=channel,a=token,rule=nc`. The
@@ -112,7 +112,7 @@ used. Calibration data is loaded once per run and reused for every mode.
 
 ## Comparison rules
 
-- Use the same windows and frames as l40s-run-2: the same protocol, `--seqlen`,
+- Use the same windows and frames as run 2 (`ab1ff1d`): the same protocol, `--seqlen`,
   `--max-windows` / `--nsamples`, `--seed`, `--n-frames` and `--n-obs`. Every mode of one run
   sees identical inputs.
 - Report each `(algo, ladder step)` against the best existing profile at the **same ladder step**,

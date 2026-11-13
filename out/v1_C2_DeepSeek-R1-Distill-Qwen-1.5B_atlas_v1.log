@@ -1,0 +1,39 @@
+Token indices sequence length is longer than the specified maximum sequence length for this model (298939 > 16384). Running this sequence through the model will result in indexing errors
+bf16 ppl: 65.6092  (1.8s, 2 windows of 2048, protocol mxq)
+  bf16 kl_vs_bf16 0.00000  top1_agree 1.0000
+Token indices sequence length is longer than the specified maximum sequence length for this model (2518424 > 16384). Running this sequence through the model will result in indexing errors
+ref_conv ppl: 240.6279  (15.6s, 2 windows of 2048, protocol mxq)
+  ref_conv kl_vs_bf16 1.54499  top1_agree 0.4185
+[chip coverage] Qwen2ForCausalLM
+  unit        calls              work  share(calls)  share(work)
+  MXU           252     6088116142080        0.1392     0.860354
+  VPU          1546       32269705216        0.8541     0.004560
+  scalar          6           4202497        0.0033     0.000001
+  data         1247        5187662212           nan          nan
+  host            6      955899969536        0.0033     0.135085
+  eval            0                 0           nan          nan
+  host fallback:
+    mm                                            calls=1      work=955898658816 kept off the chip on request (--skip lm_head)
+    mul                                           calls=2      work=524288       RoPE table (position-only), precomputed on the host (--chip-rope host)
+    bmm                                           calls=1      work=262144       RoPE table (position-only), precomputed on the host (--chip-rope host)
+    cos                                           calls=1      work=262144       RoPE table (position-only), precomputed on the host (--chip-rope host)
+    sin                                           calls=1      work=262144       RoPE table (position-only), precomputed on the host (--chip-rope host)
+  NEW decisions used: _softmax, silu, granularity_rescale (VPU), where (data)
+chip ppl: 206.2560  (6907.9s, 2 windows of 2048, protocol mxq)
+  chip kl_vs_bf16 1.48142  top1_agree 0.4253
+wrote out/v1_C2_DeepSeek-R1-Distill-Qwen-1.5B_atlas_v1.json
+[chip coverage] Qwen2ForCausalLM
+  unit        calls              work  share(calls)  share(work)
+  MXU           504    12176232284160        0.1392     0.860354
+  VPU          3092       64539410432        0.8541     0.004560
+  scalar         12           8404994        0.0033     0.000001
+  data         2494       10375324424           nan          nan
+  host           12     1911799939072        0.0033     0.135085
+  eval            0                 0           nan          nan
+  host fallback:
+    mm                                            calls=2      work=1911797317632 kept off the chip on request (--skip lm_head)
+    mul                                           calls=4      work=1048576      RoPE table (position-only), precomputed on the host (--chip-rope host)
+    bmm                                           calls=2      work=524288       RoPE table (position-only), precomputed on the host (--chip-rope host)
+    cos                                           calls=2      work=524288       RoPE table (position-only), precomputed on the host (--chip-rope host)
+    sin                                           calls=2      work=524288       RoPE table (position-only), precomputed on the host (--chip-rope host)
+  NEW decisions used: _softmax, silu, granularity_rescale (VPU), where (data)

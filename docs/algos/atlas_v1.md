@@ -10,7 +10,7 @@
 > - **The v1.0 AWQ-vs-SmoothQuant choice was within noise on SmolVLA and Pi0** (chip margins
 >   0.0159 vs a 0.020 floor and 0.0024 vs a 0.0027 floor), the TinyLlama margin depends on the
 >   unresolved `pt` unit, and **the Pi0 rows mixed commits** (none at run 5, SmoothQuant and
->   static at run 5.1, AWQ at run 5.3). `l40s-run-6` re-measures all recipes at one commit.
+>   static at run 5.1, AWQ at run 5.3). Run 6 (`5731fc0`) re-measures all recipes at one commit.
 > - **`atlas_v1` changed meaning across tags** (table below). Cite a recipe by its explicit
 >   name; results and exports record the alias, the resolved name and the expanded stack.
 
@@ -18,7 +18,7 @@
 a documented stack of the merged algorithms (`algos.RECIPES` and `algos.ALIASES` in
 `src/algos/__init__.py`; stacking rules in [stacking.md](stacking.md)). The recipe itself is **NEW**: it combines tracks that each cite their
 own sources, but no source defines this combination. Each component keeps the numerics of its
-track, and the reference author's numerics (`src/ref_numerics.py`) stay the source of truth for
+track, and the reference author's numerics (`src/reference/ref_numerics.py`) stay the source of truth for
 every cast.
 
 There are dynamic and static variants because the hardware ruling on run-time activation scales
@@ -52,7 +52,7 @@ own spec and the fully `expanded` spec, including opt-in members.
 
 | Tag / commit | `atlas_v1` meant | `atlas_v1_sq` | `atlas_v1_awq` | `atlas_v1_static` |
 |---|---|---|---|---|
-| `l40s-run-5` (`0447807`), `l40s-run-5.1` (`46b0b1d`), `l40s-run-5.2` (`4ab3889`), `l40s-run-5.3` (`a30779b`), local `atlas-v1-handoff` (`aa679e2`) | SmoothQuant+GPTQ+granularity (today's `atlas_v1_sq`) | did not exist | as today | as today |
+| run 5 (`0447807`), run 5.1 (`46b0b1d`), run 5.2 (`4ab3889`), run 5.3 (`a30779b`), local `atlas-v1-handoff` (`aa679e2`) | SmoothQuant+GPTQ+granularity (today's `atlas_v1_sq`) | did not exist | as today | as today |
 | `5ff028e` (local tag `atlas-v1.0`, never published), `fx-gpu-check-1` and main at `2d4b187` / merge `54e1855`, `characterization-gpu-pilot-1-2026-10-14` (`a99a062`) | AWQ+GPTQ+granularity **plus** a BF16 exception for the Multi-Task DiT CLIP patch embedding, keyed on the policy type `multi_task_dit` | as today | as today (no exception) | as today |
 | v1.1 (this branch) | alias of `atlas_v1_awq`, no exception | as today | as today | as today |
 
@@ -90,7 +90,7 @@ without a recorded resolved name must be read against its source tag in this tab
   it on the DiT. BF16 has no MXU operand path: placement on the VPU or host remains pending R4.
 - **Other mixed precision.** fp8x3 residual passes need ruling R4 (whether passes can share the MXU
   accumulator). Opt in with `+`, for example
-  `--algo atlas_v1_awq+mixed_precision:rank_file=PATH,k=4` (ranking from `scripts/rank_layers.py`;
+  `--algo atlas_v1_awq+mixed_precision:rank_file=PATH,k=4` (ranking from `src/scripts/rank_layers.py`;
   causal LM only).
 - Recipes take no parameters (`atlas_v1:alpha=0.3` is refused). To change a component, write the
   stack out.
@@ -108,7 +108,7 @@ Historical recipe labels below are the labels at the cited tags. AWQ means histo
 
 TinyLlama: R full 166 windows, C 4 mxq windows; calibration 16 WikiText-2 train windows.
 SmolVLA: R 200 frames, C 32 frames; calibration 32 frames outside evaluation episodes.
-These rows used `l40s-run-5` (`0447807`). Pi0: 5 DROID observations, seed 0; calibration
+These rows used run 5 (`0447807`). Pi0: 5 DROID observations, seed 0; calibration
 8 observations outside evaluated episodes. `none` used run 5; SQ/static used run 5.1
 (`46b0b1d`); AWQ used run 5.3 (`a30779b`). AWQ raised one Cholesky dampening to 0.1,
 which is recorded. Pi0 delta-space rel L2 R/C was 0.106/0.127 (none), 0.071/0.088 (SQ),
@@ -143,7 +143,7 @@ unchanged when its key has no stats (`lerobot/processor/normalize_processor.py:3
 the checkpoint's processors nothing is normalized and nothing fails. The `so100` stats do not match
 `svla_so100_pickplace` and are not aliased.
 
-`src/eval_policy.py` (and `src/policy_norm.py`) therefore:
+`src/eval_policy.py` (and `src/loaders/policy_norm.py`) therefore:
 
 - `--norm-stats checkpoint` (default): the processors as saved.
 - `--norm-stats dataset` (NEW): a zero-shot evaluation protocol for a pretraining checkpoint,

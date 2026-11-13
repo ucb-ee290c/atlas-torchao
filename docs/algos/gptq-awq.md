@@ -35,7 +35,7 @@ grid is free to choose. Here it is the Atlas vpack cast at the layer's exponent 
 
 - The cast rounds to nearest even, flushes results below 2^-6 to zero, saturates at 448 and treats
   exponent 15 as finite.
-- Sources: `src/ref_numerics.py:27-59`, a bit-exact port of pi0-quant `fp8_e4m3.py:38-86` and the
+- Sources: `src/reference/ref_numerics.py:27-59`, a bit-exact port of pi0-quant `fp8_e4m3.py:38-86` and the
   RTL `FP8Pack.scala:57-95`.
 - The error fed back is therefore the true FP8 error, never a uniform-integer rounding error.
 - vpack first rounds its input to BF16, as the hardware path does.

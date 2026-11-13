@@ -165,7 +165,7 @@ def test_opt_in_and_refusals():
 
 def test_env_router_refuses_an_algorithm(monkeypatch):
     need_refs()
-    import chip_coverage as cc
+    import chip.chip_coverage as cc
 
     monkeypatch.setenv("ATLAS_ALGO", "atlas_v1")
     with pytest.raises(NotImplementedError, match="eval_policy.py"):

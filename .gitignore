@@ -6,3 +6,5 @@ __pycache__
 src/out/
 *.egg-info
 model2MLIR
+.claude/
+out/

@@ -63,7 +63,7 @@ def lerobot_frames(policy_cfg, dataset, n_test_episodes, eval_seed, n, seed, to_
 def pi0_droid(n_eval, n, horizon, frame_idx, eval_seed, eval_frames=()):
     """n DROID frames from the episodes after the evaluated ones in pi0_model.droid_observations'
     seeded order (so disjoint from them by construction; checked against `eval_frames`)."""
-    import pi0_model
+    import loaders.pi0_model as pi0_model
 
     frames = pi0_model.droid_observations(n_eval + n, horizon, frame_idx, eval_seed)[n_eval:]
     used = {f["meta"]["episode"] for f in eval_frames}
@@ -87,7 +87,7 @@ def pi0_dummy(n, seed, eval_seed=None, model_level=False, cfg=None, device="cpu"
         frames = eval_pi0.mxu_dummy_observations(n, cfg, device, seed)
         src = "mxu_dummy (run_eval_mxu_io.py _make_dummy_obs)"
     else:
-        import pi0_model
+        import loaders.pi0_model as pi0_model
 
         frames = pi0_model.dummy_observations(n, seed)
         src = "dummy (run_output_eval.py _make_dummy_obs)"

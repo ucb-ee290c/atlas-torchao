@@ -45,7 +45,7 @@ Parameters (--algo gptq_awq:k=v,...):
                              batch's x^T x is computed on the activation's device and summed into
                              a float32 CPU accumulator; GPTQ / AWQ move one layer's H to the
                              weight's device at a time. With `device` every H stays on the GPU
-                             (all layers at once: about 42 GB for Pi0, more than an L40S holds).
+                             (all layers at once: about 42 GB for Pi0, more than a 48 GB GPU holds).
 Only Linear weights are changed; Conv2d weights and every activation keep the reference rule.
 
 Weight grid under a stack (NEW; docs/algos/stacking.md): stacked after an algorithm that chooses
@@ -65,7 +65,7 @@ import weakref
 import torch
 import torch.nn as nn
 
-import ref_numerics as rn
+import reference.ref_numerics as rn
 from algos.base import Algo, Scale
 
 METHODS = ("gptq", "awq", "awq_gptq")

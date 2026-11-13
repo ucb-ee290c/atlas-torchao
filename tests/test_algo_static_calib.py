@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 
 import algos
-import ref_numerics as rn
+import reference.ref_numerics as rn
 from algos import static_calib as sc
 from refutil import need_refs
 from test_ladder import FAST, tiny_llama
@@ -230,7 +230,7 @@ def _cast_counts(rep):
 
 def test_chip_counts_static_casts_as_vpack_without_amax(monkeypatch):
     need_refs()
-    import chip_profile
+    import chip.chip_profile as chip_profile
 
     calls = []
     orig = chip_profile.count_algo_cast

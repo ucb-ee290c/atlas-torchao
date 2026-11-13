@@ -7,8 +7,8 @@ import torch.nn as nn
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from atlas_quant import hw_bf16_to_e4m3, hw_e4m3_to_float, scale_exp_for  # noqa: E402
-from atlas_torchao import AtlasQConfig, AtlasQuantLinear  # noqa: E402
+from collab.atlas_quant import hw_bf16_to_e4m3, hw_e4m3_to_float, scale_exp_for  # noqa: E402
+from collab.atlas_torchao import AtlasQConfig, AtlasQuantLinear  # noqa: E402
 
 BIAS = torch.tensor(127)  # unit scale
 

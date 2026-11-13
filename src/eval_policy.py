@@ -17,7 +17,7 @@ Modes:
   torchao     stock TorchAO Float8DynamicActivationFloat8WeightConfig, per-tensor
               (native FP8; needs compute capability >= 8.9, e.g. L40 / H100)
 
-Normalization (src/policy_norm.py): --norm-stats checkpoint (default) uses the processors as saved;
+Normalization (src/loaders/policy_norm.py): --norm-stats checkpoint (default) uses the processors as saved;
 --norm-stats dataset (NEW) overrides their stats with the evaluated dataset's, as a lerobot fine-tune
 from the checkpoint would start. Either way a guard refuses processors that would leave a normalized
 feature unnormalized (lerobot/smolvla_base's saved processors do: SmolVLA results made before this
@@ -46,8 +46,8 @@ from pathlib import Path
 import torch
 
 import algos
-import ckpt_keys
-import policy_norm
+import loaders.ckpt_keys as ckpt_keys
+import loaders.policy_norm as policy_norm
 from quant_modes import (ALL_MODES, add_profile_args, add_subset_compare_arg, finalize_report, ladder_deltas,
                          ladder_record, quantize, require_mode_supported, subset_compare_modes)
 
@@ -61,7 +61,7 @@ def load_policy(path, device, dtype):
     cfg.device = device
     policy = get_policy_class(cfg.type).from_pretrained(path, config=cfg)
     # NEW: a non-strict load leaves keys a newer library nests one level deeper (e.g. the DiT's
-    # fine-tuned CLIP) at the constructor's weights; repair the nesting or refuse (src/ckpt_keys.py).
+    # fine-tuned CLIP) at the constructor's weights; repair the nesting or refuse (src/loaders/ckpt_keys.py).
     key_repair = ckpt_keys.repair_checkpoint_keys(policy, path)
     policy = policy.to(device=device, dtype=dtype).eval()
     policy.checkpoint_key_repair = key_repair
@@ -372,7 +372,7 @@ def build_parser():
     add_profile_args(ap)
     add_subset_compare_arg(ap)
     algos.add_args(ap, calib_sources=("non_eval_episodes",))
-    __import__("quant_export").add_args(ap)
+    __import__("exporter.quant_export", fromlist=['_']).add_args(ap)
     return ap
 
 
@@ -420,7 +420,7 @@ def main():
         args.modes = ["bf16", *args.modes]  # every FP8 mode is compared against it
     # the frames are always a sample, so a subset profile gets ref_conv on the same frames
     args.modes, added = subset_compare_modes(args.modes, args.subset_compare == "on")
-    import quant_export
+    import exporter.quant_export as quant_export
 
     export_mode = quant_export.check_args(ap, args)
     if args.export_only:
@@ -452,7 +452,7 @@ def main():
                               "frames": len(idx), "fps": meta.fps}
         calib = _calib_loader(calib_cache, args, cfg, preprocess, norm)
         if args.from_export and mode != "bf16":
-            import load_quantized
+            import exporter.load_quantized as load_quantized
 
             # no calibration; every exported tensor overwrites the checkpoint's (docs/algos/export.md)
             _, layers, man = load_quantized.load_quantized(args.policy, args.from_export, args.device,

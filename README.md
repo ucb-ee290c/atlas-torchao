@@ -6,17 +6,40 @@
     conda env create -f environment.yml
     conda activate atlas
     git submodule update --init
-    pip install -e model2MLIR --no-deps     # deps (xdsl, structlog, PyYAML) are in requirements.txt
+    git clone https://github.com/ucb-bar/model2MLIR.git    # not a submodule; the folder is in .gitignore
+    pip install -e model2MLIR --no-deps     # its dependencies (xdsl, structlog, PyYAML) are in pyproject.toml
 
 ### Notes
-- Python 3.12 is required: model2MLIR uses Python 3.11+ features (enum.StrEnum).
+- Python 3.11 or newer is required: model2MLIR uses Python 3.11 features (enum.StrEnum).
+  `environment.yml` installs 3.12.
 - Install model2MLIR with --no-deps; its optional extras can upgrade torch/torchao.
+- `third_party/atlas-kernels` and `third_party/npu_model` use SSH URLs, so cloning them needs an
+  SSH key registered with GitHub; `pi0-quant` and `smolVLA-quant` use HTTPS.
 - Create conda envs on /scratch or /rscratch, not your home directory.
+
+## Layout of `src/`
+
+Entry points sit at the top of `src/` (run them as `python src/eval.py ...`); everything else is a package.
+`src/` must be on `PYTHONPATH` (the entry points and `tests/conftest.py` do this).
+
+| Path | What lives there |
+|---|---|
+| `eval.py`, `eval_policy.py`, `eval_pi0.py` | CLIs: LLM perplexity, LeRobot policies (SmolVLA, DiT), Pi0 |
+| `quant_modes.py` | the coverage ladder: mode name to profile, and `quantize()` dispatch |
+| `layer_rmse.py` | per-layer isolated and cumulative RMSE against a clean BF16 pass |
+| `reference/` | the reference author's cast and module replacements: `ref_loader` (pinned submodules), `ref_numerics` (E4M3 cast, po2 scales), `ref_profile` (Linear), `ref_attention` (Q.K, P.V, Conv2d) |
+| `mxu/` | MXU accumulation: `accum_torch` (ports of the `ipt` and `sa` models), `accum_backends` (backend choice), `accum_crosscheck` (bit-level check against the reference CPU model) |
+| `chip/` | the `chip` profile: `chip_ops` (lane-exact VPU), `chip_numerics` (vadd rounding), `chip_coverage` (aten op router), `chip_profile` (installs it), `op_unit_map` (op to unit table) |
+| `algos/` | quantization algorithms and recipes (SmoothQuant, GPTQ/AWQ, granularity, static calibration, mixed precision) |
+| `exporter/` | `quant_export` / `load_quantized` (SafeTensors + policy + manifest), `fx_export` (FX replay bundle; run as `python -m exporter.fx_export`) |
+| `loaders/` | model and data loading: `modelutils`, `datautils`, `ppl_protocols`, `pi0_model`, `ckpt_keys`, `policy_norm` |
+| `collab/` | the earlier collaborator path: `atlas_quant`, `atlas_torchao` (`collab_v0` mode), `atlas_m2m` (TinyLlama to MLIR demo) |
+| `chip_coverage.py` | compatibility shim for `load_op_emulator("chip_coverage")` in multitask-dit-quant; the module is `chip/chip_coverage.py` |
 
 ## Reference numerics (third_party)
 
 The reference author's quantization code is pinned as two submodules and loaded from there
-(`src/ref_loader.py` checks the pins and records the sha256 of every file it loads):
+(`src/reference/ref_loader.py` checks the pins and records the sha256 of every file it loads):
 
     git submodule update --init third_party/pi0-quant third_party/smolVLA-quant
     uv pip install numba            # or: pip install -e .[reference]; gcc is needed for the C models
@@ -61,13 +84,11 @@ a seeded sample of real calls is recomputed by the reference CPU model, and any 
 `valid: false` in the result JSON. Every numerics decision and its source, the findings and the open
 questions are in [docs/reference_profile.md](docs/reference_profile.md).
 
-## L40S run matrix: the ladder per model
-
-Use tag l40s-run-2.1 (SA compile fix) for run 2.
+## Run matrix: the ladder per model
 
 Setup, once per machine:
 
-    git clone -b reference-profile git@github.com:ucb-ee290c/atlas-torchao.git && cd atlas-torchao
+    git clone git@github.com:ucb-ee290c/atlas-torchao.git && cd atlas-torchao
     git submodule update --init third_party/pi0-quant third_party/smolVLA-quant
     pip install numba                                        # gcc must be on PATH for the C oracles
     export PYTHONPATH=src HF_HOME=/path/to/hf_cache TL=/path/to/TinyLlama-1.1B-Chat-v1.0
@@ -77,7 +98,7 @@ Gates (stop if any fail), then the benchmark that sizes every subset job:
 
     python -m pytest -q tests
     ATLAS_TEST_COMPILE=1 python -m pytest -q tests/test_accum_torch.py
-    python scripts/bench_accum.py --device cuda --compile --check --ref | tee out/bench_accum.txt
+    python src/scripts/bench_accum.py --device cuda --compile --check --ref | tee out/bench_accum.txt
 
 Benchmark first: size each subset job from the measured MAC/s of the chosen MXU model in
 `out/bench_accum.txt` (ipt, or SA compiled), so that it fits in about 1–2 h:
@@ -114,7 +135,7 @@ same step names; step 2 `collab_v0` only exists here):
 
     python src/eval_policy.py --policy TRI-ML/multitask-dit-robosuite-wrist-diffusion-064000 --dataset TRI-ML/PretrainFinetune --n-frames 200 --modes bf16 collab_v0 ref_linear ref_attn ref_conv --out out/dit_ladder_fast.json
 
-Pi0: see "L40S run matrix for Pi0" below (same ladder, `src/eval_pi0.py`).
+Pi0: see "Run matrix for Pi0" below (same ladder, `src/eval_pi0.py`).
 
 Policy-eval options (eval_policy.py):
 
@@ -138,7 +159,7 @@ Check every reference_hw and chip result before quoting it:
 
 The reference author's pi0-quant is the Pi0 reference profile. This repo follows it for the
 model, checkpoint, config, observations, attention routes and action metric.
-- `src/pi0_model.py`: loading, observations, patch coverage.
+- `src/loaders/pi0_model.py`: loading, observations, patch coverage.
 - `ref_attention.patch_pi0_attention`: the three attention routes.
 - `src/eval_pi0.py`: the eval.
 
@@ -164,13 +185,13 @@ Notes on the environment:
 - `UV_LINK_MODE=copy` matters. With uv's default hard links, the `transformers_replace` copy also
   rewrites transformers in the uv cache (openpi README).
 - The torch 2.7.1 wheel that uv resolves on Linux x86-64 is the CUDA 12.6 build (`2.7.1+cu126`).
-  If the L40S driver needs a different build, reinstall it from the PyTorch index:
+  If the GPU driver needs a different build, reinstall it from the PyTorch index:
 
       VIRTUAL_ENV=$PI0_ENV uv pip install --reinstall torch==2.7.1 \
           --index-url https://download.pytorch.org/whl/cu126
 
 - torchao 0.12.0 is the release for torch 2.7. The `torchao` mode (native FP8) has only been run
-  under torchao 0.18 (main environment). **Its behaviour under 0.12 must be verified on the L40S**:
+  under torchao 0.18 (main environment). **Its behaviour under 0.12 must be verified on a GPU**:
   the result JSON records the version.
 - numba comes with the lock. gcc must be on PATH for the C oracles.
 
@@ -289,7 +310,7 @@ The checkpoint load fails loudly. The reference loader keeps random weights when
 PI0Pytorch's `torch.compile` wrapper is removed for every mode, as the reference does
 (run_eval.py:943-947).
 
-### L40S run matrix for Pi0 (benchmark first)
+### Run matrix for Pi0 (benchmark first)
 
 One Pi0 frame (10 flow steps) is 2.14e12 MAC, measured with torch's FlopCounterMode on the real
 checkpoint.
@@ -310,7 +331,7 @@ Start with F = 4, the reference's `--n-obs` default.
     export OPENPI_DIR=... PI0_CHECKPOINT=... PALIGEMMA_TOKENIZER=... HF_HOME=... PYTHONPATH=src
     P=$PI0_ENV/bin/python
     $P -m pytest -q tests                                   # includes tests/test_pi0.py
-    $P scripts/bench_accum.py --device cuda --compile --check --ref | tee out/bench_accum_pi0env.txt
+    $P src/scripts/bench_accum.py --device cuda --compile --check --ref | tee out/bench_accum_pi0env.txt
     # steps 1-5 (fast): reference methodology (dummy obs) and real DROID frames with ground truth
     $P src/eval_pi0.py --obs dummy --n-obs 32 --modes bf16 collab_v0 ref_linear ref_attn ref_conv --rmse --out out/pi0_ladder_fast_dummy.json
     $P src/eval_pi0.py --obs droid --n-obs 32 --modes bf16 collab_v0 ref_linear ref_attn ref_conv --rmse --out out/pi0_ladder_fast_droid.json
@@ -392,8 +413,8 @@ Findings:
 ## The `chip` profile: the whole model as Atlas would run it
 
 `--modes chip` = `reference_hw` (MXU accumulation model for the matmuls) + every other op of the
-forward pass routed to the Atlas unit that would execute it (`src/chip_profile.py`,
-`src/chip_coverage.py`, `src/chip_ops.py`, `src/op_unit_map.py`):
+forward pass routed to the Atlas unit that would execute it (`src/chip/chip_profile.py`,
+`src/chip/chip_coverage.py`, `src/chip/chip_ops.py`, `src/chip/op_unit_map.py`):
 
 | unit | what runs there | how it is emulated |
 |---|---|---|
@@ -424,7 +445,7 @@ docs/algos/vpu-numerics.md).
 ### Pi0
 
 Every aten op of openpi's PI0Pytorch (`sample_actions`, pi0=True) has a unit: `MODEL_OPS` rows
-`"pi0"` in `src/op_unit_map.py`, cited to pi0-quant's `patch_vector_ops` (quant_vector.py:136-171,
+`"pi0"` in `src/chip/op_unit_map.py`, cited to pi0-quant's `patch_vector_ops` (quant_vector.py:136-171,
 360-433) and vpu_decomp.py, which this repo follows op for op (GELU-tanh, RMSNorm with `1 + w` as
 vsquare / staged rsum / vsqrt+vrecip / vadd / vmul, softmax, SiLU, embedding scale, RoPE apply,
 Euler step). On a tiny random-weight Pi0 (tests/pi0_tiny.py, tests/test_chip_pi0.py)
@@ -463,7 +484,7 @@ The masked logits (-2.38e38) are zeroed by the vexp floor (-128).
 | `--chip-rope host` the default of `chip` for every model (`chip_rope_vpu` keeps the reference treatment) | RoPE and timestep sin/cos tables are compile-time host constants | on a deployment, position- and schedule-only tables are constants; vsin/vcos take \|x\| < ~400 rad and BF16 angles have an 8 rad ulp near 1000, so on-VPU tables are wrong for long positions (Pi0 findings); the reference computes them on the VPU (quant_vector.py:170-171) |
 
 The model-level op -> unit map (with the aten ops each model operation becomes) is `MODEL_OPS` in
-`src/op_unit_map.py`; the aten-level map with instruction sequences and citations is `ATEN`.
+`src/chip/op_unit_map.py`; the aten-level map with instruction sequences and citations is `ATEN`.
 
 ### Multi-Task DiT
 

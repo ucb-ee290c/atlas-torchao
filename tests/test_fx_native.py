@@ -1,4 +1,4 @@
-"""--native-fp8 FX export: one atlas.qlinear node per quantized Linear (src/atlas_fx_ops.py)."""
+"""--native-fp8 FX export: one atlas.qlinear node per quantized Linear (src/exporter/atlas_fx_ops.py)."""
 
 import hashlib
 import json
@@ -7,15 +7,21 @@ import sys
 import textwrap
 
 import algos
-import atlas_fx_ops  # noqa: F401  (registers atlas::quantize_act / atlas::qlinear)
-import fx_export
+import exporter.atlas_fx_ops as atlas_fx_ops  # noqa: F401  (registers atlas::quantize_act / atlas::qlinear)
+import exporter.fx_export as fx_export
+import exporter.quant_export as quant_export
 import pytest
-import quant_export
-import ref_numerics as rn
+import reference.ref_numerics as rn
 import torch
 import torch.nn.functional as F
 from test_export import _quantize_export, _reload
+from test_fx_export import PINNED_TORCH
 from test_ladder import FAST
+
+# Same guard as tests/test_fx_export.py: older torch cannot torch.export these captures.
+pytestmark = pytest.mark.skipif(torch.__version__ < PINNED_TORCH,
+                                reason=f"torch.export captures need the pinned torch {PINNED_TORCH} "
+                                       f"(found {torch.__version__})")
 
 STORAGES = ["uint8", "float8_e4m3fn"]
 INPUTS = [(torch.arange(8, dtype=torch.long).reshape(1, 8),),
@@ -302,7 +308,7 @@ def test_block_scaled_linear_stays_on_the_decode_path(tmp_path):
 
 @pytest.mark.parametrize("reduce", ["head", "token"])
 def test_attention_ops_equal_ref_attention_mm_and_cast(reduce):
-    import ref_attention as ra
+    import reference.ref_attention as ra
 
     torch.manual_seed(3)
     q = torch.randn(2, 4, 5, 16, dtype=torch.bfloat16)
@@ -383,7 +389,7 @@ def test_attention_native_refuses_frozen_operand_and_wrong_rule(tmp_path):
     eager, directory, _, options = _quantize_export(tmp_path, "atlas_v1_awq", layers=1)
     wrapped = fx_export.CausalLogits(_reload(directory, "ref_conv", options, layers=1)).eval()
     policy = json.loads((directory / "policy.json").read_text())
-    import ref_attention as ra
+    import reference.ref_attention as ra
 
     with fx_export._meta_placeholders(wrapped), fx_export._native_sites(wrapped, policy, "uint8") as plan:
         program = torch.export.export(wrapped, INPUTS[0], strict=True)
@@ -408,7 +414,7 @@ def test_attention_native_refuses_frozen_operand_and_wrong_rule(tmp_path):
 
 
 def test_native_capture_restores_ref_attention_functions(tmp_path):
-    import ref_attention as ra
+    import reference.ref_attention as ra
 
     cast, mm = ra._cast, ra._mm
     _tiny_native(tmp_path, "none", fresh=False)

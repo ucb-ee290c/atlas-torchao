@@ -1,7 +1,7 @@
 """FP8 quantization algorithms selectable with `--algo NAME[:k=v,...]` (NEW; docs/algos/README.md).
 
 `--algo` is orthogonal to the ladder modes: every mode except bf16 runs with the algorithm's hooks
-(src/algos/base.py), and `--algo none` (the default) leaves every mode exactly as l40s-run-2.1.
+(src/algos/base.py), and `--algo none` (the default) leaves every mode exactly as the baseline commit fcfd7d8.
 
 Registration is one line per algorithm in REGISTRY: name -> module. The module defines `ALGO`, an
 `algos.base.Algo` subclass constructed with the parsed k=v params.
@@ -44,7 +44,7 @@ REGISTRY = {
 # stack); otherwise layers are kept in BF16 only by an explicit opt-in member (keep_bf16:rule=...,
 # mixed_precision:units=...).
 RECIPES = {
-    # SmoothQuant + GPTQ + granularity: what `atlas_v1` meant at l40s-run-5 .. l40s-run-5.3.
+    # SmoothQuant + GPTQ + granularity: what `atlas_v1` meant at commits 0447807 .. a30779b.
     "atlas_v1_sq": {
         "spec": "smoothquant:alpha=0.5,po2=true,gain=false,partial=true"
                 "+gptq_awq:method=gptq,actorder=true"
@@ -52,14 +52,14 @@ RECIPES = {
         "chip": {"chip_vadd": "rn", "chip_vadd_sites": "residual"},
         "activation_scales": "dynamic per token (run-time amax on chip)",
     },
-    # AWQ + GPTQ + granularity: unchanged since l40s-run-5.
+    # AWQ + GPTQ + granularity: unchanged since 0447807.
     "atlas_v1_awq": {
         "spec": "gptq_awq:method=awq_gptq,actorder=true"
                 "+granularity:w=channel,a=token,rule=nc",
         "chip": {"chip_vadd": "rn", "chip_vadd_sites": "residual"},
         "activation_scales": "dynamic per token (run-time amax on chip)",
     },
-    # SmoothQuant static + GPTQ: unchanged since l40s-run-5.
+    # SmoothQuant static + GPTQ: unchanged since 0447807.
     "atlas_v1_static": {
         "spec": "smoothquant:alpha=0.5,po2=true,gain=true,static=true,partial=true"
                 "+gptq_awq:method=gptq,actorder=true",

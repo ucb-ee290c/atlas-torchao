@@ -26,7 +26,7 @@ def _args(tmp_path, *extra):
 
 
 def _build(rt, policy_tok=None):
-    import pi0_model
+    import loaders.pi0_model as pi0_model
     from quant_modes import quantize
 
     def build(mode, args):
@@ -62,7 +62,7 @@ def test_reference_noise_is_the_reference_draws(rt):
 
 
 def test_mxu_dummy_observations_match_reference(rt):
-    import ref_loader
+    import reference.ref_loader as ref_loader
 
     rio = ref_loader.load_file("pi0-quant", "experiments/run_eval_mxu_io.py")
     cfg = SimpleNamespace(max_token_len=8)
@@ -150,7 +150,7 @@ def test_policy_level_bf16_reproduces_run_output_eval(rt, tmp_path):
     tok = os.environ.get("PALIGEMMA_TOKENIZER")
     if not tok or not os.path.isfile(tok):
         pytest.skip("PALIGEMMA_TOKENIZER not set")
-    import pi0_model
+    import loaders.pi0_model as pi0_model
 
     frames = pi0_model.dummy_observations(2, seed=0)
     m = tiny_pi0(rt)
@@ -217,7 +217,7 @@ def test_delta_space_metrics():
 def test_droid_frames_resized_on_client(rt):
     """DROID's 180x320 frames are padded to 224x224 before the policy shim, as openpi's DROID
     client does; the model's stubbed resize path drops the batch dimension."""
-    import pi0_model
+    import loaders.pi0_model as pi0_model
 
     obs = {k: np.full((180, 320, 3), 200, np.uint8) for k in pi0_model.DROID_CAMERAS}
     fr = eval_pi0.client_resize([{"obs": obs, "gt": None, "meta": {}}])[0]
