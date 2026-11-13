@@ -303,10 +303,13 @@ def run(export, fx, out, allow_fallback=False, allow_unquantized_attention=True,
     attn_all = sorted(n for n, s in policy["sites"].items() if s["kind"] == "attention" and s["status"] == "quantized")
     # Attention sites a per-phase graph does not hold (the boundary never calls them): derived from the graph as "no
     # quantize_act tagged '<site>:<operand>'" and cross-checked with graph_inspection.unused_attention_modules. A bundle
-    # whose quantize_act nodes carry no tag (saved before tags) has no such sites.
+    # whose quantize_act nodes carry no tag (saved before tags) has no such sites. A bundle that declares
+    # unused_attention_modules was saved with tags, so a graph with no tagged node (no attention at all, e.g. the DiT
+    # modulate phase) has every attention site absent.
     act_tags = {str(n.args[6]).rpartition(":")[0] for n in prog.graph.nodes if n.op == "call_function"
                 and str(n.target) == "atlas.quantize_act.default" and len(n.args) > 6 and ":" in str(n.args[6])}
-    absent_derived = sorted(a for a in attn_all if a not in act_tags) if act_tags else []
+    tagged = bool(act_tags) or "unused_attention_modules" in gi
+    absent_derived = sorted(a for a in attn_all if a not in act_tags) if tagged else []
     absent_declared = sorted(r["site"] for r in gi.get("unused_attention_modules", []))
     absent_agree = absent_derived == absent_declared
     attn_policy = [a for a in attn_all if a not in absent_derived]
