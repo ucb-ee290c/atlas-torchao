@@ -86,7 +86,8 @@ def test_nonpersistent_buffers_are_captured_as_constants_and_restored(tmp_path, 
     report = fx_export.capture_fx(module, cases, tmp_path / "fx", policy=policy, fresh_process=False,
                                   native_fp8="uint8")
     assert report["status"] == "passed"
-    assert report["capture_buffer_roles"] == {"made_persistent": 2, "held_as_constants": ["0._cos_cached"]}
+    assert report["capture_buffer_roles"] == {"made_persistent": 2, "held_as_constants": ["0._cos_cached"],
+                                              "tied_aliases_held_as_attributes": []}
     program = torch.export.load(tmp_path / "fx" / "model.pt2")
     kinds = _input_kinds(program)
     assert kinds["0._cos_cached"] == "CONSTANT_TENSOR"
@@ -199,3 +200,71 @@ def test_export_prefix_maps_lifted_state_onto_export_names():
     assert backend_loader.export_prefix(_Program({"norm.weight": torch.zeros(1)}), {"norm.weight": 0}) == ""
     with pytest.raises(ValueError, match="no unique wrapper prefix"):
         backend_loader.export_prefix(_Program({"model.model.extra": torch.zeros(1)}), tensors)
+
+
+class _Tied(torch.nn.Module):
+    """A boundary holding a tied, unread parameter next to the quantized model (a tied LM head off the graph)."""
+
+    def __init__(self, inner):
+        super().__init__()
+        for name, child in inner.named_children():          # same names as the policy's sites ("0", "1")
+            self.add_module(name, child)
+        self.source = torch.nn.Linear(8, 4, bias=False).to(torch.bfloat16)
+        self.tied = torch.nn.Linear(8, 4, bias=False).to(torch.bfloat16)
+        self.tied.weight = self.source.weight
+
+    def forward(self, x):
+        return self._modules["1"](self._modules["0"](x))
+
+
+def test_tied_alias_parameter_is_not_saved_state(tmp_path, linear_replay_with_cache):
+    """A tied parameter the export records as an alias (policy["aliases"]) leaves the saved program's state, so every
+    state name is an export tensor name; the caller's module keeps its tie."""
+    inner, policy, cases = linear_replay_with_cache
+    module = _Tied(inner).eval()
+    policy = {**policy, "aliases": {"tied.weight": "source.weight"}}
+    report = fx_export.capture_fx(module, cases, tmp_path / "fx", policy=policy, fresh_process=False,
+                                  native_fp8="uint8")
+    assert report["capture_buffer_roles"]["tied_aliases_held_as_attributes"] == ["tied.weight"]
+    program = torch.export.load(tmp_path / "fx" / "model.pt2")
+    assert "tied.weight" not in program.state_dict and "source.weight" in program.state_dict
+    assert module.tied.weight is module.source.weight and "weight" in module.tied._parameters
+    with torch.no_grad():
+        for case in cases:
+            assert torch.equal(program.module()(*case), module(*case))
+
+
+class _ForceFloat32(torch.nn.Module):
+    """A rotary-style block that disables autocast to force float32 (transformers Gemma / Llama rotary)."""
+
+    def forward(self, x):
+        with torch.autocast(device_type="cpu", enabled=False):
+            y = x.float() * 2.0
+        return y.to(x.dtype)
+
+
+class _PreThenSites(torch.nn.Module):
+    def __init__(self, inner, pre):
+        super().__init__()
+        for name, child in inner.named_children():          # same names as the policy's sites ("0", "1")
+            self.add_module(name, child)
+        self.pre = pre
+
+    def forward(self, x):
+        return self._modules["1"](self._modules["0"](self.pre(x)))
+
+
+def test_inactive_autocast_disable_is_not_a_higher_order_submodule(tmp_path, linear_replay_with_cache):
+    inner, policy, cases = linear_replay_with_cache
+    module = _PreThenSites(inner, _ForceFloat32()).eval()
+    plain = torch.export.export(_ForceFloat32(), (cases[0][0],))
+    assert any("wrap_with_autocast" in str(n.target) for n in plain.graph.nodes)    # what the capture avoids
+    report = fx_export.capture_fx(module, cases, tmp_path / "fx", policy=policy, fresh_process=False,
+                                  native_fp8="uint8")
+    assert report["status"] == "passed"
+    program = torch.export.load(tmp_path / "fx" / "model.pt2")
+    assert not any("wrap_with_autocast" in str(n.target) for n in program.graph.nodes)
+    assert torch.autocast is torch.amp.autocast_mode.autocast
+    with torch.no_grad():
+        for case in cases:
+            assert torch.equal(program.module()(*case), module(*case))

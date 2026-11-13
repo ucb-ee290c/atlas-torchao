@@ -41,6 +41,7 @@ CONTRACTIONS = {
     torch.ops.aten.matmul.default: (0, 1),
     torch.ops.aten.bmm.default: (0, 1),
     torch.ops.aten.conv2d.default: (0, 1),
+    torch.ops.aten.conv2d.padding: (0, 1),             # string padding ("valid"), e.g. a SigLIP patch embedding
     torch.ops.aten.convolution.default: (0, 1),
 }
 SHAPE_ONLY_FACTORIES = {
@@ -245,6 +246,64 @@ def _capture_buffer_roles(module):
             mod.register_buffer(name, tensor, persistent=False)
 
 
+@contextlib.contextmanager
+def _alias_parameters_as_attributes(module, policy):
+    """For the capture only: hold every tied parameter the export records as an alias (policy["aliases"]: alias ->
+    source name; quant_export writes the tensor once, under the source name) as a plain attribute of its module.
+    torch.export then lists only the source name in the program's state, which is what the backend's atlas_fp8
+    adapter authenticates against the export tensors (it has no alias notion). An alias the boundary never reads
+    leaves the graph; one it does read is lifted as a CONSTANT_TENSOR with the same values. Restored afterwards.
+    Yields the sorted list of alias paths held this way."""
+    prefix = _prefix_of(module, policy)
+    held = []
+    try:
+        for alias in sorted((policy.get("aliases") or {})):
+            owner, _, name = (prefix + alias).rpartition(".")
+            try:
+                mod = module.get_submodule(owner)
+            except AttributeError:
+                continue
+            param = mod._parameters.get(name)
+            if param is None:
+                continue
+            del mod._parameters[name]
+            mod.__dict__[name] = param
+            held.append((mod, name, param, prefix + alias))
+        yield sorted(h[3] for h in held)
+    finally:
+        for mod, name, param, _ in held:
+            mod.__dict__.pop(name, None)
+            mod._parameters[name] = param
+
+
+@contextlib.contextmanager
+def _inert_autocast_disable():
+    """For the capture only: a `torch.autocast(..., enabled=False)` entered while autocast is not active for that
+    device (the Gemma / Llama rotary "force float32" blocks on CPU) changes nothing numerically, but torch.export
+    records it as a wrap_with_autocast higher-order submodule, whose nodes the backend's frontend trace cannot
+    put in correspondence ("quantized -> prepared correspondence incomplete"). Such a context is entered as a
+    no-op here; any autocast that would change dtypes runs unchanged. torch.autocast is restored afterwards."""
+    original = torch.autocast
+
+    class _Autocast(original):
+        def __init__(self, device_type, dtype=None, enabled=True, cache_enabled=None):
+            self._inert = not enabled and not torch.is_autocast_enabled(device_type)
+            if not self._inert:
+                super().__init__(device_type, dtype=dtype, enabled=enabled, cache_enabled=cache_enabled)
+
+        def __enter__(self):
+            return self if self._inert else super().__enter__()
+
+        def __exit__(self, *exc):
+            return None if self._inert else super().__exit__(*exc)
+
+    torch.autocast = _Autocast
+    try:
+        yield
+    finally:
+        torch.autocast = original
+
+
 def _scope(node):
     """Innermost module path of a node (empty for nodes with no module stack)."""
     stack = node.meta.get("nn_module_stack") or {}
@@ -325,6 +384,13 @@ class ActStats:
 
 
 _ACT_RECORDER = None          # set by capture_fx for the eager statistics pass only
+
+
+def _cast_if_needed(x, dtype):
+    """x.to(dtype) only when the dtype differs. Same values either way, but a same-dtype `.to` is captured as
+    an identity aten.to node, and the backend importer cannot bind an eliminated identity whose input op
+    decomposes into several values with one lineage and ABI (e.g. an f32 silu -> sigmoid, mul)."""
+    return x if x.dtype == dtype else x.to(dtype)
 
 
 def _qact(x, rule, storage, tag=None, label=None):
@@ -470,7 +536,7 @@ def _native_sites(module, policy, storage, *, attention=True, conv=True):
             plan["conv2d" if is_conv else "linear"][path] = nrule
 
             def linear_forward(x, layer=layer, nrule=nrule, out_dtype=out_dtype):
-                x = x.to(layer.weight.dtype)
+                x = _cast_if_needed(x, layer.weight.dtype)
                 codes, scale = _qact(x, nrule, storage, label=layer.layer_name)
                 return torch.ops.atlas.qlinear(codes, scale, layer.weight_codes, layer.weight_scale_exp,
                                                layer.bias, out_dtype, atlas_fx_ops.WEIGHT_FORMAT)
@@ -482,7 +548,7 @@ def _native_sites(module, policy, storage, *, attention=True, conv=True):
                 ow = (W + 2 * layer.padding[1] - layer.dilation[1] * (layer.kernel_size[1] - 1) - 1) // layer.stride[1] + 1
                 cols = torch.nn.functional.unfold(x, kernel_size=layer.kernel_size, stride=layer.stride,
                                                   padding=layer.padding, dilation=layer.dilation)
-                x_flat = cols.permute(0, 2, 1).reshape(B * oh * ow, -1).to(layer.weight.dtype)
+                x_flat = _cast_if_needed(cols.permute(0, 2, 1).reshape(B * oh * ow, -1), layer.weight.dtype)
                 codes, scale = _qact(x_flat, nrule, storage, label=layer.layer_name)
                 return torch.ops.atlas.qconv2d(codes, scale, layer.weight_codes, layer.weight_scale_exp,
                                                layer.bias, out_dtype, atlas_fx_ops.WEIGHT_FORMAT, B, oh, ow)
@@ -1210,9 +1276,11 @@ def capture_fx(module, cases, directory, *, policy, provenance=None, strict=True
             if not before:
                 raise FXVerificationError("no quantized weight buffers at this boundary")
             native_info, baseline, act_stats, attn_calls, unused_attention = None, None, None, {}, {}
-            with _meta_placeholders(module), _capture_buffer_roles(module) as roles:
+            with _meta_placeholders(module), _capture_buffer_roles(module) as roles, \
+                    _alias_parameters_as_attributes(module, policy) as aliases, _inert_autocast_disable():
                 report["capture_buffer_roles"] = {"made_persistent": len(roles["persistent"]),
-                                                  "held_as_constants": roles["constants"]}
+                                                  "held_as_constants": roles["constants"],
+                                                  "tied_aliases_held_as_attributes": aliases}
                 if native_fp8:
                     if native_fp8 not in STORAGE_DTYPES:
                         raise FXVerificationError(f"unknown native storage {native_fp8!r}")
