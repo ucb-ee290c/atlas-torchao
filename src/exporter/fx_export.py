@@ -1586,6 +1586,60 @@ class SmolVLAFlowLoss(torch.nn.Module):
         return self.policy.model.forward(images, masks, lang_tokens, lang_masks, state, actions, noise, time)
 
 
+class SmolVLATextLayers(torch.nn.Module):
+    """The first `layers` layers of a LeRobot SmolVLA policy's VLM text model and action expert (SmolVLMWithExpertModel,
+    use_cache=False, as VLAFlowMatching.forward runs them) at their own boundary: (prefix embeddings, suffix embeddings,
+    pad masks, autoregressive block masks) -> suffix output after the expert's final norm. The attention mask
+    (make_att_2d_masks) and position ids (cumsum of the pad mask - 1) are built in the graph exactly as in the
+    flow-loss forward; the vision tower, the connector and the action projections are outside (their sites are listed
+    as unused). Layer 0 is joint self-attention and layer 1 the prefix + expert cross-attention when
+    self_attn_every_n_layers is 2, so two layers hold both masked attention patterns.
+
+    The boundary sets the instance's num_vlm_layers / num_expert_layers to `layers` (so get_model_layers pairs expert
+    layer i with VLM layer i and forward stops after `layers` layers); restore() puts the counts back."""
+
+    def __init__(self, policy, layers=2):
+        super().__init__()
+        self.policy = policy
+        inner = policy.model.vlm_with_expert
+        if not 1 <= layers <= min(inner.num_vlm_layers, inner.num_expert_layers):
+            raise ValueError(f"layers {layers} outside 1..{min(inner.num_vlm_layers, inner.num_expert_layers)}")
+        if inner.num_vlm_layers != inner.num_expert_layers:
+            raise ValueError("SmolVLATextLayers needs one expert layer per VLM layer")
+        self._saved = (inner.num_vlm_layers, inner.num_expert_layers)
+        inner.num_vlm_layers = inner.num_expert_layers = layers
+
+    def restore(self):
+        inner = self.policy.model.vlm_with_expert
+        inner.num_vlm_layers, inner.num_expert_layers = self._saved
+
+    def forward(self, prefix_embs, suffix_embs, pad_masks, att_masks):
+        from lerobot.policies.common.vla_utils import make_att_2d_masks
+
+        (_, suffix_out), _ = self.policy.model.vlm_with_expert.forward(
+            attention_mask=make_att_2d_masks(pad_masks, att_masks), position_ids=torch.cumsum(pad_masks, dim=1) - 1,
+            past_key_values=None, inputs_embeds=[prefix_embs, suffix_embs], use_cache=False)
+        return suffix_out
+
+
+def smolvla_text_cases(policy, n_images, seed, device, count=2):
+    """Inputs of SmolVLATextLayers for the smolvla_cases inputs: the policy's own embed_prefix / embed_suffix on them
+    (x_t = t * noise + (1 - t) * actions, as make_flow_matching_inputs with the noise at t = 1)."""
+    model = policy.model
+    cases = []
+    with torch.no_grad():
+        for case in smolvla_cases(policy, n_images, seed, device, count):
+            images = list(case[:n_images])
+            lang_tokens, lang_masks, state, actions, noise, time = case[n_images:]
+            masks = [torch.ones(image.shape[0], dtype=torch.bool, device=image.device) for image in images]
+            prefix, prefix_pad, prefix_att = model.embed_prefix(images, masks, lang_tokens, lang_masks, state=state)
+            t = time[:, None, None]
+            suffix, suffix_pad, suffix_att = model.embed_suffix(t * noise + (1 - t) * actions, time)
+            cases.append(tuple(v.contiguous() for v in (prefix, suffix, torch.cat([prefix_pad, suffix_pad], dim=1),
+                                                         torch.cat([prefix_att, suffix_att], dim=1))))
+    return cases
+
+
 def smolvla_cases(policy, n_images, seed, device, count=2, image_size=None):
     """`count` fixed input tuples for SmolVLAFlowLoss (images in [-1, 1], as prepare_images gives)."""
     config = policy.model.config
@@ -1620,10 +1674,13 @@ def main(argv=None):
                         help="dtype of the held weight-code buffers with --native-fp8. uint8 (default) keeps the "
                              "export bytes; float8_e4m3fn is a bitcast of the same bytes, refused when a layer "
                              "holds a code on which torch and ref_numerics decode differently")
-    parser.add_argument("--boundary", choices=("causal_lm", "causal_lm_layer", "smolvla_flow_loss"), default="causal_lm",
+    parser.add_argument("--boundary", choices=("causal_lm", "causal_lm_layer", "smolvla_flow_loss", "smolvla_text_layers"),
+                        default="causal_lm",
                         help="capture boundary: causal-LM logits (default), one decoder layer of a causal LM "
                              "(CausalLayer: hidden, cos, sin, mask -> hidden; see --layer) or the SmolVLA "
-                             "flow-matching loss forward")
+                             "flow-matching loss forward, or its first --layers text / expert layers "
+                             "(SmolVLATextLayers: prefix, suffix embeddings, pad and block masks -> suffix output)")
+    parser.add_argument("--layers", type=int, default=2, help="text / expert layers with --boundary smolvla_text_layers")
     parser.add_argument("--layer", type=int, default=0, help="decoder layer index with --boundary causal_lm_layer")
     parser.add_argument("--n-images", type=int, default=1, help="cameras at the smolvla_flow_loss boundary")
     parser.add_argument("--verify-dir", help="fresh-process replay of an existing FX bundle")
@@ -1642,15 +1699,19 @@ def main(argv=None):
         if (kind == "causal_lm") != args.boundary.startswith("causal_lm"):
             parser.error(f"export kind {kind!r} does not match --boundary {args.boundary}; the CLI captures causal-LM "
                          "logits or the SmolVLA flow-loss forward (policy action sampling is a separate boundary)")
-        if args.boundary == "smolvla_flow_loss":
+        if args.boundary.startswith("smolvla_"):
             import eval_policy
 
             model_id = args.model or manifest["model"]["id"]
             lerobot_policy, _ = eval_policy.load_policy(model_id, args.device, torch.bfloat16)
             load_quantized.load_quantized(model_id, args.export_dir, args.device, build=lambda: lerobot_policy,
                                           mode="ref_conv", options={})
-            boundary = SmolVLAFlowLoss(lerobot_policy, args.n_images).eval()
-            cases = smolvla_cases(lerobot_policy, args.n_images, args.seed, args.device)
+            if args.boundary == "smolvla_text_layers":
+                cases = smolvla_text_cases(lerobot_policy, args.n_images, args.seed, args.device)
+                boundary = SmolVLATextLayers(lerobot_policy, args.layers).eval()
+            else:
+                boundary = SmolVLAFlowLoss(lerobot_policy, args.n_images).eval()
+                cases = smolvla_cases(lerobot_policy, args.n_images, args.seed, args.device)
             config_dict = __import__("dataclasses").asdict(lerobot_policy.config)
         else:
             model, _, _ = load_quantized.load_quantized(args.model, args.export_dir, args.device,
@@ -1680,7 +1741,8 @@ def main(argv=None):
                                             sort_keys=True, default=str).encode()).hexdigest(),
                                         "capture_source": _capture_source(),
                                         "seed": args.seed, "seqlen": args.seqlen,
-                                        **({"layer": args.layer} if args.boundary == "causal_lm_layer" else {})})
+                                        **({"layer": args.layer} if args.boundary == "causal_lm_layer" else {}),
+                                        **({"layers": args.layers} if args.boundary == "smolvla_text_layers" else {})})
     print(json.dumps(report, indent=2))
     return 0
 
