@@ -86,6 +86,7 @@ from loaders.pi0_model import CallCounter, inventory, patch_coverage
 import algos
 from quant_modes import (ALL_MODES, add_profile_args, add_subset_compare_arg, finalize_report, ladder_deltas,
                          ladder_record, quantize, require_mode_supported, subset_compare_modes)
+import quant_modes
 
 REFERENCE_STEPS = 10      # serve_quant.py:479, run_output_eval.py:356, run_eval_mxu_io.py:707
 ACTION_DIMS = 8           # serve_quant.py:494-495: 7 joints + gripper
@@ -405,10 +406,19 @@ def evaluate(args, frames, build, level, horizon, action_dim, out: Path) -> dict
     order = ["bf16", *[m for m in args.modes if m != "bf16"]]      # bf16 first: the baseline
     # the frames are always a sample, so a subset profile gets ref_conv on the same frames
     order, added = subset_compare_modes(order, getattr(args, "subset_compare", "on") == "on")
-    for mode in order:
+    kept = None          # (model, inv, layers, policy, algo_rec) of ref_conv, kept for a following native_fp8 (NEW)
+    for i_mode, mode in enumerate(order):
         print(f"== {mode}", flush=True)
-        model, inv, layers, policy = build(mode)
-        algo_rec = algos.entry_record(layers, mode, getattr(args, "algo", "none"))
+        shared = kept is not None and quant_modes.can_share_native(order, i_mode)
+        if shared:
+            # NEW: the same quantized model (codes, exponents, calibration) with the FP8 kernels switched in
+            model, inv, ref_layers, policy, ref_algo_rec = kept
+            layers = quant_modes.share_native(model, ref_layers, args)
+            algo_rec = {**ref_algo_rec, "shared_from_mode": quant_modes.SHARED_NATIVE_FROM}
+        else:
+            model, inv, layers, policy = build(mode)
+            algo_rec = algos.entry_record(layers, mode, getattr(args, "algo", "none"))
+        kept = None
         eq = (layers or {}).get("ladder", {}).get("equivalent_to")
         if eq in modes:
             # the op class this step adds is absent from the model: same model, same numbers
@@ -474,6 +484,8 @@ def evaluate(args, frames, build, level, horizon, action_dim, out: Path) -> dict
             import chip.chip_coverage as chip_coverage
 
             print(chip_coverage.format_report(layers["coverage"]), flush=True)
+        if quant_modes.can_share_native(order, i_mode + 1):
+            kept = (model, inv, layers, policy, algo_rec)
         del model, policy, run
         if str(args.device).startswith("cuda"):
             torch.cuda.empty_cache()
