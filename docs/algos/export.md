@@ -84,6 +84,14 @@ the tests also checks the policy. It is meant to become the m2m adapter's policy
     chip option given on the command line;
   - requirements such as RoPE / timestep tables as host constants, and a run-time amax for
     dynamic sites.
+- **`tile_native`** (NEW; [tile-aware.md](tile-aware.md)): per site `tile_native` {tile_native, reasons, weight and
+  activation checks} and a top-level summary listing the sites whose exponents vary along K or within a 32-group
+  (per-channel, per-token, `block32`) with reasons; per weight `granularity` (`per_panel(32)`, ...),
+  `panel_rows`, `e8m0_code_range` and `code_report`; per activation rule `tile_label` (`per_block(32 rows)`).
+  `load_quantized` raises `TileContractError` if a `per_panel` weight varies within a group or a weight holds `0x7F` / `0xFF`.
+- **`compiler_pack_scale_admission`** (NEW, informational): E8M0 codes (`127 + s`) of static activation exponents and
+  of weight exponents, and the activation sites outside `122..128` (the compiler's `lowerPack` admission today).
+  Nothing is clamped.
 - **`pending_hardware_rulings`**: the open rulings listed below.
 - **`normalization`** (LeRobot policies, NEW): as in `manifest.json`.
 

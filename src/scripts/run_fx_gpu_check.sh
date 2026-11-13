@@ -45,8 +45,8 @@ import os
 from pathlib import Path
 import torch
 import algos
-import load_quantized
-import quant_export
+import exporter.load_quantized as load_quantized
+import exporter.quant_export as quant_export
 
 assert torch.cuda.is_available(), 'use the existing GPU atlas-lerobot environment'
 assert torch.__version__.split('+')[0].startswith('2.11.'), 'CPU checks used torch 2.11; do not upgrade the existing environment'

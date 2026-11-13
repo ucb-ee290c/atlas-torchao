@@ -63,3 +63,31 @@ def test_chip_rope_host_marks_tables():
         model(ids)
     reasons = [h["reason"] for h in rep["coverage"]["host_fallback"]]
     assert any("RoPE table" in r for r in reasons)
+
+
+def test_dynamic_scale_chain_rows_are_additive_and_new():
+    """NEW (hw_scale): the real dynamic-scale chain is counted next to, not instead of, the
+    vredmax/vredmin/vpack count of the cast; a=token and a=block add rows, the default adds none."""
+    need_refs()
+    import algos
+
+    def run(spec):
+        model = tiny_llama()
+        rep = algos.quantize(model, "chip", ["lm_head"], {"chip_mxu": "framework"}, algo=algos.make(spec))
+        model(torch.randint(0, 128, (1, 32), generator=torch.Generator().manual_seed(0)))
+        return rep["coverage"]
+
+    base = run("granularity")
+    assert not any(o["op"].startswith("dyn_scale_chain") for o in base["ops"])
+    assert "dynamic_scale_chain_NEW" not in base
+    cov = run("granularity:a=token,rule=nc")
+    ops = {o["op"]: o for o in cov["ops"]}
+    cast = ops["fp8_operand_cast"]["instructions"]
+    assert cast["vredmax.row.bf16"] == cast["vredmin.row.bf16"] == cast["vpack.bf16.fp8"] > 0   # old counts kept
+    chain = ops["dyn_scale_chain"]
+    assert chain["unit"] == "VPU" and chain["reason"].startswith("NEW")
+    assert chain["instructions"]["vstore"] > 0 and ops["dyn_scale_chain_scalar"]["instructions"]["rv32i"] > 0
+    tot = cov["dynamic_scale_chain_NEW"]["token"]
+    assert tot["serialized_cycles"] > 0 and tot["seld"] == 0
+    assert tot["instructions"] == sum(tot["vpu"].values()) + tot["rv32i"] + tot["seld"]
+    json.dumps(cov)

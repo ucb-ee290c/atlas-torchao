@@ -27,6 +27,7 @@ REGISTRY = {
     "smoothquant": "algos.smoothquant",
     "gptq_awq": "algos.gptq_awq",
     "keep_bf16": "algos.keep_bf16",
+    "k_order": "algos.k_order",
 }
 
 # Named recipes (NEW; docs/algos/atlas_v1.md): `--algo NAME` expands to a documented stack, and
@@ -39,8 +40,9 @@ REGISTRY = {
 #
 # IMMUTABLE (NEW, from atlas-v1.1): a recipe name denotes exactly one stack forever. Changing a
 # recipe means adding a new name; tests/test_algo_atlas_v1.py pins every spec below verbatim.
-# No recipe carries a BF16 exception; layers are kept in BF16 only by an explicit opt-in member
-# (keep_bf16:rule=..., mixed_precision:units=...).
+# No recipe carries a BF16 exception except atlas_v1_tile (NEW, tile-aware: spells out keep_bf16 in its
+# stack); otherwise layers are kept in BF16 only by an explicit opt-in member (keep_bf16:rule=...,
+# mixed_precision:units=...).
 RECIPES = {
     # SmoothQuant + GPTQ + granularity: what `atlas_v1` meant at commits 0447807 .. a30779b.
     "atlas_v1_sq": {
@@ -64,6 +66,48 @@ RECIPES = {
         "chip": {"chip_vadd": "rn", "chip_vadd_sites": "residual"},
         "activation_scales": "static per tensor for every calibrated Linear input (no run-time amax "
                              "there); attention operands keep the reference dynamic per-(batch, head) rule",
+    },
+    # ---- Tile-aware recipes (NEW; docs/algos/tile-aware.md) --------------------------------------------
+    # Scales the Atlas matrix unit can apply without per-K-block rescaling (ruling H3): one exponent per
+    # 32-channel weight group (`panel`; the atlas-kernels "panel", a launch of up to 2048 columns sharing
+    # one exponent, is something else) and per 32-token activation block, both over the full K.
+    "atlas_v1_awq_tile": {
+        # Mirrors atlas_v1_awq: no automatic exception.
+        "spec": "gptq_awq:method=awq_gptq,actorder=true"
+                "+granularity:w=panel,a=block,rows=32,rule=nc,attn=head",
+        "chip": {"chip_vadd": "rn", "chip_vadd_sites": "residual"},
+        "activation_scales": "dynamic per 32-token block over the full K (run-time amax per block on chip); "
+                             "attention operands per (batch, head), never-clip rule",
+        "new_decisions": ["NEW: tile-aware granularity w=panel (32 output channels over all K) and "
+                          "a=block (32 tokens over all K); both constant along K, so the MXU pop applies "
+                          "them (docs/algos/tile-aware.md#recipes; TinyLlama perplexity in #tinyllama-quality)"],
+    },
+    "atlas_v1_tile": {
+        # atlas_v1_awq_tile plus the structural input-convolution BF16 exception (what v1.0 `atlas_v1`
+        # kept for the Multi-Task DiT patch embedding, expressed with the v1.1 member keep_bf16).
+        "spec": "gptq_awq:method=awq_gptq,actorder=true"
+                "+granularity:w=panel,a=block,rows=32,rule=nc,attn=head"
+                "+keep_bf16:rule=input_conv",
+        "chip": {"chip_vadd": "rn", "chip_vadd_sites": "residual"},
+        "activation_scales": "dynamic per 32-token block over the full K (run-time amax per block on chip); "
+                             "attention operands per (batch, head), never-clip rule",
+        "new_decisions": ["NEW: tile-aware granularity (see atlas_v1_awq_tile)",
+                          "NEW: carries the keep_bf16:rule=input_conv exception, a structural rule (every "
+                          "Conv2d with 3 input channels, grouped=1), which also selects the SigLIP patch "
+                          "embedding of Pi0 / SmolVLA; the v1.0 atlas_v1 exception was keyed on the policy "
+                          "type multi_task_dit. BF16 placement on chip: pending R4"],
+    },
+    "atlas_v1_awq_tile_static": {
+        # granularity a=defer / attn=defer: granularity gives no activation Scale, static_calib does.
+        "spec": "gptq_awq:method=awq_gptq,actorder=true"
+                "+granularity:w=panel,a=defer,attn=defer,rows=32,rule=nc"
+                "+static_calib",
+        "chip": {"chip_vadd": "rn", "chip_vadd_sites": "residual"},
+        "activation_scales": "static per tensor for every calibrated Linear / Conv2d input (no run-time amax "
+                             "there; avoids ruling H2); attention p static exponent -8, q / k / v per "
+                             "(batch, head) with the reference dynamic rule",
+        "new_decisions": ["NEW: tile-aware weights (w=panel) with static_calib activations; attention q, k, v "
+                          "keep the reference per-(batch, head) dynamic scale (constant along the reduction)"],
     },
 }
 

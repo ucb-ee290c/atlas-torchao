@@ -32,6 +32,9 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
+import exporter.pack_plan as pack_plan
+import exporter.tile_native as tile_native
+
 POLICY_SCHEMA = "atlas_torchao.execution_policy.v1"        # NEW
 MANIFEST_SCHEMA = "atlas_torchao.export_manifest.v1"       # NEW
 FORMAT_VERSION = 1
@@ -144,6 +147,18 @@ def add_args(ap) -> None:
     g.add_argument("--export-only", action="store_true",
                    help="with --export-dir: quantize the exported mode, write the export and stop "
                         "(no evaluation)")
+    g.add_argument("--allow-uncalibrated-fallback", action="store_true",
+                   help="declare in policy.json that Linear / Conv2d sites of a static recipe without "
+                        "calibration data (e.g. an unused lm_head) may keep the dynamic per-tensor rule; "
+                        "undeclared sites make verify_bundle.py fail 'static recipe is fully static'")
+    g.add_argument("--pack-fold", action="store_true",
+                   help="after the export, fold the static activation pack exponents into the compiler's admitted E8M0 range "
+                        "122..128 where the producer already multiplies by a constant (RMSNorm gamma, up_proj weight exponent, "
+                        "PV pop rescale, a Linear feeding a Linear); exact, no re-calibration (docs/algos/tile-aware.md#pack-fold). "
+                        "Default off: the export is unchanged. The unfolded export is kept in <export-dir>.unfolded")
+    g.add_argument("--pack-fold-graph", default=None,
+                   help="with --pack-fold: fx/ directory (graph.txt, graph_signature.txt) of a native-FP8 capture of this model's "
+                        "export; default: capture the graph in process (causal LMs only)")
     g.add_argument("--from-export", default=None,
                    help="build every quantized mode from this export (load_quantized.py) instead of "
                         "quantizing: no calibration, no float weights of the quantized layers")
@@ -169,21 +184,37 @@ def check_args(ap, args) -> str | None:
 # ---------------------------------------------------------------------------------------------
 
 REFERENCE_ACT = {"mode": "dynamic", "source": "reference", "rule": "ref"}
+# Linear / Conv2d of a static recipe with no calibration data: same numerics as REFERENCE_ACT (source
+# "reference" is what replay and the FX capture dispatch on), but declared in policy.json and never tile-native.
+UNCALIBRATED_FALLBACK_ACT = {**REFERENCE_ACT, "uncalibrated_fallback": True, "label": "uncalibrated_fallback"}
 
 
 def _granularity_rule(g, name, kind):
     if kind.startswith("attention."):
+        if g.attn == "defer":
+            return None
         if g.attn == "token" and kind in ("attention.q", "attention.p"):
             return {"mode": "dynamic", "reduce": "token", "rule": g.rule, "label": "per_token",
                     "out_cols": 0, "source": "granularity"}
-        if g.rule == "nc":
+        if g.attn == "block" and kind in ("attention.q", "attention.p"):
+            return {"mode": "dynamic", "reduce": "head_block", "rule": "nc", "rows": g.rows,
+                    "label": "per_row_block", "tile_label": tile_native.block_rows_label(g.rows),
+                    "source": "granularity"}
+        if g.rule == "nc" or g.attn == "block":
             return {"mode": "dynamic", "reduce": "reference_dims", "rule": "nc", "label": "per_head",
                     "source": "granularity"}
         return None
-    if g.a == "tensor":
+    if g.a == "defer":
+        return None
+    out_cols = int(g._out.get(name, 0))
+    if g.a == "block" and kind == "linear":
+        # algos.granularity._token_block: always the never-clip rule, Linear inputs only
+        return {"mode": "dynamic", "reduce": "block", "rule": "nc", "rows": g.rows,
+                "label": "per_token_block", "tile_label": tile_native.block_rows_label(g.rows),
+                "out_cols": out_cols, "source": "granularity"}
+    if g.a in ("tensor", "block"):                      # a=block: a Conv2d input keeps the per-tensor rule
         return None if g.rule == "ref" else {"mode": "dynamic", "reduce": "tensor", "rule": "nc",
                                              "label": "per_tensor", "source": "granularity"}
-    out_cols = int(g._out.get(name, 0))
     if g.a == "block32":
         return {"mode": "dynamic", "reduce": "block32_or_token", "rule": g.rule, "block": 32,
                 "label": "per_block", "tail_label": "per_token(block_tail)", "out_cols": out_cols,
@@ -246,8 +277,25 @@ def check_exportable(algo) -> None:
                                       "(add one to quant_export.ACT_RULES)")
 
 
+def is_static_recipe(algo) -> bool:
+    """True when a member gives Linear / Conv2d inputs calibrated static exponents (static_calib, or
+    smoothquant with static=true)."""
+    return any(m.name == "static_calib" or (m.name == "smoothquant" and getattr(m, "static", False))
+               for m in _members(algo))
+
+
+def _static_covers(algo, kind) -> bool:
+    """Does a static member give `kind` ("linear" / "conv2d") a calibrated exponent? static_calib: both;
+    smoothquant static=true: Linear only (its Conv2d inputs keep the reference rule by design, so a Conv2d is
+    never reported as uncalibrated under it)."""
+    return any(m.name == "static_calib" or (m.name == "smoothquant" and getattr(m, "static", False)
+                                            and kind == "linear") for m in _members(algo))
+
+
 def act_rule(algo, name, kind) -> dict:
-    """The activation scale rule of (site, kind) as data; REFERENCE_ACT when no member sets one."""
+    """The activation scale rule of (site, kind) as data; REFERENCE_ACT when no member sets one, except
+    that a Linear / Conv2d the calibration never saw, of a kind a static member covers, gets
+    UNCALIBRATED_FALLBACK_ACT (identical numerics, declared)."""
     got = []
     for m in _members(algo):
         if not _overrides(m, "act_scale"):
@@ -257,24 +305,41 @@ def act_rule(algo, name, kind) -> dict:
             got.append(r)
     if len(got) > 1:
         raise ValueError(f"export: {name} {kind}: several activation rules {got}")
-    return got[0] if got else dict(REFERENCE_ACT)
+    if got:
+        return got[0]
+    if not kind.startswith("attention.") and _static_covers(algo, kind):
+        return dict(UNCALIBRATED_FALLBACK_ACT)
+    return dict(REFERENCE_ACT)
 
 
 # ---------------------------------------------------------------------------------------------
 # Sites
 # ---------------------------------------------------------------------------------------------
 
-def _weight_granularity(exp: torch.Tensor, block: int) -> str:
+def _weight_granularity(exp: torch.Tensor, block: int, panel_rows: int = 0) -> str:
     if block:
         return f"per_block({block})"
     if exp.numel() == 1:
         return "per_tensor"
     if exp.dim() == 2 and exp.shape[-1] == 1:
+        if panel_rows:                       # granularity w=panel: same string as algos.granularity.panel_label
+            return f"per_panel({panel_rows}" + (",partial_tail)" if exp.shape[0] % panel_rows else ")")
         return "per_channel"
     return f"shape{tuple(exp.shape)}"
 
 
+def weight_panel_rows(algo) -> int:
+    """Rows per weight panel when a stacked granularity member chose w=panel, else 0."""
+    for m in _members(algo):
+        if m.name == "granularity" and getattr(m, "w", None) == "panel":
+            return int(m.rows)
+    return 0
+
+
 def _act_description(rule, kind):
+    if rule.get("uncalibrated_fallback"):
+        return ("dynamic per tensor: reference rule; UNCALIBRATED FALLBACK (a static recipe, but this layer "
+                "saw no calibration data, so there is no static exponent)")
     if rule.get("source") == "reference":
         return ("dynamic per (batch, head): reference rule over the last two dims"
                 if kind.startswith("attention.") else "dynamic per tensor: reference rule")
@@ -284,7 +349,10 @@ def _act_description(rule, kind):
         return f"static exponent per call index {rule['exps']}"
     red = {"tensor": "per tensor", "token": "per token (last dim reduced)",
            "reference_dims": "per (batch, head)" if kind.startswith("attention.") else "per tensor",
-           "block32_or_token": "per 32-element block along K (per token if K % 32 != 0)"}[rule["reduce"]]
+           "block32_or_token": "per 32-element block along K (per token if K % 32 != 0; NOT hardware-realizable, H3)",
+           "block": f"per {rule.get('rows', 32)}-token block over the full K (flattened B*T rows, last block "
+                    "may be partial; NEW)",
+           "head_block": f"per {rule.get('rows', 32)}-row block of each (batch, head) matrix (NEW)"}[rule["reduce"]]
     return f"dynamic {red}: {'reference' if rule['rule'] == 'ref' else 'NEW nc'} rule"
 
 
@@ -313,13 +381,16 @@ def _accumulation(ladder):
 
 
 def build_policy(model, mode, report, algo, options, skip, bf16_opt_out, opt_out_reasons,
-                 tensors_out: dict) -> dict:
+                 tensors_out: dict, allow_uncalibrated_fallback: bool = False) -> dict:
     """The policy dict; fills `tensors_out` with the codes / exponent tensors it names."""
     import quant_modes
 
     check_exportable(algo)
     ladder = report.get("ladder", {})
     sites = {}
+    panel_rows = weight_panel_rows(algo)
+    tile, static_act, weight_ranges = {}, {}, {}
+    fallback_sites = []
     for n, m in quantized_modules(model).items():
         kind = "linear" if type(m).__name__ == "RefQuantLinear" else "conv2d"
         codes, exp = m.weight_codes.detach().cpu(), m.weight_scale_exp.detach().cpu().to(torch.int32)
@@ -329,6 +400,7 @@ def build_policy(model, mode, report, algo, options, skip, bf16_opt_out, opt_out
         if rule["mode"] == "static":
             tensors_out[f"{n}.input_scale_exp"] = torch.tensor(rule["exp"], dtype=torch.int32)
         block = int(getattr(m, "weight_block", 0) or 0)
+        wgran = _weight_granularity(exp, block, panel_rows)
         site = {"kind": kind, "status": "quantized",
                 "weight_shape": list(m.weight.shape), "weight_dtype": str(m.weight.dtype).replace("torch.", ""),
                 "bias": None if m.bias is None else {"tensor": f"{n}.bias",
@@ -336,8 +408,12 @@ def build_policy(model, mode, report, algo, options, skip, bf16_opt_out, opt_out
                                                      "added": "after the output rescale, in the layer dtype"},
                 "weight": {"codes": f"{n}.weight_codes", "scale_exp": f"{n}.weight_scale_exp",
                            "codes_shape": list(codes.shape),
-                           "granularity": _weight_granularity(exp, block), "block": block,
-                           "scale_exp_shape": list(exp.shape), "mode": "static (offline)"},
+                           "granularity": wgran, "block": block,
+                           "scale_exp_shape": list(exp.shape), "mode": "static (offline)",
+                           **({"panel_rows": panel_rows} if wgran.startswith("per_panel") else {}),
+                           "e8m0_code_range": tile_native.code_range(exp),
+                           "code_report": tile_native.weight_code_report(
+                               codes, panel_rows or None, name=n)},
                 "activation": {**rule, "description": _act_description(rule, kind)},
                 "output_rescale": "y_bf16 * 2^(s_x + s_w) in float32, then the layer dtype "
                                   "(quant_linear.py:169-170; per-row / per-column exponents broadcast "
@@ -345,6 +421,14 @@ def build_policy(model, mode, report, algo, options, skip, bf16_opt_out, opt_out
                 "residual_passes": None}
         if rule["mode"] == "static":
             site["activation"]["tensor"] = f"{n}.input_scale_exp"
+            site["activation"]["e8m0_code"] = tile_native.E8M0_BIAS + int(rule["exp"])
+            static_act[n] = [int(rule["exp"])]
+        elif rule["mode"] == "static_per_step":
+            static_act[n] = [int(e) for e in rule["exps"]]
+        weight_ranges[n] = tuple(site["weight"]["e8m0_code_range"].values())
+        site["tile_native"] = tile[n] = tile_native.linear_site_status(wgran, exp, panel_rows, rule)
+        if rule.get("uncalibrated_fallback"):
+            fallback_sites.append(n)
         if kind == "conv2d":
             site["conv"] = {"kernel_size": list(m.kernel_size), "stride": list(m.stride),
                             "padding": list(m.padding), "dilation": list(m.dilation),
@@ -364,7 +448,13 @@ def build_policy(model, mode, report, algo, options, skip, bf16_opt_out, opt_out
         for op in ("q", "k", "p", "v"):
             r = act_rule(algo, n, "attention." + op)
             ops[op] = {**r, "description": _act_description(r, "attention." + op)}
+        tile[n] = tile_native.attention_site_status(ops)
+        for op, r in ops.items():
+            if r.get("mode") == "static":
+                r["e8m0_code"] = tile_native.E8M0_BIAS + int(r["exp"])
+                static_act[f"{n}:{op}"] = [int(r["exp"])]
         sites[n] = {"kind": "attention", "status": "quantized", "variant": cfg.get("variant"),
+                    "tile_native": tile[n],
                     "matmuls": ["q.k^T (FP8 x FP8)", "softmax in BF16 / VPU", "p.v (FP8 x FP8)"],
                     "operands": ops,
                     "output_rescale": "2^(s_q + s_k) on the scores, 2^(s_p + s_v) on the output "
@@ -392,7 +482,7 @@ def build_policy(model, mode, report, algo, options, skip, bf16_opt_out, opt_out
         v = opts.get(k)
         if v is not None and (base == "chip" or k not in chip_opts):
             chip_opts[k] = v
-    return {
+    policy = {
         "schema": POLICY_SCHEMA, "format_version": FORMAT_VERSION,
         "exported_mode": mode, "profile": quant_modes.canonical(mode), "ops": list(prof["ops"]),
         "operand": dict(OPERAND), "scale": dict(SCALE),
@@ -410,8 +500,25 @@ def build_policy(model, mode, report, algo, options, skip, bf16_opt_out, opt_out
                  if any(_is_dynamic(s) for s in sites.values()) else []) + ([f"chip vadd {chip_opts['chip_vadd']} on {chip_opts.get('chip_vadd_sites', 'residual')} sites "
                   "(recipe chip default; NEW, off-ladder)"] if chip_opts.get("chip_vadd") else []),
         },
+        "uncalibrated_fallback": {
+            "static_recipe": is_static_recipe(algo),
+            "count": len(fallback_sites), "sites": sorted(fallback_sites),
+            "declared": bool(allow_uncalibrated_fallback),
+            "note": "Linear / Conv2d sites of a static recipe without calibration data: they keep the dynamic "
+                    "per-tensor reference rule (activation.uncalibrated_fallback, tile_native false). "
+                    "declared=true only when the export was run with --allow-uncalibrated-fallback"},
+        "tile_native": {**tile_native.tile_summary(tile),
+                        "token_grouping": "activation block groups = consecutive rows of the flattened "
+                                          "row-major [B*T, K] operand; the last group may be partial; padding "
+                                          "rows are zeros and encode to +0 (docs/algos/tile-aware.md)",
+                        "padding_encodes_to_plus_zero": tile_native.padding_encodes_to_plus_zero()},
+        "compiler_pack_scale_admission": tile_native.pack_admission_report(static_act, weight_ranges),
         "pending_hardware_rulings": PENDING_RULINGS,
     }
+    # REPORTING ONLY (docs/algos/tile-aware.md#pack-plan): per static activation site the pack code, in-range flag, fold k and cost.
+    # The producer class needs the FX graph (capture_fx fills it into fx/policy.json); here it is 'unknown' except attention p.
+    pack_plan.attach(policy, pack_plan.build_plan(policy))
+    return policy
 
 
 # ---------------------------------------------------------------------------------------------
@@ -558,14 +665,19 @@ def _opt_out_reasons(algo, bf16) -> dict:
 
 def export(model: nn.Module, export_dir, *, mode: str, report: dict, algo, algo_spec: str, options=None,
            skip=(), model_record: dict | None = None, calib_batches=None, calib_record=None,
-           device=None, extra_provenance: dict | None = None, normalization: dict | None = None) -> dict:
+           device=None, extra_provenance: dict | None = None, normalization: dict | None = None,
+           allow_uncalibrated_fallback: bool = False) -> dict:
     """Write model.safetensors, policy.json and manifest.json for `model`, quantized under `mode`
     by algos.quantize (whose return value is `report`). Returns the manifest.
 
     normalization (NEW; LeRobot policies, src/policy_norm.export_record): the input / output
     normalization protocol, its stats sha256 and its transform (per-key mode and eps) sha256,
     written to both files; --from-export refuses an export whose protocol or transform differs
-    from the requested one."""
+    from the requested one.
+
+    allow_uncalibrated_fallback: declare (policy.json uncalibrated_fallback.declared) that Linear sites of a
+    static recipe without calibration data may stay on the dynamic reference rule; without it the export is
+    still written but warns, and tools/verify_bundle.py fails the static check."""
     from safetensors.torch import save_file
 
     import quant_modes
@@ -583,7 +695,13 @@ def export(model: nn.Module, export_dir, *, mode: str, report: dict, algo, algo_
     for n in exact_bf16:
         reasons[n] = exact_reasons.get(n, "algorithm exact BF16 opt-out (bf16_exact)")
     quant = {}
-    policy = build_policy(model, mode, report, algo, options, list(skip or ()), bf16, reasons, quant)
+    policy = build_policy(model, mode, report, algo, options, list(skip or ()), bf16, reasons, quant,
+                          allow_uncalibrated_fallback=allow_uncalibrated_fallback)
+    fb = policy["uncalibrated_fallback"]
+    if fb["count"]:
+        status = "declared" if fb["declared"] else "NOT declared; pass --allow-uncalibrated-fallback to declare"
+        print(f"export: WARNING {fb['count']} Linear / Conv2d site(s) of a static recipe have no calibration "
+              f"data and stay on the dynamic per-tensor rule ({status}): {fb['sites'][:5]}", flush=True)
     # NEW: exact site identity avoids excluding similarly named sibling layers on replay.
     for row in policy["bf16_opt_out"]:
         if row["site"] in exact_bf16:
@@ -662,4 +780,34 @@ def export(model: nn.Module, export_dir, *, mode: str, report: dict, algo, algo_
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2, allow_nan=False) + "\n")
     print(f"export: wrote {out} ({manifest['files']['model.safetensors']['bytes'] / 2**20:.1f} MiB, "
           f"{manifest['counts']['quantized']} quantized sites)", flush=True)
+    if getattr(options, "pack_fold", False):
+        manifest = _pack_fold_in_place(out, model, policy, getattr(options, "pack_fold_graph", None))
     return manifest
+
+
+def _pack_fold_in_place(out: Path, model, policy: dict, graph_dir) -> dict:
+    """--pack-fold: replace the export in `out` by its folded twin (src/exporter/pack_fold.py); the unfolded export stays in
+    <out>.unfolded. The producer classes come from an FX capture of the unfolded export."""
+    import os
+
+    import exporter.pack_fold as pack_fold
+
+    if graph_dir:
+        graph, sig = (Path(graph_dir) / "graph.txt").read_text(), (Path(graph_dir) / "graph_signature.txt").read_text()
+    else:
+        graph, sig = pack_fold.capture_graph_text(model, policy)
+    unfolded = out.with_name(out.name + ".unfolded")
+    if unfolded.exists():
+        raise FileExistsError(f"--pack-fold: {unfolded} exists")
+    os.replace(out, unfolded)
+    try:
+        summary = pack_fold.fold_export_dir(unfolded, out, graph, sig)
+    except BaseException:
+        if out.exists():
+            import shutil
+            shutil.rmtree(out)
+        os.replace(unfolded, out)
+        raise
+    print(f"export: pack fold {summary['outside_before']} -> {summary['outside_after']} static sites outside "
+          f"{summary['admitted_range']} ({summary['sites_folded']} folded); unfolded export kept in {unfolded}", flush=True)
+    return json.loads((out / "manifest.json").read_text())

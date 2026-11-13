@@ -91,6 +91,11 @@ PYTHONPATH=src python -m exporter.fx_export --export-dir SMOLVLA_EXPORT --out-di
   "every valid code", not "every code the encoder emits".
 - **Inventory.** `buffer_inventory.json` records the held dtype and the sha256 of the bytes; for float8 storage
   the hash equals the hash of the original uint8 codes (checked at capture).
+- **Tile-native report (NEW).** `graph_inspection.json` also has `tile_native` (per site: `tile_native`, reasons, whether
+  it is carried natively; the list of sites whose exponents are not constant along K at 32-granularity; the
+  observed dynamic exponents, token splits and code hygiene of the capture cases under `fixture_activation_stats`)
+  and `compiler_pack_scale_admission` (informational). `quantize_act` has `reduce="block"` / `"head_block"` and a
+  trailing `rows=32` argument with a default, so bundles saved earlier still load. See [tile-aware.md](tile-aware.md).
 - **What stays emulated.** `graph_inspection.json` lists under `still_emulated` any quantized module that
   could not be carried natively (per-block weight or activation scales, residual passes, MXU models, an
   activation rule `quantize_act` does not express, a Conv2d whose geometry differs from the policy). Attention

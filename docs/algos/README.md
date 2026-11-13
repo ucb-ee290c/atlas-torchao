@@ -16,9 +16,17 @@ order, the conflict rule and the record are in [stacking.md](stacking.md) (NEW).
 Named recipes expand to documented stacks that never change meaning: `atlas_v1_awq`
 (AWQ+GPTQ+granularity), `atlas_v1_sq` (SmoothQuant+GPTQ+granularity) and `atlas_v1_static`
 (static fallback). `atlas_v1` is an alias, currently for `atlas_v1_awq`; what it meant at each
-historical tag is listed in [atlas_v1.md](atlas_v1.md) (NEW). No recipe keeps a layer in BF16;
-[`keep_bf16:rule=input_conv`](keep-bf16.md) (NEW) is the opt-in rule for convolutions that read
-image pixels directly.
+historical tag is listed in [atlas_v1.md](atlas_v1.md) (NEW). No recipe keeps a layer in BF16 except
+`atlas_v1_tile`; [`keep_bf16:rule=input_conv`](keep-bf16.md) (NEW) is the opt-in rule for convolutions that
+read image pixels directly.
+
+Three **tile-aware** recipes (NEW) use only scales that are constant along K, which the Atlas matrix unit can
+apply at the output pop: `atlas_v1_awq_tile` (`gptq_awq` + `granularity:w=panel,a=block,rows=32,rule=nc`),
+`atlas_v1_tile` (the same plus `keep_bf16:rule=input_conv`) and `atlas_v1_awq_tile_static` (`w=panel` weights with
+static activations). `w=panel` is a 32-channel group (option name `panel`; the atlas-kernels "panel" means a
+launch of up to 2048 columns sharing one exponent). See [tile-aware.md](tile-aware.md).
+The step-by-step flow from any model through AWQ / GPTQ calibration to the verified native FP8 FX graph (commands, files, checklist, limitations) is in
+[How to take a model to a native FP8 FX graph](tile-aware.md#from-a-model-to-a-native-fp8-fx-graph).
 
 The [verified release records](release/README.md) retain results, export verification,
 the presentation and the shared-document replacement. The code tag remains pinned at
