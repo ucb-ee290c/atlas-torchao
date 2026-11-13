@@ -304,6 +304,31 @@ def _inert_autocast_disable():
         torch.autocast = original
 
 
+@contextlib.contextmanager
+def _mse_loss_without_identity_broadcast():
+    """For the capture only: F.mse_loss on two tensors of the same shape calls aten.mse_loss directly instead of
+    first running aten.broadcast_tensors, which is then an identity (SmolVLA's flow loss: u_t and v_t are both
+    [B, chunk, action_dim]). The backend's frontend trace does not record that eliminated multi-result identity
+    ("quantized -> prepared correspondence incomplete"). Same aten.mse_loss call on the same tensors, so the same
+    values; any other call (different shapes, legacy size_average / reduce, weight) is unchanged."""
+    import torch.nn.functional as F
+    from torch.nn.modules.loss import _Reduction
+
+    original = F.mse_loss
+
+    def mse_loss(input, target, size_average=None, reduce=None, reduction="mean", weight=None):
+        if (isinstance(input, torch.Tensor) and isinstance(target, torch.Tensor) and input.shape == target.shape
+                and size_average is None and reduce is None and weight is None):
+            return torch._C._nn.mse_loss(input, target, _Reduction.get_enum(reduction))
+        return original(input, target, size_average, reduce, reduction, weight)
+
+    F.mse_loss = mse_loss
+    try:
+        yield
+    finally:
+        F.mse_loss = original
+
+
 def _scope(node):
     """Innermost module path of a node (empty for nodes with no module stack)."""
     stack = node.meta.get("nn_module_stack") or {}
@@ -793,11 +818,11 @@ def _bf16_by_policy_report(program, nodes, module, policy):
     prefix = _prefix_of(module, policy)
     modules = dict(module.named_modules())
     rows = []
-    scope = getattr(module, "policy_site_scope", None)
+    site_scope = getattr(module, "policy_site_scope", None)
     for name, site in policy["sites"].items():
         if site["status"] not in ("host", "skipped"):
             continue
-        if scope is not None and not name.startswith(tuple(scope)):
+        if site_scope is not None and not name.startswith(tuple(site_scope)):
             continue                                      # outside a sub-boundary (inspect_graph's scope rule)
         path = prefix + name
         layer = modules.get(path)
@@ -1277,7 +1302,8 @@ def capture_fx(module, cases, directory, *, policy, provenance=None, strict=True
                 raise FXVerificationError("no quantized weight buffers at this boundary")
             native_info, baseline, act_stats, attn_calls, unused_attention = None, None, None, {}, {}
             with _meta_placeholders(module), _capture_buffer_roles(module) as roles, \
-                    _alias_parameters_as_attributes(module, policy) as aliases, _inert_autocast_disable():
+                    _alias_parameters_as_attributes(module, policy) as aliases, _inert_autocast_disable(), \
+                    _mse_loss_without_identity_broadcast():
                 report["capture_buffer_roles"] = {"made_persistent": len(roles["persistent"]),
                                                   "held_as_constants": roles["constants"],
                                                   "tied_aliases_held_as_attributes": aliases}

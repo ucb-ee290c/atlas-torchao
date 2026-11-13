@@ -268,3 +268,22 @@ def test_inactive_autocast_disable_is_not_a_higher_order_submodule(tmp_path, lin
     with torch.no_grad():
         for case in cases:
             assert torch.equal(program.module()(*case), module(*case))
+
+
+class _FlowLoss(torch.nn.Module):
+    def forward(self, u, v):
+        return torch.nn.functional.mse_loss(u, v, reduction="none")
+
+
+def test_same_shape_mse_loss_has_no_identity_broadcast():
+    u = torch.randn(1, 5, 4, dtype=torch.bfloat16)
+    v = torch.randn(1, 5, 4, dtype=torch.bfloat16)
+    plain = torch.export.export(_FlowLoss(), (u, v))
+    assert any("broadcast_tensors" in str(n.target) for n in plain.graph.nodes)      # what the capture avoids
+    with fx_export._mse_loss_without_identity_broadcast():
+        program = torch.export.export(_FlowLoss(), (u, v))
+        assert torch.equal(torch.nn.functional.mse_loss(u, v[0], reduction="none"),
+                           ((u - v[0]) ** 2))                                          # broadcasting call unchanged
+    assert not any("broadcast_tensors" in str(n.target) for n in program.graph.nodes)
+    assert torch.equal(program.module()(u, v), torch.nn.functional.mse_loss(u, v, reduction="none"))
+    assert torch.nn.functional.mse_loss.__module__ == "torch.nn.functional"
