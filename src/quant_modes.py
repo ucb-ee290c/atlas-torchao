@@ -13,7 +13,7 @@
                 (default, the reference author's choice) or sa, implementation --mxu-impl
                 ref_cpu (the reference CPU models) or torch (src/mxu/accum_torch.py)
   torchao       stock TorchAO Float8DynamicActivationFloat8WeightConfig, per-tensor
-                (native FP8 matmul; needs compute capability >= 8.9, e.g. Ada Lovelace or Hopper GPUs)
+                (native FP8 matmul; needs compute capability >= 8.9, Ada Lovelace, Hopper or newer GPUs)
 
 The collab_v0 profiles keep exactly the behaviour of atlas-eval (daf8e78) under both their new
 names and their old ones, so the collaborator's numbers reproduce
