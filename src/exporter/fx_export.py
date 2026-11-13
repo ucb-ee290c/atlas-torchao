@@ -329,6 +329,106 @@ def _mse_loss_without_identity_broadcast():
         F.mse_loss = original
 
 
+BF16_MIN = torch.finfo(torch.bfloat16).min
+
+
+def additive_attention_mask(keep):
+    """Boolean keep mask (True = attend) -> additive BF16 mask: 0 where kept, the BF16 minimum (finite) elsewhere.
+    The expression transformers' eager_mask uses, so it captures as TinyLlama's full-model mask does:
+    aten.zeros([], bfloat16) and aten.where.ScalarOther(keep, zeros, -3.3895313892515355e+38)."""
+    return torch.where(keep, torch.zeros((), device=keep.device, dtype=torch.bfloat16), BF16_MIN)
+
+
+@contextlib.contextmanager
+def _smolvla_additive_attention_mask(module):
+    """For the capture only: every SmolVLA text / expert attention softmax takes an additive mask,
+    softmax(scores + where(keep, 0, BF16_MIN)), the form TinyLlama's graph has, instead of the boolean select
+    softmax(where(keep, scores, finfo(float32).min)) of the reference text attention (ref_attention.py, the
+    SmolVLMWithExpertModel.eager_attention_forward replacement). The backend's qualified masked softmax recognizes
+    a score + mask addition; the float32 minimum of the select form rounds to -inf in BF16.
+
+    Each SmolVLMWithExpertModel whose attention is the reference routine (`_atlas_ref_attn`) gets an instance
+    `forward` that converts its boolean [B, Sq, Skv] attention_mask once (additive_attention_mask; rank kept, the
+    layers slice dims 1 and 2) and calls the original forward; ref_attention's text variant then adds the BF16 mask
+    to the float32 scores. Kept scores are unchanged (s + 0 = s) and masked ones become about -3.39e38, so a row with
+    a kept entry gives the same softmax words as the select form (both exponentials underflow to exactly 0). A fully
+    masked row (a padded query) is uniform in both forms in the float32 softmax. Restored afterwards; eager
+    evaluation is unchanged. Yields the module paths converted."""
+    import types
+
+    patched = []
+    try:
+        for path, mod in module.named_modules():
+            if type(mod).__name__ != "SmolVLMWithExpertModel" or not isinstance(
+                    getattr(mod, "_atlas_ref_attn", None), dict):
+                continue
+            original = mod.forward
+
+            def forward(self, attention_mask=None, *args, _original=original, **kwargs):
+                if isinstance(attention_mask, torch.Tensor) and attention_mask.dtype == torch.bool:
+                    attention_mask = additive_attention_mask(attention_mask)
+                return _original(attention_mask, *args, **kwargs)
+
+            patched.append((mod, mod.__dict__.get("forward"), path))
+            mod.forward = types.MethodType(forward, mod)
+        yield [p[2] for p in patched]
+    finally:
+        for mod, previous, _ in patched:
+            if previous is None:
+                del mod.forward
+            else:
+                mod.forward = previous
+
+
+_MASK_VIEWS = {torch.ops.aten.slice.Tensor, torch.ops.aten.unsqueeze.default, torch.ops.aten.expand.default,
+               torch.ops.aten.view.default, torch.ops.aten.reshape.default, torch.ops.aten.alias.default}
+_SOFTMAX = {torch.ops.aten.softmax.int, torch.ops.aten._softmax.default}
+
+
+def _dtype(node):
+    val = node.meta.get("val") if isinstance(node, torch.fx.Node) else None
+    return getattr(val, "dtype", None)
+
+
+def softmax_mask_forms(graph):
+    """The input form of every softmax in a captured graph, in graph order:
+      "additive_bf16_min"  aten.add.Tensor(scores, mask): float32 scores plus a BF16 mask that is, through views
+                           (slice / unsqueeze / expand / view / reshape), aten.where.ScalarOther(keep, zeros BF16,
+                           BF16 minimum) built in the graph (TinyLlama's full-model form) or a BF16 graph input
+                           (TinyLlama's layer boundary form);
+      "additive_other"     any other aten.add.Tensor input;
+      "select"             an aten.where input (the boolean select form);
+      "unmasked"           anything else.
+    Returns [{"node", "form", ...}]."""
+    rows = []
+    for node in graph.nodes:
+        if node.op != "call_function" or node.target not in _SOFTMAX:
+            continue
+        x = node.args[0]
+        row = {"node": node.name, "input": getattr(x, "name", None)}
+        target = getattr(x, "target", None)
+        if target == torch.ops.aten.add.Tensor and len(x.args) == 2 and all(isinstance(a, torch.fx.Node) for a in x.args):
+            scores, mask = x.args
+            source = mask
+            while source.op == "call_function" and source.target in _MASK_VIEWS:
+                source = source.args[0]
+            row.update(scores_dtype=str(_dtype(scores)), mask_dtype=str(_dtype(mask)), mask_source=source.name)
+            built = (source.op == "call_function" and source.target == torch.ops.aten.where.ScalarOther
+                     and _dtype(source.args[0]) == torch.bool and isinstance(source.args[1], torch.fx.Node)
+                     and source.args[1].target == torch.ops.aten.zeros.default and _dtype(source.args[1]) == torch.bfloat16
+                     and source.args[2] == BF16_MIN)
+            boundary = source.op == "placeholder"
+            ok = (built or boundary) and _dtype(mask) == torch.bfloat16 and _dtype(scores) == torch.float32
+            row["form"] = "additive_bf16_min" if ok else "additive_other"
+        elif target in (torch.ops.aten.where.self, torch.ops.aten.where.ScalarOther, torch.ops.aten.where.ScalarSelf,
+                        torch.ops.aten.where.Scalar):
+            row.update(form="select", fill=[a for a in x.args if not isinstance(a, torch.fx.Node)])
+        else:
+            row["form"] = "unmasked"
+        rows.append(row)
+    return rows
+
+
 def _scope(node):
     """Innermost module path of a node (empty for nodes with no module stack)."""
     stack = node.meta.get("nn_module_stack") or {}
@@ -1303,10 +1403,12 @@ def capture_fx(module, cases, directory, *, policy, provenance=None, strict=True
             native_info, baseline, act_stats, attn_calls, unused_attention = None, None, None, {}, {}
             with _meta_placeholders(module), _capture_buffer_roles(module) as roles, \
                     _alias_parameters_as_attributes(module, policy) as aliases, _inert_autocast_disable(), \
-                    _mse_loss_without_identity_broadcast():
+                    _mse_loss_without_identity_broadcast(), _smolvla_additive_attention_mask(module) as additive:
                 report["capture_buffer_roles"] = {"made_persistent": len(roles["persistent"]),
                                                   "held_as_constants": roles["constants"],
                                                   "tied_aliases_held_as_attributes": aliases}
+                if additive:
+                    report["additive_attention_mask"] = {"modules": additive, "form": "scores + where(keep, 0, bf16_min)"}
                 if native_fp8:
                     if native_fp8 not in STORAGE_DTYPES:
                         raise FXVerificationError(f"unknown native storage {native_fp8!r}")
@@ -1345,6 +1447,12 @@ def capture_fx(module, cases, directory, *, policy, provenance=None, strict=True
                                          native_fp8 or "uint8", unused=unused, act_stats=act_stats, calls=calls,
                                          attn_calls=attn_calls if native_fp8 else None,
                                          unused_attention=unused_attention if native_fp8 else None)
+            if report.get("additive_attention_mask"):
+                forms = softmax_mask_forms(program.graph)
+                counts = dict(collections.Counter(row["form"] for row in forms))
+                report["additive_attention_mask"]["softmax_input_forms"] = counts
+                if counts.get("select") or counts.get("additive_other"):
+                    raise FXVerificationError(f"a masked softmax is not in the additive BF16 form: {counts}")
             if native_fp8:
                 for args, (outputs, spec) in zip(cases, expected):
                     _compare(program.module()(*args), _leaves(baseline.module()(*args))[0], spec)
