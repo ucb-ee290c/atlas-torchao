@@ -268,7 +268,7 @@ Run every Linear on the inner-product tree (MXU1, `--mxu ipt`, the default) and 
 - **Rounding.** The IPT aligns all 32 products and the incoming BF16 partial sum to one anchor in a 32-bit integer (17 guard bits below the largest product, shifted-out bits truncated), sums them exactly and rounds once per 32-wide K tile (`AnchorAccumulationTree.scala`). The SA's elaborated PE (`CustomFMA`, `SystolicArrayParams.scala:75`) rounds to BF16 after every one of the 32 adds in a tile. For K = 4416 (138 tiles) that is 138 roundings against 4416, which is the measured +3.8 pt TinyLlama cost and the DiT adaLN degradation of the SA in earlier runs.
 - **Latency.** A matmul takes 35 cycles on MXU1 and 95 on MXU0 (`rtl-timing.md:51`; spec 02 says 96, the RTL-calibrated 95 is used). The issue gap is 32 cycles on both, so throughput per MXU is the same; the IPT is the lower-latency path.
 - **Selection.** Software picks the unit per instruction (`Instructions.scala:99-113`), so this is a scheduling and recipe decision, not a hardware ruling. Whether the taped-out tile contains both units should still be confirmed with the hardware team; the standalone elaboration stub (`chipyard/top/AtlasCluster.scala`) instantiates only the IPT.
-- **Evidence.** The IPT numerics were checked bit for bit against the RTL under Verilator on 14,780 tiles from this flow (`scripts/rtl/`, `results/hw-verify/l1.json`).
+- **Evidence.** The IPT numerics were checked bit for bit against the RTL under Verilator on 14,780 tiles from this flow (`src/scripts/rtl/`, `results/hw-verify/l1.json`).
 
 ## Pending hardware rulings
 

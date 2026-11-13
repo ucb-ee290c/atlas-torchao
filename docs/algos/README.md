@@ -26,7 +26,7 @@ apply at the output pop: `atlas_v1_awq_tile` (`gptq_awq` + `granularity:w=panel,
 static activations). `w=panel` is a 32-channel group (option name `panel`; the atlas-kernels "panel" means a
 launch of up to 2048 columns sharing one exponent). See [tile-aware.md](tile-aware.md).
 The step-by-step flow from any model through AWQ / GPTQ calibration to the verified native FP8 FX graph (commands, files, checklist, limitations) is in
-[howto-model-to-fx-graph.md](howto-model-to-fx-graph.md).
+[How to take a model to a native FP8 FX graph](tile-aware.md#from-a-model-to-a-native-fp8-fx-graph).
 
 The [verified release records](release/README.md) retain results, export verification,
 the presentation and the shared-document replacement. The code tag remains pinned at
