@@ -1,5 +1,7 @@
 # Atlas FP8 Quantization Algorithms
 
+> **Corrected 2026-10-14** ([CORRECTIONS.md](CORRECTIONS.md)): `atlas_v1` rows of run 5.x are the SmoothQuant stack (`atlas_v1_sq`); SmolVLA numbers predate input normalization (ground-truth metrics invalid); AWQ vs SmoothQuant was within noise on SmolVLA and Pi0, and the Pi0 rows mixed commits; `atlas-v1.0` is a local tag (cite `5ff028e`); the release was merged to `main` (`54e1855`).
+
 `atlas_v1` selects AWQ plus GPTQ with token and channel granularity (`nc`) and rounded vector addition (`rn`). AWQ has the lowest measured chip error on TinyLlama, SmolVLA and Pi0. Its chip margins over SmoothQuant are 0.0477 PPL, 0.0159 relative L2 and 0.0024 absolute relative L2 respectively. The latter two are within the supplied 2σ floors, so the choice is a consistent numerical preference rather than three individually resolved wins. DiT candidates tie at reference precision; no DiT chip recipe result is available.
 
 ## Recipe and fallback

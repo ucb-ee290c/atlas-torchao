@@ -26,28 +26,25 @@ REGISTRY = {
     "static_calib": "algos.static_calib",
     "smoothquant": "algos.smoothquant",
     "gptq_awq": "algos.gptq_awq",
+    "keep_bf16": "algos.keep_bf16",
+    "k_order": "algos.k_order",
 }
 
 # Named recipes (NEW; docs/algos/atlas_v1.md): `--algo NAME` expands to a documented stack, and
-# NAME+other:k=v appends opt-in members (e.g. atlas_v1+mixed_precision:...). `chip` options apply
-# to the chip profiles unless the command line sets them (--chip-vadd). In the SQ/static recipes,
-# smoothquant runs with partial=true so that a policy's SigLIP / CLIP / DiT blocks are left unfolded and
-# listed in the record (prepare: unsupported_blocks) instead of refusing the model; on a pure
-# decoder stack (TinyLlama) partial=true folds exactly what partial=false folds.
+# NAME+other:k=v appends opt-in members (e.g. atlas_v1_awq+keep_bf16:rule=input_conv). `chip`
+# options apply to the chip profiles unless the command line sets them (--chip-vadd). In the
+# SQ/static recipes, smoothquant runs with partial=true so that a policy's SigLIP / CLIP / DiT
+# blocks are left unfolded and listed in the record (prepare: unsupported_blocks) instead of
+# refusing the model; on a pure decoder stack (TinyLlama) partial=true folds exactly what
+# partial=false folds.
+#
+# IMMUTABLE (NEW, from atlas-v1.1): a recipe name denotes exactly one stack forever. Changing a
+# recipe means adding a new name; tests/test_algo_atlas_v1.py pins every spec below verbatim.
+# No recipe carries a BF16 exception except atlas_v1_tile (NEW, tile-aware: spells out keep_bf16 in its
+# stack); otherwise layers are kept in BF16 only by an explicit opt-in member (keep_bf16:rule=...,
+# mixed_precision:units=...).
 RECIPES = {
-    "atlas_v1": {
-        "spec": "gptq_awq:method=awq_gptq,actorder=true"
-                "+granularity:w=channel,a=token,rule=nc",
-        "chip": {"chip_vadd": "rn", "chip_vadd_sites": "residual"},
-        "activation_scales": "dynamic per token (run-time amax on chip)",
-        "new_decisions": ["NEW: promote run-5.x AWQ+GPTQ+granularity with residual vadd rn",
-                          "NEW: recipe declares conditional multi_task_dit exact patch_embedding "
-                          "Conv2d BF16 exception (bf16_opt_out_exact records application); "
-                          "run-5.2 ref_conv evidence only, chip result pending"],
-        "bf16_by_policy": {"multi_task_dit": [
-            "observation_encoder.vision_encoder.model.vision_model.embeddings.patch_embedding"]},
-    },
-    # Historical run-5.x atlas_v1, retained under a distinct name for replay (NEW name).
+    # SmoothQuant + GPTQ + granularity: what `atlas_v1` meant at l40s-run-5 .. l40s-run-5.3.
     "atlas_v1_sq": {
         "spec": "smoothquant:alpha=0.5,po2=true,gain=false,partial=true"
                 "+gptq_awq:method=gptq,actorder=true"
@@ -55,13 +52,14 @@ RECIPES = {
         "chip": {"chip_vadd": "rn", "chip_vadd_sites": "residual"},
         "activation_scales": "dynamic per token (run-time amax on chip)",
     },
+    # AWQ + GPTQ + granularity: unchanged since l40s-run-5.
     "atlas_v1_awq": {
-        # Historical compatibility alias: no automatic DiT exception, matching run 5.3.
         "spec": "gptq_awq:method=awq_gptq,actorder=true"
                 "+granularity:w=channel,a=token,rule=nc",
         "chip": {"chip_vadd": "rn", "chip_vadd_sites": "residual"},
         "activation_scales": "dynamic per token (run-time amax on chip)",
     },
+    # SmoothQuant static + GPTQ: unchanged since l40s-run-5.
     "atlas_v1_static": {
         "spec": "smoothquant:alpha=0.5,po2=true,gain=true,static=true,partial=true"
                 "+gptq_awq:method=gptq,actorder=true",
@@ -69,7 +67,74 @@ RECIPES = {
         "activation_scales": "static per tensor for every calibrated Linear input (no run-time amax "
                              "there); attention operands keep the reference dynamic per-(batch, head) rule",
     },
+    # ---- Tile-aware recipes (NEW; docs/algos/tile-aware.md) --------------------------------------------
+    # Scales the Atlas matrix unit can apply without per-K-block rescaling (ruling H3): one exponent per
+    # 32-channel weight group (`panel`; the atlas-kernels "panel", a launch of up to 2048 columns sharing
+    # one exponent, is something else) and per 32-token activation block, both over the full K.
+    "atlas_v1_awq_tile": {
+        # Mirrors atlas_v1_awq: no automatic exception.
+        "spec": "gptq_awq:method=awq_gptq,actorder=true"
+                "+granularity:w=panel,a=block,rows=32,rule=nc,attn=head",
+        "chip": {"chip_vadd": "rn", "chip_vadd_sites": "residual"},
+        "activation_scales": "dynamic per 32-token block over the full K (run-time amax per block on chip); "
+                             "attention operands per (batch, head), never-clip rule",
+        "new_decisions": ["NEW: tile-aware granularity w=panel (32 output channels over all K) and "
+                          "a=block (32 tokens over all K); both constant along K, so the MXU pop applies "
+                          "them (docs/algos/tile-aware.md); no CPU quality result yet"],
+    },
+    "atlas_v1_tile": {
+        # atlas_v1_awq_tile plus the structural input-convolution BF16 exception (what v1.0 `atlas_v1`
+        # kept for the Multi-Task DiT patch embedding, expressed with the v1.1 member keep_bf16).
+        "spec": "gptq_awq:method=awq_gptq,actorder=true"
+                "+granularity:w=panel,a=block,rows=32,rule=nc,attn=head"
+                "+keep_bf16:rule=input_conv",
+        "chip": {"chip_vadd": "rn", "chip_vadd_sites": "residual"},
+        "activation_scales": "dynamic per 32-token block over the full K (run-time amax per block on chip); "
+                             "attention operands per (batch, head), never-clip rule",
+        "new_decisions": ["NEW: tile-aware granularity (see atlas_v1_awq_tile)",
+                          "NEW: carries the keep_bf16:rule=input_conv exception, a structural rule (every "
+                          "Conv2d with 3 input channels, grouped=1), which also selects the SigLIP patch "
+                          "embedding of Pi0 / SmolVLA; the v1.0 atlas_v1 exception was keyed on the policy "
+                          "type multi_task_dit. BF16 placement on chip: pending R4"],
+    },
+    "atlas_v1_awq_tile_static": {
+        # granularity a=defer / attn=defer: granularity gives no activation Scale, static_calib does.
+        "spec": "gptq_awq:method=awq_gptq,actorder=true"
+                "+granularity:w=panel,a=defer,attn=defer,rows=32,rule=nc"
+                "+static_calib",
+        "chip": {"chip_vadd": "rn", "chip_vadd_sites": "residual"},
+        "activation_scales": "static per tensor for every calibrated Linear / Conv2d input (no run-time amax "
+                             "there; avoids ruling H2); attention p static exponent -8, q / k / v per "
+                             "(batch, head) with the reference dynamic rule",
+        "new_decisions": ["NEW: tile-aware weights (w=panel) with static_calib activations; attention q, k, v "
+                          "keep the reference per-(batch, head) dynamic scale (constant along the reduction)"],
+    },
 }
+
+# Aliases (NEW): a convenience name that resolves to exactly one recipe. Every result and export
+# records the alias, the resolved recipe and its expanded stack (recipe_record). What `atlas_v1`
+# meant at each historical tag is listed in docs/algos/atlas_v1.md ("Recipe names by tag").
+ALIASES = {
+    "atlas_v1": "atlas_v1_awq",
+}
+
+RECIPE_DOC = "docs/algos/atlas_v1.md"
+
+
+def resolve(name: str) -> tuple[str | None, str]:
+    """(alias or None, recipe name) for a recipe or alias name."""
+    name = name.strip()
+    if name in ALIASES:
+        return name, ALIASES[name]
+    if name in RECIPES:
+        return None, name
+    raise ValueError(f"unknown recipe {name!r}; recipes {sorted(RECIPES)}, aliases {sorted(ALIASES)}")
+
+
+def _is_recipe(token: str) -> bool:
+    head = token.strip().partition(":")[0].strip()
+    return head in RECIPES or head in ALIASES
+
 
 _CURRENT = []
 
@@ -82,7 +147,7 @@ def split(spec: str | None) -> list:
     parts = []
     for tok in spec.split("+"):
         head = tok.strip().partition(":")[0].strip()
-        if parts and head not in REGISTRY and head not in RECIPES:
+        if parts and head not in REGISTRY and head not in RECIPES and head not in ALIASES:
             parts[-1] += "+" + tok
         else:
             parts.append(tok.strip())
@@ -116,23 +181,46 @@ def parse(spec: str | None) -> tuple[str, dict]:
 
 
 def recipe_of(spec: str | None):
-    """(recipe name, its dict) if `spec` uses a named recipe, else (None, None). Recipes take no
-    parameters, and at most one recipe may appear in a spec."""
-    names = [p.strip() for p in split(spec) if p.partition(":")[0].strip() in RECIPES]
+    """(resolved recipe name, its dict) if `spec` uses a named recipe or alias, else (None, None).
+    Recipes take no parameters, and at most one recipe may appear in a spec."""
+    names = [p.strip() for p in split(spec) if _is_recipe(p)]
     if not names:
         return None, None
     if len(names) > 1:
         raise ValueError(f"--algo {spec!r}: more than one recipe ({names})")
     if ":" in names[0]:
         raise ValueError(f"--algo {spec!r}: recipe {names[0].partition(':')[0]!r} takes no parameters; "
-                         "write its stack out (docs/algos/atlas_v1.md) to change one")
-    return names[0], RECIPES[names[0]]
+                         f"write its stack out ({RECIPE_DOC}) to change one")
+    _, name = resolve(names[0])
+    return name, RECIPES[name]
+
+
+def recipe_record(spec: str | None) -> dict | None:
+    """What a recipe name in `spec` meant, as recorded in every result and export (NEW):
+    requested token, alias (None when a recipe name was given), resolved recipe, its stack and the
+    fully expanded spec. None when `spec` uses no recipe."""
+    name, rcp = recipe_of(spec)
+    if name is None:
+        return None
+    token = next(p.strip() for p in split(spec) if _is_recipe(p))
+    alias, _ = resolve(token)
+    return {"requested": token, "alias": alias, "name": name, "resolved": name,
+            "spec": rcp["spec"], "expanded": expand(spec),
+            "chip_defaults": dict(rcp["chip"]), "activation_scales": rcp["activation_scales"],
+            "new_decisions": list(rcp.get("new_decisions", [])), "doc": RECIPE_DOC}
 
 
 def expand(spec: str | None) -> str:
-    """`spec` with a named recipe replaced by its stack."""
+    """`spec` with a named recipe (or alias) replaced by its stack."""
     parts = split(spec)
-    return "+".join(RECIPES[p.strip()]["spec"] if p.strip() in RECIPES else p for p in parts)
+    return "+".join(_expand_part(p) for p in parts)
+
+
+def _expand_part(part: str) -> str:
+    """A bare recipe or alias token as its stack; any other token unchanged."""
+    if _is_recipe(part) and ":" not in part.strip():
+        return RECIPES[resolve(part)[1]]["spec"]
+    return part
 
 
 def parse_stack(spec: str | None) -> list:
@@ -170,13 +258,9 @@ def make(spec: str | None):
     from algos.stack import Stack
 
     st = Stack([_make_one(n, p) for n, p in parsed], spec=(spec or "").strip())
-    name, rcp = recipe_of(spec)
-    if name is not None:
-        st.recipe = {"name": name, "spec": rcp["spec"], "expanded": expand(spec),
-                     "chip_defaults": dict(rcp["chip"]), "activation_scales": rcp["activation_scales"],
-                     "new_decisions": list(rcp.get("new_decisions", [])),
-                     "bf16_by_policy": dict(rcp.get("bf16_by_policy", {})),
-                     "doc": "docs/algos/atlas_v1.md"}
+    rrec = recipe_record(spec)
+    if rrec is not None:
+        st.recipe = rrec
     return st
 
 
@@ -200,7 +284,8 @@ def add_args(ap, calib_sources=("auto",)) -> None:
                    help="NAME[:k=v,...] from src/algos, or several joined by '+' "
                         "(docs/algos/stacking.md; default none: the profiles unchanged); "
                         f"registered: {', '.join(sorted(REGISTRY))}; recipes "
-                        f"(docs/algos/atlas_v1.md): {', '.join(RECIPES)}")
+                        f"(docs/algos/atlas_v1.md): {', '.join(RECIPES)}; aliases: "
+                        + ", ".join(f"{a} -> {r}" for a, r in ALIASES.items()))
     g.add_argument("--calib-n", type=int, default=None,
                    help="calibration samples (windows / frames / observations); default: the algorithm's")
     g.add_argument("--calib-seed", type=int, default=1234,
@@ -221,9 +306,9 @@ def none_record(spec, mode=None) -> dict:
         by = dict(parsed)
         rec = {"name": name, "spec": str(spec).strip(), "order": order([n for n, _ in parsed]),
                "params": by, "calibration": None}
-        rname, rcp = recipe_of(spec)
-        if rname is not None:
-            rec["recipe"] = {"name": rname, "spec": rcp["spec"], "expanded": expand(spec)}
+        rrec = recipe_record(spec)
+        if rrec is not None:
+            rec["recipe"] = rrec
     if name != "none" and mode == "bf16":
         rec.update(applied=False, reason="bf16 baseline: no algorithm applied")
     return rec
@@ -262,17 +347,19 @@ def quantize(model, mode, skip=(), options=None, algo=None, calib=None) -> dict:
         chip_applied = {k: v for k, v in recipe["chip_defaults"].items() if opts.get(k) is None}
         options = {**opts, **chip_applied}
     bf16 = list(algo.bf16_layers(model, mode) or [])
-    # NEW: resolve the canonical recipe's exact model exception before calibration. This
-    # Conv2d is outside GPTQ/AWQ's Linear calibration/folds, and must never reach cast hooks.
-    exact_bf16 = []
-    policy_type = getattr(getattr(model, "config", None), "type", None)
-    for name in (recipe or {}).get("bf16_by_policy", {}).get(policy_type, []):
+    # Exact BF16 sites with their reasons (algos.base.Algo.bf16_exact; NEW): resolved and
+    # validated before calibration, so they never reach calibration folds or cast hooks, and
+    # matched by exact fqn (no substring siblings).
+    exact = dict(algo.bf16_exact(model, mode) or {})
+    mods = dict(model.named_modules())
+    for name in exact:
         import torch.nn as nn
 
-        mod = dict(model.named_modules()).get(name)
-        if type(mod) is not nn.Conv2d:
-            raise ValueError(f"recipe {recipe['name']}: expected exact BF16 Conv2d {name!r}")
-        exact_bf16.append(name)
+        site_type = type(mods.get(name))
+        if site_type is not nn.Conv2d:
+            raise ValueError(f"{algo.name}: exact BF16 site {name!r} must be an nn.Conv2d of the model "
+                             f"(got {site_type.__name__})")
+    exact_bf16 = list(exact)
     bf16 = list(dict.fromkeys(bf16 + exact_bf16))
     if algo.needs_calibration and calib is None:
         raise RuntimeError(f"algorithm {algo.name!r} needs calibration data and none was provided")
@@ -309,7 +396,7 @@ def quantize(model, mode, skip=(), options=None, algo=None, calib=None) -> dict:
     if recipe:
         rec["recipe"] = {**recipe, "chip_options_applied": chip_applied}
     rec.update(applied=True, bf16_opt_out=bf16, prepare=prep,
-               bf16_opt_out_exact=exact_bf16,
+               bf16_opt_out_exact=exact_bf16, bf16_opt_out_reasons=exact,
                module_hooks=hooks, module_hooks_applied=base in ("reference", "reference_hw", "chip"))
     if hooks and not rec["module_hooks_applied"]:
         rec["module_hooks_note"] = f"{mode}: module hooks {hooks} act only in the reference modules"

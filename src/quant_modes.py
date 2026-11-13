@@ -189,6 +189,7 @@ def add_profile_args(ap) -> None:
     g.add_argument("--crosscheck-budget", type=float, default=600.0,
                    help="seconds of reference CPU time the cross-check may spend")
     __import__("chip_profile").add_args(ap)
+    __import__("hw_two_term").add_args(ap)
     g.add_argument("--ops", default=None,
                    help="comma-separated ops the reference profiles cover: linear, conv2d, attention "
                         "(smolVLA run_eval.py:7-18). Default: the profile's own (ref_linear: linear; "
