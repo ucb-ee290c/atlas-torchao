@@ -4,7 +4,8 @@ Every number is read from a config, a source file, a scheduler object or a fixtu
 which inputs change per call, which operations stay on the host and how often each graph is called.
 
 usage (run with PYTHONPATH=<worktree>/src):
-  make_loop_manifest.py dit --single-step-bundle DIR --out PHASES_DIR/loop_manifest.json      # atlas-lerobot env
+  make_loop_manifest.py dit --single-step-bundle DIR --out PHASES_DIR/loop_manifest.json [--layout hoisted|two_phase]
+                        [--steps-per-call N]                                                   # atlas-lerobot env
   make_loop_manifest.py pi0 --single-step-bundle DIR --checkpoint-dir CKPT --openpi-dir OPENPI --out PATH   # atlas-pi0 env
 `--single-step-bundle` is the existing one-step bundle (read only): its bundle_manifest.json names the checkpoint snapshot, its
 fx/fixtures.safetensors gives the observation tensor shapes, dtypes and the camera masks of the capture cases."""
@@ -17,6 +18,10 @@ import sys
 from pathlib import Path
 
 SCHEMA = "atlas_torchao.loop_manifest.v1"
+# Hoisted DiT: timesteps per modulate call. The largest call size whose rows the CPU reference emulation reproduces byte
+# for byte against one-step calls on the real checkpoint (dit_hoist_check.py, 1 and 8 threads; 50 and 100 rows differ in a few elements
+# because the BF16 matmul kernel changes with the row count). The hardware computes each row on its own at any size.
+DEFAULT_STEPS_PER_CALL = 25
 
 
 def _sha(path):
@@ -73,7 +78,7 @@ def ddpm_schedule(scheduler):
     return rows
 
 
-def dit_manifest(single_step_bundle):
+def dit_manifest(single_step_bundle, layout="hoisted", steps_per_call=DEFAULT_STEPS_PER_CALL):
     from types import SimpleNamespace
 
     import diffusers
@@ -113,7 +118,7 @@ def dit_manifest(single_step_bundle):
                           f"{cfg['n_obs_steps']} obs steps = {cond_dim}; ObservationEncoder._setup_vector_output",
             "check": "equals the encode graph output shape (verified at equivalence time, see tile-aware.md#per-phase-graphs-and-loop-manifest)"}
     start, end = cfg["n_obs_steps"] - 1, cfg["n_obs_steps"] - 1 + cfg["n_action_steps"]
-    return {
+    manifest = {
         "schema": SCHEMA, "model": "multi_task_dit", "objective": "diffusion (DDPM)",
         "sources": {
             "policy_config": str(cfg_path), "policy_config_sha256": _sha(cfg_path),
@@ -174,6 +179,69 @@ def dit_manifest(single_step_bundle):
             {"op": "output unnormalization", "detail": "policy_postprocessor.json unnormalizer (MIN_MAX)"}],
         "not_provided": ["unrolled 100-step graph (not sensible: 99 variance-noise inputs and host scheduler arithmetic)",
                          "random-crop augmentation (training only; eval uses center crop inside the encode graph)"]}
+    if layout == "two_phase":
+        manifest["layout"] = "two_phase"
+        return manifest
+    if layout != "hoisted":
+        raise SystemExit(f"unknown layout {layout!r}")
+    return hoist_modulation(manifest, cfg, src, steps_per_call)
+
+
+def hoist_modulation(manifest, cfg, src, steps_per_call):
+    """The hoisted layout: time_mlp and every block's adaLN_modulation depend only on the timestep and conditioning_vec
+    (DiffusionTransformer.forward, TransformerBlock.forward), so they move from `step` into `modulate`, called once per
+    action chunk for all timesteps; `step` reads its timestep's rows."""
+    n, layers, hidden = manifest["denoising_steps"], cfg["num_layers"], cfg["hidden_dim"]
+    cond = manifest["graphs"]["step"]["inputs"]["conditioning_vec"]
+    noisy = manifest["graphs"]["step"]["inputs"]["noisy_actions"]
+    batch = noisy["shape"][0]
+    calls = -(-n // steps_per_call)
+    sites = (["noise_predictor.time_mlp.1", "noise_predictor.time_mlp.3"]
+             + [f"noise_predictor.transformer_blocks.{i}.adaLN_modulation.1" for i in range(layers)])
+    mod_all = {"shape": [layers, n, batch, 6 * hidden], "dtype": noisy["dtype"],
+               "layout": "modulation[l, i, b] = transformer_blocks[l].adaLN_modulation(cat([time_mlp(timesteps[i]), "
+                         "conditioning_vec[b]])): the 6 chunks shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp "
+                         "of hidden_dim each, in that order"}
+    mod_step = {"shape": [layers, batch, 6 * hidden], "dtype": noisy["dtype"],
+                "slice": "modulation[:, i] of the modulate output for the i-th entry of scheduler.timesteps"}
+    manifest["layout"] = "hoisted"
+    manifest["sources"]["hoist"] = {"modulation_inputs": _line_range(src, "cond_features = torch.cat([timestep_features, "
+                                                                           "conditioning_vec], dim=-1)"),
+                                    "adaLN_call": _line_range(src, "= self.adaLN_modulation(")}
+    manifest["graphs"] = {
+        "encode": manifest["graphs"]["encode"],
+        "modulate": {"path": "modulate/fx", "calls_per_action_chunk": 1,
+                     "boundary": "time_mlp and every block's adaLN_modulation (SiLU + Linear) for all timesteps of the chunk",
+                     "inputs": {"conditioning_vec": cond,
+                                "timesteps": {"shape": [n], "dtype": "I64", "values": "scheduler.timesteps (int64)"}},
+                     "outputs": {"modulation": mod_all},
+                     "hoisted_sites": sites, "steps_per_call": steps_per_call, "calls_per_site": calls,
+                     "rows_per_call": steps_per_call * batch,
+                     "exactness": [
+                         "static or per-token activation scales on the hoisted sites: each row is quantized on its own, "
+                         "so a step's rows have the codes the per-step graph gives them",
+                         "a dynamic scale spanning rows (a=block, per tensor) requires steps_per_call = 1 (the capture refuses "
+                         "otherwise): batching steps would put several steps in one scale group",
+                         "the reference emulation's BF16 matmul is not row-count invariant on every backend; steps_per_call is "
+                         "the call size verified byte-identical against the step-by-step loop"]},
+        "step": {"path": "step/fx", "calls_per_action_chunk": n,
+                 "boundary": "noise_predictor without time_mlp and adaLN_modulation: input_proj, blocks with the given "
+                             "modulation, output_proj",
+                 "inputs": {"noisy_actions": noisy, "modulation": mod_step},
+                 "outputs": manifest["graphs"]["step"]["outputs"]}}
+    manifest["per_call_inputs"] = {
+        "encode": manifest["per_call_inputs"]["encode"],
+        "modulate": "once per action chunk: conditioning_vec (encode output) and the scheduler's timesteps",
+        "step": {"changes_every_call": ["noisy_actions (previous scheduler output)", "modulation[:, i] (slice of the modulate output)"],
+                 "constant_over_the_loop": []}}
+    manifest["loop"] = [manifest["loop"][0],
+                        f"mod = modulate(cond, timesteps)                               # 1 call ({calls} calls per hoisted site inside)",
+                        manifest["loop"][1],
+                        f"for i, t in enumerate(scheduler.timesteps):                   # {n} iterations, host",
+                        f"    eps = step(x, mod[:, i])                                   # {n} calls",
+                        manifest["loop"][4], manifest["loop"][5]]
+    manifest["host_operations"].insert(4, {"op": "modulation slice", "detail": "mod[:, i] for step i (a view or copy, no arithmetic)"})
+    return manifest
 
 
 # ------------------------------------------------------------------------------------------------------------------
@@ -308,10 +376,15 @@ def main(argv=None):
     ap.add_argument("--out", required=True)
     ap.add_argument("--checkpoint-dir")
     ap.add_argument("--openpi-dir")
+    ap.add_argument("--layout", choices=("hoisted", "two_phase"), default="hoisted",
+                    help="dit: hoisted = encode, modulate, step (adaLN out of the loop); two_phase = encode, step")
+    ap.add_argument("--steps-per-call", type=int, default=DEFAULT_STEPS_PER_CALL,
+                    help="dit hoisted: timesteps per call of each hoisted Linear in the modulate graph (default "
+                         f"{DEFAULT_STEPS_PER_CALL}; 1 for a dynamic activation recipe whose scale spans rows)")
     ap.add_argument("--stack-cameras", action="store_true", help="pi0: record the one-tower-call deviation instead of one SigLIP call per camera")
     a = ap.parse_args(argv)
     if a.model == "dit":
-        manifest = dit_manifest(a.single_step_bundle)
+        manifest = dit_manifest(a.single_step_bundle, a.layout, a.steps_per_call)
     else:
         if not a.checkpoint_dir or not a.openpi_dir:
             ap.error("pi0 needs --checkpoint-dir and --openpi-dir")

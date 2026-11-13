@@ -108,19 +108,56 @@ def test_line_range_cites_the_line_and_fails_when_absent(mlm, tmp_path):
         mlm._line_range(p, "absent")
 
 
+def _two_phase(n=100, layers=6, hidden=512):
+    """The parts of a two_phase DiT manifest that hoist_modulation reads."""
+    cond = {"shape": [1, 4160], "dtype": "BF16"}
+    noisy = {"shape": [1, 16, 10], "dtype": "BF16"}
+    return {"denoising_steps": n, "sources": {}, "scheduler": {"timesteps": list(range(n - 1, -1, -1))},
+            "graphs": {"encode": {"path": "encode/fx", "calls_per_action_chunk": 1, "outputs": {"conditioning_vec": cond}},
+                       "step": {"path": "step/fx", "calls_per_action_chunk": n,
+                                "inputs": {"conditioning_vec": cond, "noisy_actions": noisy,
+                                           "timestep": {"shape": [1], "dtype": "I64"}},
+                                "outputs": {"predicted_noise": noisy}}},
+            "per_call_inputs": {"encode": "once"}, "loop": [f"line {i}" for i in range(6)],
+            "host_operations": [{"op": str(i)} for i in range(9)]}, {"num_layers": layers, "hidden_dim": hidden}
+
+
+@pytest.mark.parametrize("steps_per_call,calls", [(100, 1), (25, 4), (7, 15), (1, 100)])
+def test_hoisted_dit_manifest_moves_modulation_out_of_the_step(mlm, steps_per_call, calls):
+    mt = pytest.importorskip("lerobot.policies.multi_task_dit.modeling_multi_task_dit")
+    manifest, cfg = _two_phase()
+    m = mlm.hoist_modulation(manifest, cfg, Path(mt.__file__), steps_per_call)
+    assert m["layout"] == "hoisted" and list(m["graphs"]) == ["encode", "modulate", "step"]
+    mod, step = m["graphs"]["modulate"], m["graphs"]["step"]
+    assert mod["calls_per_action_chunk"] == 1 and step["calls_per_action_chunk"] == 100
+    assert mod["steps_per_call"] == steps_per_call and mod["calls_per_site"] == calls
+    assert mod["inputs"]["conditioning_vec"] == m["graphs"]["encode"]["outputs"]["conditioning_vec"]
+    assert mod["inputs"]["timesteps"]["shape"] == [100]
+    assert mod["outputs"]["modulation"]["shape"] == [6, 100, 1, 3072]
+    assert step["inputs"]["modulation"]["shape"] == [6, 1, 3072] and set(step["inputs"]) == {"noisy_actions", "modulation"}
+    assert mod["hoisted_sites"] == ["noise_predictor.time_mlp.1", "noise_predictor.time_mlp.3"] + [
+        f"noise_predictor.transformer_blocks.{i}.adaLN_modulation.1" for i in range(6)]
+    assert all(":" in v for v in m["sources"]["hoist"].values())          # cited source lines
+
+
 @pytest.mark.skipif(not DIT_BUNDLE.exists(), reason="needs the DiT bundle")
-def test_dit_manifest_end_to_end(mlm, tmp_path):
+@pytest.mark.parametrize("layout", ["two_phase", "hoisted"])
+def test_dit_manifest_end_to_end(mlm, tmp_path, layout):
     pytest.importorskip("lerobot")
     pytest.importorskip("diffusers")
     out = tmp_path / "loop_manifest.json"
-    assert mlm.main(["dit", "--single-step-bundle", str(DIT_BUNDLE), "--out", str(out)]) == 0
+    assert mlm.main(["dit", "--single-step-bundle", str(DIT_BUNDLE), "--out", str(out), "--layout", layout]) == 0
     m = json.loads(out.read_text())
     cfg = json.loads(Path(m["sources"]["policy_config"]).read_text())
     assert cfg["num_inference_steps"] is None and m["denoising_steps"] == cfg["num_train_timesteps"] == 100
     assert m["graphs"]["step"]["calls_per_action_chunk"] == 100 and m["graphs"]["encode"]["calls_per_action_chunk"] == 1
     assert len(m["scheduler"]["per_step"]) == 100 and m["scheduler"]["variance_noise_draws"] == 99
     assert m["scheduler"]["config"]["clip_sample"] is True and m["scheduler"]["config"]["prediction_type"] == "epsilon"
-    assert m["graphs"]["step"]["inputs"]["conditioning_vec"]["shape"] == m["graphs"]["encode"]["outputs"]["conditioning_vec"]["shape"]
+    if layout == "two_phase":
+        assert m["graphs"]["step"]["inputs"]["conditioning_vec"]["shape"] == m["graphs"]["encode"]["outputs"]["conditioning_vec"]["shape"]
+    else:
+        assert m["graphs"]["modulate"]["inputs"]["conditioning_vec"]["shape"] == m["graphs"]["encode"]["outputs"]["conditioning_vec"]["shape"]
+        assert m["graphs"]["modulate"]["outputs"]["modulation"]["shape"] == [cfg["num_layers"], 100, 1, 6 * cfg["hidden_dim"]]
 
 
 @pytest.mark.skipif(not (PI0_BUNDLE.exists() and Path("/scratch2/lorenhung/atlas-fp8/openpi").exists()), reason="needs the Pi0 bundle and openpi")

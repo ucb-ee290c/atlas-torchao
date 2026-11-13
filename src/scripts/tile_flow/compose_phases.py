@@ -9,6 +9,9 @@ for the one-step comparison.
   (b) --eager-loop EXPORT_DIR: the host loop of loop_manifest.json (100 steps, DDPM arithmetic from the per_step table, variance noise
       from the global RNG in the same order diffusers draws it) over the step graph, against DiffusionObjective.conditional_sample
       of the eagerly rebuilt quantized policy with the same seed.
+  Hoisted DiT layout (the manifest has a `modulate` graph): (a) step(x, modulate(encode(obs), timesteps)[:, i]) for the case's
+  timestep i, against the single-step graph (same process) or, when that bundle has no graph, its recorded fixture;
+  (b) the hoisted host loop (encode once, modulate once, step 100 times reading modulation[:, i]) against conditional_sample.
   Pi0 (atlas-pi0 env): (a) prefix, then step with time 1.0, then x = noise + dt * v with dt = -1 (the single-step bundle is
   sample_actions(num_steps=1)) against that bundle's graph in the same process and against its fixture; (b) with --eager-loop the 10-step
   host loop of the manifest (euler.times, float32 dt) against model.sample_actions(num_steps=10) on the same noise.
@@ -151,6 +154,83 @@ def compose_pi0(a):
     return 0 if res["ok"] else 1
 
 
+def compose_dit_hoisted(a):
+    """Hoisted DiT layout (encode, modulate, step): (a) one step, step(x, modulate(encode(obs), timesteps)[:, i]) with i the
+    case's timestep, against the single-step bundle's graph in the same process when it has one (else against its recorded
+    fixture), plus the modulate output shape against the manifest; (b) --eager-loop: the host loop of the manifest over the
+    three graphs against eager conditional_sample."""
+    from safetensors.torch import load_file
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import policy_fx_capture_phases as cap
+
+    ph, ss = Path(a.phases_dir), Path(a.single_step_bundle)
+    manifest = json.loads((ph / "loop_manifest.json").read_text())
+    enc = torch.export.load(ph / "encode" / "fx" / "model.pt2").module()
+    mod = torch.export.load(ph / "modulate" / "fx" / "model.pt2").module()
+    stp = torch.export.load(ph / "step" / "fx" / "model.pt2").module()
+    fx_ss = load_file(str(ss / "fx" / "fixtures.safetensors"))
+    parity = json.loads((ss / "fx" / "parity.json").read_text())
+    single = torch.export.load(ss / "fx" / "model.pt2").module() if (ss / "fx" / "model.pt2").exists() else None
+    ts = cap.manifest_timesteps(manifest)
+    want_shape = manifest["graphs"]["modulate"]["outputs"]["modulation"]["shape"]
+    res = {"phases_dir": str(ph), "single_step_bundle": str(ss), "layout": "hoisted",
+           "reference": "single-step graph, same process" if single is not None else "single-step bundle's recorded fixture",
+           "one_step": [], "ok": True}
+    with torch.no_grad():
+        for i, case in enumerate(parity["cases"]):
+            ins = [fx_ss[k] for k in case["inputs"]]
+            m = mod(enc(*ins[:4]), ts)
+            row_i = int((ts == int(ins[5].reshape(-1)[0])).nonzero()[0])
+            out = stp(ins[4], m[:, row_i].contiguous())
+            want = fx_ss[case["outputs"][0]]
+            row = {"case": i, "timestep": int(ins[5].reshape(-1)[0]), "modulation_shape": list(m.shape),
+                   "modulation_shape_matches_manifest": list(m.shape) == want_shape,
+                   "composition_equals_recorded_fixture": _bytes_equal(out, want),
+                   "max_abs_diff_vs_recorded_fixture": _diff(out, want)}
+            if single is not None:
+                same = single(*ins)
+                row["composition_equals_single_step_graph_same_process"] = _bytes_equal(out, same)
+                row["max_abs_diff_vs_single_step_graph"] = _diff(out, same)
+            res["one_step"].append(row)
+            res["ok"] &= row["modulation_shape_matches_manifest"] and (
+                row["composition_equals_single_step_graph_same_process"] if single is not None
+                else row["composition_equals_recorded_fixture"])
+        if a.eager_loop:
+            # every case (or --eager-cases), each under its recorded sampling seed when it has one (dit_hoist_check.py
+            # --write-cases records the evaluation's seed + frame), else --seed
+            policy, _ = cap.load_dit(a.eager_loop)
+            info = manifest["scheduler"]["initial_noise"]
+            clip = manifest["scheduler"]["config"]["clip_sample_range"]
+            loops = []
+            for i, case in enumerate(parity["cases"]):
+                if a.eager_cases is not None and i not in a.eager_cases:
+                    continue
+                seed = case.get("seed", a.seed)
+                ins = [fx_ss[k] for k in case["inputs"]][:4]
+                cond_eager = policy.observation_encoder.encode(cap._batch(*ins))
+                torch.manual_seed(seed)
+                eager = policy.objective.conditional_sample(policy.noise_predictor, 1, cond_eager)
+                torch.manual_seed(seed)
+                x = torch.randn(info["shape"], dtype=getattr(torch, {"BF16": "bfloat16", "F32": "float32"}[info["dtype"]]))
+                graph, calls = cap.hoisted_host_loop(
+                    stp, mod(enc(*ins), ts), x, manifest["scheduler"]["per_step"],
+                    lambda row, eps: torch.randn(eps.shape, dtype=eps.dtype) if row["variance_noise_draw"] else None,
+                    lambda row, x, eps, z: ddpm_host_step(row, x, eps, z, clip))
+                loops.append({"case": i, "frame": case.get("frame"), "seed": seed, "step_graph_calls": calls,
+                              "encode_graph_calls": 1, "modulate_graph_calls": 1,
+                              "bytes_equal": _bytes_equal(graph, eager), "max_abs_diff": _diff(graph, eager),
+                              "differing_elements": int((graph != eager).sum()), "elements": graph.numel(),
+                              "shape": list(graph.shape), "dtype": str(graph.dtype)})
+                res["ok"] &= loops[-1]["bytes_equal"]
+                res["host_loop_vs_eager_conditional_sample"] = loops
+                Path(a.out).write_text(json.dumps(res, indent=1))       # partial result survives a kill
+                print(json.dumps(loops[-1]), flush=True)
+    Path(a.out).write_text(json.dumps(res, indent=1))
+    print(json.dumps(res, indent=1))
+    return 0 if res["ok"] else 1
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("model", choices=("dit", "pi0"))
@@ -159,7 +239,7 @@ def main(argv=None):
     ap.add_argument("out")
     ap.add_argument("--eager-loop", metavar="EXPORT_DIR")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--eager-cases", type=int, nargs="*", default=None, help="pi0: only these case indices for the eager loop")
+    ap.add_argument("--eager-cases", type=int, nargs="*", default=None, help="only these case indices for the eager loop")
     ap.add_argument("--cache-dir", default=None, help="pi0: save eager and composed loop outputs here")
     ap.add_argument("--openpi-dir")
     ap.add_argument("--checkpoint-dir")
@@ -167,6 +247,8 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.model == "pi0":
         return compose_pi0(a)
+    if "modulate" in json.loads((Path(a.phases_dir) / "loop_manifest.json").read_text())["graphs"]:
+        return compose_dit_hoisted(a)
     from safetensors.torch import load_file
 
     ph, ss = Path(a.phases_dir), Path(a.single_step_bundle)
