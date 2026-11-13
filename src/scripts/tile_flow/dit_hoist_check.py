@@ -90,9 +90,10 @@ def hoisted_generate(policy, batch, steps_per_call):
     return x[:, start:start + cfg.n_action_steps]
 
 
-def write_cases(policy, manifest, batches, timesteps, out, seed):
+def write_cases(policy, manifest, batches, timesteps, out, seed, frames):
     """Capture cases in the single-step bundle layout: inputs (state, images, input_ids, attention_mask, noisy_actions,
-    timestep), output the stock noise_predictor's prediction; case j uses frame j and a timestep spread over the schedule."""
+    timestep), output the stock noise_predictor's prediction; case j uses frame j and a timestep spread over the schedule.
+    Each case records its frame and the sampling seed the evaluation uses for it (seed + frame, eval_policy.run_mode)."""
     import hashlib
 
     from huggingface_hub import snapshot_download
@@ -113,7 +114,8 @@ def write_cases(policy, manifest, batches, timesteps, out, seed):
             keys = [f"case_{j}.input_{i}" for i in range(len(ins))]
             tensors.update({k: v.detach().cpu().contiguous().clone() for k, v in zip(keys, ins)})
             tensors[f"case_{j}.output_0"] = pred.contiguous()
-            parity["cases"].append({"inputs": keys, "outputs": [f"case_{j}.output_0"]})
+            parity["cases"].append({"inputs": keys, "outputs": [f"case_{j}.output_0"], "frame": frames[j],
+                                    "seed": seed + frames[j]})
     save_file(tensors, str(out / "fx" / "fixtures.safetensors"))
     (out / "fx" / "parity.json").write_text(json.dumps(parity, indent=1))
     snap = Path(snapshot_download(manifest["model"]["id"], local_files_only=True))
@@ -128,7 +130,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--export-dir", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--n-frames", type=int, default=4)
+    ap.add_argument("--n-frames", type=int, default=4, help="frame selection of the evaluation protocol (eval_policy make_data)")
+    ap.add_argument("--max-frames", type=int, default=None, help="check only the first N frames of that selection")
     ap.add_argument("--n-test-episodes", type=int, default=32)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--steps-per-call", type=int, nargs="+", default=[1, 2, 4, 5, 10, 20, 25, 50, 100])
@@ -166,7 +169,10 @@ def main(argv=None):
     ds, _, test_eps, idx = eval_policy.make_data(cfg, args.dataset, args.n_test_episodes, args.n_frames, args.seed)
     norm, norm_stats = eval_policy.setup_normalization(args, cfg, rename, ds, idx)
     preprocess, _ = eval_policy.build_processors(cfg, args, rename, norm_stats)
-    res["data"] = {"dataset": args.dataset, "test_episodes": test_eps, "frames": idx, "normalization": norm["status"]}
+    if a.max_frames is not None:
+        idx = idx[:a.max_frames]
+    res["data"] = {"dataset": args.dataset, "test_episodes": test_eps, "selection_n_frames": a.n_frames, "frames": idx,
+                   "normalization": norm["status"]}
     batches = []
     for i in idx:
         b = eval_policy.to_batch(ds[i], preprocess)
@@ -175,7 +181,7 @@ def main(argv=None):
         cond0 = policy.observation_encoder.encode(batches[0])
         res["rows"] = rows_check(policy, cond0, timesteps, ks)
     if a.write_cases:
-        res["cases_written"] = write_cases(policy, manifest, batches, timesteps, Path(a.write_cases), a.seed)
+        res["cases_written"] = write_cases(policy, manifest, batches, timesteps, Path(a.write_cases), a.seed, idx)
     exact_k = [k for k in ks if res["rows"][k]["differing_elements"] == 0]
     res["row_exact_steps_per_call"] = exact_k
     Path(a.out).write_text(json.dumps(res, indent=1))

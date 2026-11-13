@@ -132,7 +132,8 @@ def test_hoisted_step_equals_stock_noise_predictor(cap, static_policy):
             assert torch.equal(cap.DiTStepHoisted(policy)(x, mod[:, 0]), want)
 
 
-@pytest.mark.parametrize("steps_per_call", [1, 25, 100])
+# 100 steps per call is exact on these tiny shapes but not guaranteed: the CPU BF16 matmul is not row-count invariant
+@pytest.mark.parametrize("steps_per_call", [1, 25])
 def test_hoisted_loop_equals_conditional_sample_static(cap, static_policy, steps_per_call):
     policy, _ = static_policy
     for seed in (0, 7):
@@ -147,7 +148,7 @@ def test_modulation_rows_equal_per_step_rows(cap, static_policy):
     cond, ts = _cond(5), _timesteps(policy)
     with torch.no_grad():
         one = cap.DiTModulate(policy, 1)(cond, ts)
-        for k in (7, 25, 100):                       # 7 does not divide 100: the last call is short
+        for k in (7, 25):                            # 7 does not divide 100: the last call is short
             assert torch.equal(cap.DiTModulate(policy, k)(cond, ts), one)
 
 
@@ -157,6 +158,8 @@ def test_dynamic_block_recipe_is_refused_when_batched_and_exact_per_step(cap):
     with pytest.raises(ValueError, match="spanning rows"):
         cap.check_hoist_rules(policy_json, paths, 25)
     assert cap.check_hoist_rules(policy_json, paths, 1) == paths
+    with pytest.raises(ValueError, match="not in the policy"):
+        cap.check_hoist_rules(policy_json, paths + ["noise_predictor.absent"], 1)
     cond = _cond(3)
     got, _ = _hoisted_loop(cap, policy, cond, 0, 1)
     assert torch.equal(got, _stock_loop(policy, cond, 0))

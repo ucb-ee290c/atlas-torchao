@@ -87,7 +87,10 @@ def check_hoist_rules(policy_json, paths, steps_per_call):
     """Refuse a modulate graph that batches several steps into one call of a site whose activation exponent spans rows:
     one step's input then shares a scale group with other steps' rows, which changes its codes (per 32-row block under
     a=block). With one step per call the grouping is the per-step one. Returns the row-spanning sites."""
-    bad = [p for p in paths if _row_spanning((policy_json["sites"].get(p) or {}).get("activation"))]
+    missing = [p for p in paths if p not in policy_json["sites"]]
+    if missing:
+        raise ValueError(f"hoisted site(s) not in the policy: {missing}")
+    bad = [p for p in paths if _row_spanning(policy_json["sites"][p].get("activation"))]
     if bad and steps_per_call != 1:
         raise ValueError(f"{len(bad)} hoisted site(s) have a dynamic activation scale spanning rows "
                          f"(e.g. {bad[0]}: {policy_json['sites'][bad[0]].get('activation')}); {steps_per_call} steps per "

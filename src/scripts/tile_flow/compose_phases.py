@@ -197,24 +197,35 @@ def compose_dit_hoisted(a):
                 row["composition_equals_single_step_graph_same_process"] if single is not None
                 else row["composition_equals_recorded_fixture"])
         if a.eager_loop:
+            # every case (or --eager-cases), each under its recorded sampling seed when it has one (dit_hoist_check.py
+            # --write-cases records the evaluation's seed + frame), else --seed
             policy, _ = cap.load_dit(a.eager_loop)
-            ins = [fx_ss[k] for k in parity["cases"][0]["inputs"]][:4]
-            cond_eager = policy.observation_encoder.encode(cap._batch(*ins))
-            torch.manual_seed(a.seed)
-            eager = policy.objective.conditional_sample(policy.noise_predictor, 1, cond_eager)
             info = manifest["scheduler"]["initial_noise"]
-            torch.manual_seed(a.seed)
-            x = torch.randn(info["shape"], dtype=getattr(torch, {"BF16": "bfloat16", "F32": "float32"}[info["dtype"]]))
             clip = manifest["scheduler"]["config"]["clip_sample_range"]
-            graph, calls = cap.hoisted_host_loop(
-                stp, mod(enc(*ins), ts), x, manifest["scheduler"]["per_step"],
-                lambda row, eps: torch.randn(eps.shape, dtype=eps.dtype) if row["variance_noise_draw"] else None,
-                lambda row, x, eps, z: ddpm_host_step(row, x, eps, z, clip))
-            res["host_loop_vs_eager_conditional_sample"] = {
-                "seed": a.seed, "step_graph_calls": calls, "encode_graph_calls": 1, "modulate_graph_calls": 1,
-                "bytes_equal": _bytes_equal(graph, eager), "max_abs_diff": _diff(graph, eager),
-                "shape": list(graph.shape), "dtype": str(graph.dtype)}
-            res["ok"] &= res["host_loop_vs_eager_conditional_sample"]["bytes_equal"]
+            loops = []
+            for i, case in enumerate(parity["cases"]):
+                if a.eager_cases is not None and i not in a.eager_cases:
+                    continue
+                seed = case.get("seed", a.seed)
+                ins = [fx_ss[k] for k in case["inputs"]][:4]
+                cond_eager = policy.observation_encoder.encode(cap._batch(*ins))
+                torch.manual_seed(seed)
+                eager = policy.objective.conditional_sample(policy.noise_predictor, 1, cond_eager)
+                torch.manual_seed(seed)
+                x = torch.randn(info["shape"], dtype=getattr(torch, {"BF16": "bfloat16", "F32": "float32"}[info["dtype"]]))
+                graph, calls = cap.hoisted_host_loop(
+                    stp, mod(enc(*ins), ts), x, manifest["scheduler"]["per_step"],
+                    lambda row, eps: torch.randn(eps.shape, dtype=eps.dtype) if row["variance_noise_draw"] else None,
+                    lambda row, x, eps, z: ddpm_host_step(row, x, eps, z, clip))
+                loops.append({"case": i, "frame": case.get("frame"), "seed": seed, "step_graph_calls": calls,
+                              "encode_graph_calls": 1, "modulate_graph_calls": 1,
+                              "bytes_equal": _bytes_equal(graph, eager), "max_abs_diff": _diff(graph, eager),
+                              "differing_elements": int((graph != eager).sum()), "elements": graph.numel(),
+                              "shape": list(graph.shape), "dtype": str(graph.dtype)})
+                res["ok"] &= loops[-1]["bytes_equal"]
+                res["host_loop_vs_eager_conditional_sample"] = loops
+                Path(a.out).write_text(json.dumps(res, indent=1))       # partial result survives a kill
+                print(json.dumps(loops[-1]), flush=True)
     Path(a.out).write_text(json.dumps(res, indent=1))
     print(json.dumps(res, indent=1))
     return 0 if res["ok"] else 1
@@ -228,7 +239,7 @@ def main(argv=None):
     ap.add_argument("out")
     ap.add_argument("--eager-loop", metavar="EXPORT_DIR")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--eager-cases", type=int, nargs="*", default=None, help="pi0: only these case indices for the eager loop")
+    ap.add_argument("--eager-cases", type=int, nargs="*", default=None, help="only these case indices for the eager loop")
     ap.add_argument("--cache-dir", default=None, help="pi0: save eager and composed loop outputs here")
     ap.add_argument("--openpi-dir")
     ap.add_argument("--checkpoint-dir")
