@@ -13,7 +13,7 @@
                 (default, the reference author's choice) or sa, implementation --mxu-impl
                 ref_cpu (the reference CPU models) or torch (src/mxu/accum_torch.py)
   torchao       stock TorchAO Float8DynamicActivationFloat8WeightConfig, per-tensor
-                (native FP8 matmul; needs compute capability >= 8.9, e.g. L40S / H100)
+                (native FP8 matmul; needs compute capability >= 8.9, Ada Lovelace, Hopper or newer GPUs)
 
 The collab_v0 profiles keep exactly the behaviour of atlas-eval (daf8e78) under both their new
 names and their old ones, so the collaborator's numbers reproduce
@@ -132,7 +132,7 @@ def require_mode_supported(mode: str, device: str) -> None:
     idx = torch.device(device).index
     cap = torch.cuda.get_device_capability(idx if idx is not None else torch.cuda.current_device())
     if cap < (8, 9):
-        raise RuntimeError(f"mode 'torchao' needs compute capability >= 8.9 (L40S/H100), "
+        raise RuntimeError(f"mode 'torchao' needs compute capability >= 8.9 (Ada Lovelace, Hopper or newer GPUs), "
                            f"found {cap[0]}.{cap[1]} on {torch.cuda.get_device_name(idx)}")
 
 

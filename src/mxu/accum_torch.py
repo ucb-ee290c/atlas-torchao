@@ -9,7 +9,7 @@ Two functional models, both bit-exact ports of the reference sources at pi0-quan
                            the reference author's choice and the default
                   "c"      funct_models_ipt/ipt_c (inner_product_trees_model.h, ipt_linear.h)
 
-Call contract (src/mxu/accum_backends.py on reference-profile; pi0_inout/functional_models.py:7-12):
+Call contract (src/mxu/accum_backends.py; pi0_inout/functional_models.py:7-12):
 
     y = sa_linear(x, w, b=None, *, rows=32)       y = ipt_linear(x, w, b=None, *, vec_len=32)
 

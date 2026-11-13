@@ -2,7 +2,7 @@
 
 An algorithm is a subclass of `Algo` that overrides some of the hooks below. Every hook's default
 is a no-op, and with `--algo none` no `Algo` object exists at all: the quantized modules see
-`algo is None` and call exactly the code of l40s-run-2.1 (tests/test_algo_base.py checks this bit
+`algo is None` and call exactly the code of the baseline commit fcfd7d8 (tests/test_algo_base.py checks this bit
 for bit on every ladder step).
 
 Model-level hooks (applied by algos.quantize to every mode except bf16):

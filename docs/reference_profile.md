@@ -145,9 +145,9 @@ For the reference author:
 - **R5.** The weight-cache key can alias freed temporaries (F-cache).
 - **R6.** ipt_c double-rounds and uses a 30-bit sum (F-IPT). Should it match ipt_numba and the RTL?
 
-## Must be re-verified on the L40S (CUDA)
+## Must be re-verified on a CUDA GPU
 
-This host has no GPU. Everything above was tested with CPU torch, using the same ops. On the L40S, re-check the following:
+This host has no GPU. Everything above was tested with CPU torch, using the same ops. On a CUDA GPU, re-check the following:
 
 1. **Bit-exactness on CUDA.** Run `pytest tests/test_accum_torch.py` and `ATLAS_TEST_COMPILE=1 pytest tests/test_accum_torch.py -k compile`.
 2. **The benchmark.** Run `src/scripts/bench_accum.py --device cuda --compile --check --ref`. Its `--check` compares CUDA bits against CPU bits.
@@ -167,4 +167,4 @@ CPU microbenchmark (from src/scripts/bench_accum.py; shared 160-core host under 
 | reference systolic_c | 16×2048×256 | 4.1e7 |
 | reference ipt_c | 16×2048×256 | 3.7e7 |
 
-The L40S estimates are not measured: SA eager about 2e9 MAC/s, SA compiled 1e10–5e10. TinyLlama is about 0.97 GMAC per token.
+The GPU estimates are not measured: SA eager about 2e9 MAC/s, SA compiled 1e10–5e10. TinyLlama is about 0.97 GMAC per token.
