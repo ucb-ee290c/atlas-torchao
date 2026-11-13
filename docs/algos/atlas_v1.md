@@ -10,7 +10,7 @@
 > - **The v1.0 AWQ-vs-SmoothQuant choice was within noise on SmolVLA and Pi0** (chip margins
 >   0.0159 vs a 0.020 floor and 0.0024 vs a 0.0027 floor), the TinyLlama margin depends on the
 >   unresolved `pt` unit, and **the Pi0 rows mixed commits** (none at run 5, SmoothQuant and
->   static at run 5.1, AWQ at run 5.3). `l40s-run-6` re-measures all recipes at one commit.
+>   static at run 5.1, AWQ at run 5.3). Run 6 (`5731fc0`) re-measures all recipes at one commit.
 > - **`atlas_v1` changed meaning across tags** (table below). Cite a recipe by its explicit
 >   name; results and exports record the alias, the resolved name and the expanded stack.
 
@@ -49,7 +49,7 @@ own spec and the fully `expanded` spec, including opt-in members.
 
 | Tag / commit | `atlas_v1` meant | `atlas_v1_sq` | `atlas_v1_awq` | `atlas_v1_static` |
 |---|---|---|---|---|
-| `l40s-run-5` (`0447807`), `l40s-run-5.1` (`46b0b1d`), `l40s-run-5.2` (`4ab3889`), `l40s-run-5.3` (`a30779b`), local `atlas-v1-handoff` (`aa679e2`) | SmoothQuant+GPTQ+granularity (today's `atlas_v1_sq`) | did not exist | as today | as today |
+| run 5 (`0447807`), run 5.1 (`46b0b1d`), run 5.2 (`4ab3889`), run 5.3 (`a30779b`), local `atlas-v1-handoff` (`aa679e2`) | SmoothQuant+GPTQ+granularity (today's `atlas_v1_sq`) | did not exist | as today | as today |
 | `5ff028e` (local tag `atlas-v1.0`, never published), `fx-gpu-check-1` and main at `2d4b187` / merge `54e1855`, `characterization-gpu-pilot-1-2026-10-14` (`a99a062`) | AWQ+GPTQ+granularity **plus** a BF16 exception for the Multi-Task DiT CLIP patch embedding, keyed on the policy type `multi_task_dit` | as today | as today (no exception) | as today |
 | v1.1 (this branch) | alias of `atlas_v1_awq`, no exception | as today | as today | as today |
 
@@ -105,7 +105,7 @@ Historical recipe labels below are the labels at the cited tags. AWQ means histo
 
 TinyLlama: R full 166 windows, C 4 mxq windows; calibration 16 WikiText-2 train windows.
 SmolVLA: R 200 frames, C 32 frames; calibration 32 frames outside evaluation episodes.
-These rows used `l40s-run-5` (`0447807`). Pi0: 5 DROID observations, seed 0; calibration
+These rows used run 5 (`0447807`). Pi0: 5 DROID observations, seed 0; calibration
 8 observations outside evaluated episodes. `none` used run 5; SQ/static used run 5.1
 (`46b0b1d`); AWQ used run 5.3 (`a30779b`). AWQ raised one Cholesky dampening to 0.1,
 which is recorded. Pi0 delta-space rel L2 R/C was 0.106/0.127 (none), 0.071/0.088 (SQ),

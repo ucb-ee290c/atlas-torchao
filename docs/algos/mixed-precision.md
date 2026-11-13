@@ -105,7 +105,7 @@ This change is on `algo/mixed-precision` only, kept to two files for integration
   `_forward_residual`.
   - With `--algo none` (`algo is None`) or any algorithm that does not override the hook, the
     existing code paths are untouched.
-  - tests/test_algo_base.py (bit-identity to l40s-run-2.1) and the example_identity test pass.
+  - tests/test_algo_base.py (bit-identity to the baseline commit fcfd7d8) and the example_identity test pass.
 - **Conflicts with the granularity branch:** none. It does not touch `algos.base.output_scale` or
   `chip_profile.count_algo_vpu`, the two points the granularity branch changed. The coverage
   accounting comes from the existing `_GuardedFM` MXU counting and VPU dispatch.
