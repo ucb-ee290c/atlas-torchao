@@ -45,6 +45,76 @@ architecture, `load_quantized`, `ref_profile` or `ref_attention`. Use the captur
 and a compatible PyTorch version; cross-version or cross-device portability is not
 established by this check.
 
+## Native-FP8 option (`--native-fp8`)
+
+The default graph above decodes every quantized Linear, Conv2d and attention operand into aten ops. With
+`--native-fp8` the quantized contractions become opaque nodes from `src/exporter/atlas_fx_ops.py`, fed directly by the
+weight code and exponent buffers:
+
+| Site | Nodes in the graph |
+| --- | --- |
+| Linear | `atlas.quantize_act` then `atlas.qlinear(x_codes, x_exp, w_codes, w_exp, bias, out_dtype, "atlas_e4m3")` |
+| Conv2d | visible im2col (`aten.im2col`, permute, reshape), `atlas.quantize_act` per patch row, `atlas.qconv2d(..., B, oh, ow)` on the `[out, in*kh*kw]` weight codes; geometry is checked against `policy.json` |
+| Attention | per Q, K, P, V one `atlas.quantize_act` (per head `reduce=head`, or per token), `atlas.qk_matmul`, then the head_dim scaling, mask, softmax and the BF16 cast as ordinary nodes, then `atlas.pv_matmul` on `V^T` |
+
+```
+%quantize_act = atlas.quantize_act(%x_bf16, dynamic, token, nc, None, uint8)   -> (codes, exp)
+%qlinear      = atlas.qlinear(%codes, %exp, %<fqn>_weight_codes, %<fqn>_weight_scale_exp, %bias, bfloat16, atlas_e4m3)
+```
+
+No `convert`, `exp2`, `mul`, bit operation, `frexp` or float weight remains in those scopes, and `inspect_graph`
+fails closed otherwise. The activation rule is read from `policy.json` (reference, dynamic token / tensor /
+per-head with rule `ref` or `nc`, or static). The eager bodies call the reference code (`reference.ref_numerics`,
+`algos.granularity.scale_exp`, `F.linear` with the bias after, `ref_numerics.dq_matmul_nt`, which
+`reference.ref_attention._mm` also calls), so outputs are byte-identical to eager replay and to the decode graph;
+`capture_fx` captures the decode graph in memory as well and compares both on every input case. Capture
+swaps `reference.ref_attention._cast` / `_mm` and each layer's `forward` inside a restoring context only.
+
+```bash
+PYTHONPATH=src python -m exporter.fx_export --export-dir EXPORT --model CONFIG --out-dir NEW_DIR --device cpu --seqlen 8 --native-fp8
+PYTHONPATH=src python -m exporter.fx_export --verify-dir NEW_DIR --device cpu       # imports exporter.atlas_fx_ops itself
+PYTHONPATH=src python -m exporter.fx_export --export-dir SMOLVLA_EXPORT --out-dir NEW_DIR --device cpu --native-fp8 \
+    --boundary smolvla_flow_loss --n-images 1
+```
+
+- **Loading a saved native bundle.** `model.pt2` names the `atlas.*` operators. Run `import exporter.atlas_fx_ops` (with
+  `src/` on `PYTHONPATH`) before `torch.export.load`, or the load fails with an unknown-operator error. `verify_saved` does
+  this when `fx_manifest.json` has a `native_fp8` record and checks the operator counts against
+  `graph_inspection.json`; tests/test_fx_native.py checks that a bare load fails and the verifier passes.
+- **Storage dtype.** `--native-storage uint8` (default) holds the export bytes as uint8 and the operators carry
+  the format as the `weight_format="atlas_e4m3"` attribute. `--native-storage float8_e4m3fn` holds the same
+  bytes as a `torch.float8_e4m3fn` bitcast. The two decoders do not agree on every code:
+  `torch.float8_e4m3fn` reads the 14 exponent-0 non-zero codes (0x01-0x07, 0x81-0x87) as subnormals where
+  `ref_numerics.e4m3_unpack` gives zero (flush to zero), and 0x7F/0xFF as NaN. The other 240 of the 254 valid
+  codes (including exponent 15 and the 448 maximum) are bit-identical. The encoder never emits those 16 codes,
+  and the float8 option refuses any layer that contains one. `uint8` is the default because the proof is
+  "every valid code", not "every code the encoder emits".
+- **Inventory.** `buffer_inventory.json` records the held dtype and the sha256 of the bytes; for float8 storage
+  the hash equals the hash of the original uint8 codes (checked at capture).
+- **What stays emulated.** `graph_inspection.json` lists under `still_emulated` any quantized module that
+  could not be carried natively (per-block weight or activation scales, residual passes, MXU models, an
+  activation rule `quantize_act` does not express, a Conv2d whose geometry differs from the policy). Attention
+  is native for all sites or for none: one unsupported operand rule keeps every attention module on the
+  decode path. `native_fp8_attention_modules` gives, per attention module, the operand rules, the native
+  node names and `remaining_nodes_in_module_by_target`: what is left in the module (RoPE, repeat_kv,
+  masks, softmax, casts) is ordinary BF16 / float32 nodes, not FP8 emulation.
+- **BF16 by policy.** `bf16_by_policy` (written for every capture, native or not) lists the sites the policy
+  keeps in BF16 (status `host` or `skipped`, e.g. TinyLlama `lm_head`, or the DiT patch-embedding Conv2d
+  exception): the module, the reason, the contraction node and the real BF16 weight. Each is an ordinary
+  `aten.linear` / `aten.conv2d` with no `atlas.*` operator in its scope. This is separate from
+  `still_emulated`: BF16 by policy is intended, an emulated site is FP8 that is not yet native.
+- **Boundary for SmolVLA.** `--boundary smolvla_flow_loss` captures `VLAFlowMatching.forward` (the
+  flow-matching loss for given images, language tokens, state, actions, noise and time): the vision tower
+  including its patch-embedding Conv2d, the connector, all text/expert layers and the action projections, as a
+  tensor-in / tensor-out forward with no sampling loop, no KV cache and no random draw. The 10-step action
+  sampler is a different boundary and is not captured. The 12 vision attention modules and the single
+  text/expert attention site (`model.vlm_with_expert`, invoked once per layer) are native.
+- **Output rescale.** The operators scale the operands by their power-of-two exponents before the contraction,
+  as eager `ref_conv` does. The policy's wording (normalized operands, then `2^(sx+sw)` in float32, then the
+  layer dtype) gives the same bytes for per-token x per-channel exponents;
+  `test_rescale_after_contraction_equals_operand_scaling` measures it for the Linear. Attention scores are
+  float32 matmuls on the decoded operands, as in `ref_attention`.
+
 ## Files
 
 | File | Contents |
@@ -98,6 +168,6 @@ A small synthetic DiT regression can check preservation of the exact BF16 patch
 exception without establishing full-checkpoint action-graph export. Real-model GPU
 capture is separate evidence from the synthetic CPU tests.
 
-model2MLIR lowering follows this graph check. Its native-FP8-to-FP32 projection and the
+model2MLIR lowering follows this graph check (step 3, not part of the native-FP8 option). Its native-FP8-to-FP32 projection and the
 448-versus-240 target-contract conflict remain separate blockers to claiming native
 FP8 or hardware compatibility; they do not change the reference-emulation scope here.

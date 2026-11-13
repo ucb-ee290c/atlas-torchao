@@ -117,3 +117,13 @@ def quantize(x: torch.Tensor, dims=None):
 def dequantize(q: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
     """e4m3(q) * 2^s as float32 (exact: the product of an E4M3 value and a power of two)."""
     return e4m3_unpack(q) * torch.exp2(s.float())
+
+
+def dq_matmul_nt(a_q: torch.Tensor, a_s: torch.Tensor, b_q: torch.Tensor, b_s: torch.Tensor) -> torch.Tensor:
+    """a [..., M, K] times b [..., N, K]^T on E4M3 operands with power-of-two exponents: both are decoded
+    (`dequantize`, float32, exact) and multiplied with torch.matmul in float32. The reference attention's
+    framework-accumulation matmul (ref_attention._mm); the atlas.qk_matmul / atlas.pv_matmul operators
+    call it so the graph and the eager reference share one body."""
+    a = dequantize(a_q, a_s)
+    b = dequantize(b_q, b_s)
+    return torch.matmul(a, b.transpose(-1, -2))
