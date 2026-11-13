@@ -60,7 +60,7 @@ The reference's policy shim always runs 10 flow steps (serve_quant.py:479: num_s
 run_output_eval's --steps has no effect there (its README: "label only"); here --steps reaches
 sample_actions for every source, and anything but 10 is flagged reduced_steps.
 
-Example (L40S):
+Example (CUDA GPU):
   OPENPI_DIR=.../openpi python src/eval_pi0.py --checkpoint-dir .../pi0_droid_jointpos_polaris \\
       --tokenizer-path .../paligemma_tokenizer.model --modes bf16 reference reference_hw torchao \\
       --obs dummy --device cuda --out out/pi0_dummy.json

@@ -26,7 +26,7 @@ The CPU path is for testing; throughput is the GPU's job.
 
 Expected scaling (NEW estimate, to be replaced by a measurement on the GPU host):
   SA is a K-step loop of ~60 element-wise int32 ops over an [M, N] state. Eager mode is memory
-  bound: ~60 passes of 4 bytes over M*N per step, so on an L40S (~860 GB/s) roughly
+  bound: ~60 passes of 4 bytes over M*N per step, so on a GPU with ~860 GB/s of memory bandwidth roughly
   860e9 / (60 * 2 * 4) ~ 1.8e9 MAC/s once M*N is large (>= 1e6) and per-launch overhead
   (~60 launches/step, ~5 us each) is hidden. --compile fuses a step into one kernel
   (read state + gather, write state: ~12 bytes/element), ~1e10-5e10 MAC/s at large M*N, then

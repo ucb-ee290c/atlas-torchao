@@ -6,11 +6,15 @@
     conda env create -f environment.yml
     conda activate atlas
     git submodule update --init
-    pip install -e model2MLIR --no-deps     # deps (xdsl, structlog, PyYAML) are in requirements.txt
+    git clone https://github.com/ucb-bar/model2MLIR.git    # not a submodule; the folder is in .gitignore
+    pip install -e model2MLIR --no-deps     # its dependencies (xdsl, structlog, PyYAML) are in pyproject.toml
 
 ### Notes
-- Python 3.12 is required: model2MLIR uses Python 3.11+ features (enum.StrEnum).
+- Python 3.11 or newer is required: model2MLIR uses Python 3.11 features (enum.StrEnum).
+  `environment.yml` installs 3.12.
 - Install model2MLIR with --no-deps; its optional extras can upgrade torch/torchao.
+- `third_party/atlas-kernels` and `third_party/npu_model` use SSH URLs, so cloning them needs an
+  SSH key registered with GitHub; `pi0-quant` and `smolVLA-quant` use HTTPS.
 - Create conda envs on /scratch or /rscratch, not your home directory.
 
 ## Layout of `src/`
@@ -80,13 +84,11 @@ a seeded sample of real calls is recomputed by the reference CPU model, and any 
 `valid: false` in the result JSON. Every numerics decision and its source, the findings and the open
 questions are in [docs/reference_profile.md](docs/reference_profile.md).
 
-## L40S run matrix: the ladder per model
-
-Use tag l40s-run-2.1 (SA compile fix) for run 2.
+## Run matrix: the ladder per model
 
 Setup, once per machine:
 
-    git clone -b reference-profile git@github.com:ucb-ee290c/atlas-torchao.git && cd atlas-torchao
+    git clone git@github.com:ucb-ee290c/atlas-torchao.git && cd atlas-torchao
     git submodule update --init third_party/pi0-quant third_party/smolVLA-quant
     pip install numba                                        # gcc must be on PATH for the C oracles
     export PYTHONPATH=src HF_HOME=/path/to/hf_cache TL=/path/to/TinyLlama-1.1B-Chat-v1.0
@@ -133,7 +135,7 @@ same step names; step 2 `collab_v0` only exists here):
 
     python src/eval_policy.py --policy TRI-ML/multitask-dit-robosuite-wrist-diffusion-064000 --dataset TRI-ML/PretrainFinetune --n-frames 200 --modes bf16 collab_v0 ref_linear ref_attn ref_conv --out out/dit_ladder_fast.json
 
-Pi0: see "L40S run matrix for Pi0" below (same ladder, `src/eval_pi0.py`).
+Pi0: see "Run matrix for Pi0" below (same ladder, `src/eval_pi0.py`).
 
 Policy-eval options (eval_policy.py):
 
@@ -183,13 +185,13 @@ Notes on the environment:
 - `UV_LINK_MODE=copy` matters. With uv's default hard links, the `transformers_replace` copy also
   rewrites transformers in the uv cache (openpi README).
 - The torch 2.7.1 wheel that uv resolves on Linux x86-64 is the CUDA 12.6 build (`2.7.1+cu126`).
-  If the L40S driver needs a different build, reinstall it from the PyTorch index:
+  If the GPU driver needs a different build, reinstall it from the PyTorch index:
 
       VIRTUAL_ENV=$PI0_ENV uv pip install --reinstall torch==2.7.1 \
           --index-url https://download.pytorch.org/whl/cu126
 
 - torchao 0.12.0 is the release for torch 2.7. The `torchao` mode (native FP8) has only been run
-  under torchao 0.18 (main environment). **Its behaviour under 0.12 must be verified on the L40S**:
+  under torchao 0.18 (main environment). **Its behaviour under 0.12 must be verified on a GPU**:
   the result JSON records the version.
 - numba comes with the lock. gcc must be on PATH for the C oracles.
 
@@ -308,7 +310,7 @@ The checkpoint load fails loudly. The reference loader keeps random weights when
 PI0Pytorch's `torch.compile` wrapper is removed for every mode, as the reference does
 (run_eval.py:943-947).
 
-### L40S run matrix for Pi0 (benchmark first)
+### Run matrix for Pi0 (benchmark first)
 
 One Pi0 frame (10 flow steps) is 2.14e12 MAC, measured with torch's FlopCounterMode on the real
 checkpoint.
