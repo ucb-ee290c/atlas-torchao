@@ -74,6 +74,32 @@ def _file_record(path):
     return {"sha256": digest.hexdigest(), "bytes": Path(path).stat().st_size}
 
 
+
+EXPORT_FILES = ("manifest.json", "model.safetensors", "policy.json")
+
+
+def link_export(export_dir, dest):
+    """Place the export's files in `dest` as real files (hard links, or copies across file systems), never a
+    symlink: the backend's atlas_fp8 adapter refuses any export path with a symlinked component. Existing
+    files must already hold the same bytes. Returns dest."""
+    import shutil
+
+    export_dir, dest = Path(export_dir).resolve(), Path(dest)
+    if dest.is_symlink():
+        raise FXVerificationError(f"{dest} is a symlink; remove it (the backend refuses symlinked export paths)")
+    dest.mkdir(parents=True, exist_ok=True)
+    for name in EXPORT_FILES:
+        source, target = export_dir / name, dest / name
+        if target.exists():
+            if target.is_symlink() or _file_record(target) != _file_record(source):
+                raise FXVerificationError(f"{target} exists and differs from {source}")
+            continue
+        try:
+            os.link(source, target)
+        except OSError:
+            shutil.copy2(source, target)
+    return dest
+
 def _inventory(items, code_dtype=torch.uint8):
     result = {}
     for name, value in items:
@@ -172,6 +198,51 @@ def _meta_placeholders(module):
     finally:
         for layer, original in originals:
             layer.weight = original
+
+
+
+@contextlib.contextmanager
+def _capture_buffer_roles(module):
+    """For the capture only, give every non-persistent buffer the role the backend intake expects:
+
+    - an exported quantization tensor (name ending in quant_export.QUANT_SUFFIXES: weight codes / exponents,
+      static input exponents; non-persistent on the module because quant_export writes them separately) is made
+      persistent, so the saved program holds it in `state_dict` like every other export tensor (the backend's
+      independent reference interpreter and capsule tooling read lifted buffers from `state_dict`);
+    - any other non-persistent buffer (not model state: absent from state_dict and so from the export's tensor
+      inventory, e.g. a RoPE cos/sin cache the constructor builds) is held as a plain tensor attribute, so
+      torch.export lifts it as a CONSTANT_TENSOR; the atlas_fp8 adapter authenticates every lifted
+      BUFFER/PARAMETER against the export tensors and records constants separately as graph literals.
+
+    Same tensors, same values, same graph arithmetic; the caller's buffers are restored afterwards. Yields
+    {"persistent": [paths], "constants": [paths]}."""
+    from exporter.quant_export import QUANT_SUFFIXES
+
+    persistent, constants, seen = [], [], set()
+    try:
+        for path, mod in module.named_modules():
+            if id(mod) in seen:
+                continue
+            seen.add(id(mod))
+            for name in sorted(mod._non_persistent_buffers_set):
+                tensor = mod._buffers.get(name)
+                if tensor is None:
+                    continue
+                full = f"{path}.{name}" if path else name
+                mod._non_persistent_buffers_set.discard(name)
+                if ("." + name).endswith(QUANT_SUFFIXES):
+                    persistent.append((mod, name, full))
+                else:
+                    del mod._buffers[name]
+                    setattr(mod, name, tensor)
+                    constants.append((mod, name, tensor, full))
+        yield {"persistent": sorted(m[2] for m in persistent), "constants": sorted(m[3] for m in constants)}
+    finally:
+        for mod, name, _ in persistent:
+            mod._non_persistent_buffers_set.add(name)
+        for mod, name, tensor, _ in constants:
+            mod.__dict__.pop(name, None)
+            mod.register_buffer(name, tensor, persistent=False)
 
 
 def _scope(node):
@@ -656,9 +727,12 @@ def _bf16_by_policy_report(program, nodes, module, policy):
     prefix = _prefix_of(module, policy)
     modules = dict(module.named_modules())
     rows = []
+    scope = getattr(module, "policy_site_scope", None)
     for name, site in policy["sites"].items():
         if site["status"] not in ("host", "skipped"):
             continue
+        if scope is not None and not name.startswith(tuple(scope)):
+            continue                                      # outside a sub-boundary (inspect_graph's scope rule)
         path = prefix + name
         layer = modules.get(path)
         if layer is None:
@@ -814,6 +888,11 @@ def inspect_graph(program, module, policy, plan=None, storage="uint8", unused=()
                            for node in contractions}
     selected = {name: site for name, site in policy["sites"].items()
                 if site["status"] == "quantized" and site["kind"] in ("linear", "conv2d")}
+    scope = getattr(module, "policy_site_scope", None)
+    outside = []
+    if scope is not None:      # a sub-boundary (e.g. CausalLayer): sites of other modules are outside the graph
+        outside = sorted(name for name in selected if not name.startswith(tuple(scope)))
+        selected = {name: site for name, site in selected.items() if name not in outside}
     actual, rows, unused_rows = set(), [], []
     for path, layer in module.named_modules():
         if type(layer).__name__ not in ("RefQuantLinear", "RefQuantConv2d"):
@@ -903,6 +982,7 @@ def inspect_graph(program, module, policy, plan=None, storage="uint8", unused=()
         attention_rows = _inspect_native_attention(plan["attention"], nodes, storage, depends_on_input, claimed,
                                                    attn_calls, unused_attention)
     report = {"weight_site_bindings": rows, "weight_sites_verified": len(rows),
+              **({"policy_site_scope": list(scope), "sites_outside_boundary": len(outside)} if scope is not None else {}),
               "unused_quantized_modules": unused_rows,
               "unused_attention_modules": [{"site": site, "module": path} for path, site in sorted((unused_attention or {}).items())],
               "bf16_by_policy": _bf16_by_policy_report(program, nodes, module, policy),
@@ -1130,7 +1210,9 @@ def capture_fx(module, cases, directory, *, policy, provenance=None, strict=True
             if not before:
                 raise FXVerificationError("no quantized weight buffers at this boundary")
             native_info, baseline, act_stats, attn_calls, unused_attention = None, None, None, {}, {}
-            with _meta_placeholders(module):
+            with _meta_placeholders(module), _capture_buffer_roles(module) as roles:
+                report["capture_buffer_roles"] = {"made_persistent": len(roles["persistent"]),
+                                                  "held_as_constants": roles["constants"]}
                 if native_fp8:
                     if native_fp8 not in STORAGE_DTYPES:
                         raise FXVerificationError(f"unknown native storage {native_fp8!r}")
@@ -1225,6 +1307,64 @@ class CausalLogits(torch.nn.Module):
         return self.model(input_ids, use_cache=False).logits
 
 
+class CausalLayer(torch.nn.Module):
+    """One decoder layer of a causal LM at its own boundary: (hidden, cos, sin, additive mask) -> hidden.
+
+    The layer stays registered under its original path (`model.model.layers.<index>`, the same names
+    CausalLogits gives it), so its lifted buffers keep the export's tensor names behind the `model.` prefix
+    and its policy sites keep their identity. Rotary cos/sin and the additive BF16 mask are inputs, so the
+    graph holds no rotary or mask construction (the layer-0 boundary of the unchanged_fx backend route)."""
+
+    def __init__(self, model, index):
+        super().__init__()
+        self.index = str(index)
+        self.model = torch.nn.Module()
+        self.model.model = torch.nn.Module()
+        self.model.model.layers = torch.nn.ModuleDict({self.index: model.model.layers[index]})
+        # policy sites of this boundary; inspect_graph treats every other site as outside the graph
+        self.policy_site_scope = (f"model.layers.{index}.",)
+
+    def forward(self, hidden, cos, sin, attention_mask):
+        # transformers >= 5 hangs output-capturing hooks on the layer's submodules that read a ContextVar the
+        # model's own forward sets; strict export cannot trace an unset ContextVar.get, so set "no collector"
+        # here exactly as the model forward does (inactive hooks, same arithmetic).
+        collector = _output_collector()
+        token = collector.set(None) if collector is not None else None
+        try:
+            out = self.model.model.layers[self.index](hidden, attention_mask=attention_mask,
+                                                      position_embeddings=(cos, sin))
+        finally:
+            if collector is not None:
+                collector.reset(token)
+        return out[0] if isinstance(out, tuple) else out
+
+
+def _output_collector():
+    try:
+        from transformers.utils.output_capturing import _active_collector
+    except ImportError:
+        return None
+    return _active_collector
+
+
+def causal_layer_cases(model, index, seqlen, seed, device, count=2):
+    """`count` input tuples for CausalLayer: the hidden state entering layer `index` for random token ids
+    (the model's own embedding and preceding layers), its rotary cos/sin at positions 0..seqlen-1 and a
+    causal additive mask (0 on and below the diagonal, the BF16 minimum above), all BF16."""
+    vocab = model.config.vocab_size
+    cases = []
+    with torch.no_grad():
+        for i in range(count):
+            ids = torch.randint(vocab, (1, seqlen), generator=torch.Generator().manual_seed(seed + i)).to(device)
+            hidden = model(ids, use_cache=False, output_hidden_states=True).hidden_states[index]
+            positions = torch.arange(seqlen, device=device)[None]
+            cos, sin = model.model.rotary_emb(hidden, positions)
+            dtype = hidden.dtype
+            mask = torch.full((seqlen, seqlen), torch.finfo(dtype).min, dtype=dtype, device=device).triu(1)
+            cases.append(tuple(t.contiguous() for t in (hidden, cos.to(dtype), sin.to(dtype), mask[None, None])))
+    return cases
+
+
 class SmolVLAFlowLoss(torch.nn.Module):
     """Tensor-in / tensor-out boundary of a LeRobot SmolVLA policy: the flow-matching loss forward
     (`VLAFlowMatching.forward`) for given images, language tokens, state, actions, noise and time. It runs the
@@ -1278,8 +1418,11 @@ def main(argv=None):
                         help="dtype of the held weight-code buffers with --native-fp8. uint8 (default) keeps the "
                              "export bytes; float8_e4m3fn is a bitcast of the same bytes, refused when a layer "
                              "holds a code on which torch and ref_numerics decode differently")
-    parser.add_argument("--boundary", choices=("causal_lm", "smolvla_flow_loss"), default="causal_lm",
-                        help="capture boundary: causal-LM logits (default) or the SmolVLA flow-matching loss forward")
+    parser.add_argument("--boundary", choices=("causal_lm", "causal_lm_layer", "smolvla_flow_loss"), default="causal_lm",
+                        help="capture boundary: causal-LM logits (default), one decoder layer of a causal LM "
+                             "(CausalLayer: hidden, cos, sin, mask -> hidden; see --layer) or the SmolVLA "
+                             "flow-matching loss forward")
+    parser.add_argument("--layer", type=int, default=0, help="decoder layer index with --boundary causal_lm_layer")
     parser.add_argument("--n-images", type=int, default=1, help="cameras at the smolvla_flow_loss boundary")
     parser.add_argument("--verify-dir", help="fresh-process replay of an existing FX bundle")
     args = parser.parse_args(argv)
@@ -1294,7 +1437,7 @@ def main(argv=None):
 
         _, policy, manifest = load_quantized.read_export(args.export_dir)
         kind = (manifest.get("model") or {}).get("kind", "causal_lm")
-        if (kind == "causal_lm") != (args.boundary == "causal_lm"):
+        if (kind == "causal_lm") != args.boundary.startswith("causal_lm"):
             parser.error(f"export kind {kind!r} does not match --boundary {args.boundary}; the CLI captures causal-LM "
                          "logits or the SmolVLA flow-loss forward (policy action sampling is a separate boundary)")
         if args.boundary == "smolvla_flow_loss":
@@ -1310,10 +1453,17 @@ def main(argv=None):
         else:
             model, _, _ = load_quantized.load_quantized(args.model, args.export_dir, args.device,
                                                        mode="ref_conv", seqlen=args.seqlen)
-            vocab = model.config.vocab_size
-            cases = [(torch.randint(vocab, (1, args.seqlen), generator=torch.Generator().manual_seed(args.seed + i))
-                      .to(args.device),) for i in range(2)]
-            boundary, config_dict = CausalLogits(model).eval(), model.config.to_dict()
+            config_dict = model.config.to_dict()
+            if args.boundary == "causal_lm_layer":
+                if not 0 <= args.layer < model.config.num_hidden_layers:
+                    parser.error(f"--layer {args.layer} outside 0..{model.config.num_hidden_layers - 1}")
+                cases = causal_layer_cases(model, args.layer, args.seqlen, args.seed, args.device)
+                boundary = CausalLayer(model, args.layer).eval()
+            else:
+                vocab = model.config.vocab_size
+                cases = [(torch.randint(vocab, (1, args.seqlen), generator=torch.Generator().manual_seed(args.seed + i))
+                          .to(args.device),) for i in range(2)]
+                boundary = CausalLogits(model).eval()
         report = capture_fx(boundary, cases, args.out_dir, policy=policy,
                             strict=not args.non_strict,
                             native_fp8=args.native_storage if args.native_fp8 else None,
@@ -1327,7 +1477,8 @@ def main(argv=None):
                                         "config_sha256": hashlib.sha256(json.dumps(config_dict,
                                             sort_keys=True, default=str).encode()).hexdigest(),
                                         "capture_source": _capture_source(),
-                                        "seed": args.seed, "seqlen": args.seqlen})
+                                        "seed": args.seed, "seqlen": args.seqlen,
+                                        **({"layer": args.layer} if args.boundary == "causal_lm_layer" else {})})
     print(json.dumps(report, indent=2))
     return 0
 
