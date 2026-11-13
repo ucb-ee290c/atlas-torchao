@@ -19,7 +19,7 @@ from pathlib import Path
 
 SCHEMA = "atlas_torchao.loop_manifest.v1"
 # Hoisted DiT: timesteps per modulate call. The largest call size whose rows the CPU reference emulation reproduces byte
-# for byte against one-step calls on the real checkpoint (dit_hoist_check.py; 50 and 100 rows differ in a few elements
+# for byte against one-step calls on the real checkpoint (dit_hoist_check.py, 1 and 8 threads; 50 and 100 rows differ in a few elements
 # because the BF16 matmul kernel changes with the row count). The hardware computes each row on its own at any size.
 DEFAULT_STEPS_PER_CALL = 25
 

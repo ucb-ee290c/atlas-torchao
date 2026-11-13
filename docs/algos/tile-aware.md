@@ -465,7 +465,7 @@ Exactness conditions (the hoisted loop must give the step-by-step result byte fo
   `--steps-per-call 1` keeps the per-step grouping and is exact, but then reads the adaLN weights 100 times per chunk unless
   the compiler batches the calls.
 - Row count of the reference emulation's matmul: the hardware computes each output row on its own, but the CPU BF16 matmul
-  behind `atlas::qlinear` is not row-count invariant. On the real checkpoint (8 threads), 2 to 25 rows per call give the
+  behind `atlas::qlinear` is not row-count invariant. On the real checkpoint (1 and 8 threads), 2 to 25 rows per call give the
   one-row results exactly; 50 and 100 rows differ in 57 of 1,843,200 adaLN outputs (max 0.0078), which changes the chunk
   (84 to 97 of 112 action elements, max 0.098). Hence 25 by default.
 - The adaLN Linear is not split into its time and observation halves: that would change the accumulation and the rounding.
@@ -479,7 +479,8 @@ loop; the dynamic recipe is refused when batched and exact with one step per cal
 `atlas_v1_awq_tile_static` and `atlas_v1_awq` (per-token scales), and with 1 step per call under `atlas_v1_awq_tile`
 (batching refused); 4 frames per recipe. The hoisted phase bundles (static recipe) pass
 `verify_bundle.py` (25 of 25 each); one step through them equals the stock noise prediction on 4 cases (timesteps 99, 62,
-25, 88), and the 100-step host loop over the three graphs equals eager `conditional_sample`, max abs difference 0.0.
+25, 88), and the 100-step host loop over the three graphs equals eager `conditional_sample` on the first 8 frames of the
+`--n-frames 96` evaluation selection under each frame's evaluation seed: 0 of 168 elements differ on every frame.
 
 ```bash
 python src/scripts/tile_flow/make_loop_manifest.py dit --single-step-bundle B --out P/loop_manifest.json   # hoisted, 25
@@ -521,7 +522,7 @@ RoPE outer product and BF16 / float32 softmax, norm and residual nodes are ordin
 | SmolVLA | `atlas_v1_awq_tile_static` | flow-loss forward, 1 image | 302 | 1 | 36 | 447 | 25 of 25 |
 | Multi-Task DiT | `atlas_v1_awq_tile_static_attn` | encoder plus one noise-predictor call | 179 | 0 | 30 (24 CLIP, 6 DiT) | 299 | 25 of 25 |
 | Multi-Task DiT phases | `..._attn_phases/{encode,step}` + `loop_manifest.json` | `encode` once, `step` 100 times | see [Per-phase graphs and loop manifest](#per-phase-graphs-and-loop-manifest) | | | | 25 of 25 each |
-| Multi-Task DiT hoisted phases | `atlas_v1_awq_tile_static` (calibration 8 frames), `{encode,modulate,step}` + `loop_manifest.json` | `encode` once, `modulate` once, `step` 100 times | 145 / 32 (8 sites x 4) / 26 | 0 | 24 / 0 / 6 | 241 / 32 / 50 | 25 of 25 each |
+| Multi-Task DiT hoisted phases (verification capture) | `atlas_v1_awq_tile_static` (calibration 8 frames; cases from `dit_hoist_check.py`), `{encode,modulate,step}` + `loop_manifest.json` | `encode` once, `modulate` once, `step` 100 times | 145 / 32 (8 sites x 4) / 26 | 0 | 24 / 0 / 6 | 241 / 32 / 50 | 25 of 25 each |
 | Pi0 | `gptq_panel_static_noawq_deadrtn` (candidate) | one sampler step, non-strict | 420 | 0 | 63 | 672 | 25 of 25 |
 | Pi0 phases | `gptq_panel_static_noawq_phases/{prefix,step}` + `loop_manifest.json` | `prefix` once, `step` 10 times | see [Per-phase graphs and loop manifest](#per-phase-graphs-and-loop-manifest) | | | | 25 of 25 each |
 
