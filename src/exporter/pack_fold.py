@@ -34,8 +34,8 @@ from pathlib import Path
 
 import torch
 
-import pack_plan as pp
-import tile_native as tn
+import exporter.pack_plan as pp
+import exporter.tile_native as tn
 
 SCHEMA = "atlas_torchao.pack_fold.v1"
 FREE_CLASSES = ("norm_affine", "layer_norm", "gated_product", "attn_out_pv", "linear_to_linear")
@@ -567,8 +567,8 @@ def fold_export_dir(src, dst, graph_text: str, signature_text: str) -> dict:
     from safetensors import safe_open
     from safetensors.torch import save_file
 
-    import load_quantized
-    import quant_export
+    import exporter.load_quantized as load_quantized
+    import exporter.quant_export as quant_export
 
     src, dst = Path(src), Path(dst)
     tensors, policy, manifest = load_quantized.read_export(src, verify=True)
@@ -625,12 +625,12 @@ def capture_graph_text(model, policy: dict, seqlen: int = 8):
     producer classes are read from it, so a short sequence is enough."""
     import tempfile
 
-    import fx_export
+    import exporter.fx_export as fx_export
 
     vocab = int(getattr(getattr(model, "config", None), "vocab_size", 0) or 0)
     if not vocab:
         raise RuntimeError("--pack-fold: cannot capture the FX graph in process for a model without config.vocab_size; "
-                           "capture it with src/fx_export.py and pass --pack-fold-graph <fx dir>")
+                           "capture it with `python -m exporter.fx_export` and pass --pack-fold-graph <fx dir>")
     ids = torch.arange(seqlen, dtype=torch.long).reshape(1, seqlen) % vocab
     cases = [(ids,), ((ids + seqlen) % vocab,)]
     model.eval()

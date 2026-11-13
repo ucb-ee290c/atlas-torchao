@@ -245,7 +245,7 @@ def token_split_report(n_tokens: int, rows: int = GROUP) -> dict:
 def padding_encodes_to_plus_zero(k: int = GROUP, rows: int = GROUP, exp: int = 0) -> bool:
     """The zero padding rows of a partial block encode to the +0 code 0x00 at any exponent (vpack of BF16
     +0 / -0). A property of the encoder (ref_numerics.e4m3_vpack), checked, not assumed."""
-    import ref_numerics as rn
+    import reference.ref_numerics as rn
 
     z = torch.zeros(rows, k, dtype=torch.bfloat16)
     return bool((rn.e4m3_vpack(z, torch.tensor(int(exp), dtype=torch.int32)) == 0).all()

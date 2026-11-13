@@ -16,8 +16,8 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-import load_quantized
-from modelutils import load_llama
+import exporter.load_quantized as load_quantized
+from loaders.modelutils import load_llama
 
 model_dir, T, B = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 jobs = [a.split("=") for a in sys.argv[4:]]

@@ -6,7 +6,7 @@ npu-model needs Python >= 3.13 (PEP 696 type-parameter defaults in npu_model/isa
 simulator under a 3.14 interpreter (--py314), and does the analytic and bit-for-bit comparisons. The same file is
 the child (`--child`). The simulator checkout is only read; no file is written inside it.
 
-    /scratch2/lorenhung/envs/atlas-lerobot/bin/python -I scripts/npu_model_l2.py --py314 <venv314>/bin/python
+    /scratch2/lorenhung/envs/atlas-lerobot/bin/python -I src/scripts/npu_model_l2.py --py314 <venv314>/bin/python
 
 Kernel (generated here, MXU1 = inner-product tree, weight [N,K] tiles pushed WITHOUT vtrpose.xlu): per output
 strip n, for k in 0..Kt-1: vload A tile(s), vload W tile (burst of `burst` tiles per DMA), vmatpush.weight,
@@ -31,7 +31,7 @@ from pathlib import Path
 import numpy as np
 
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE.parent / "src"))
+sys.path.insert(0, str(HERE.parent))
 
 NPU_MODEL = os.environ.get("NPU_MODEL", "/scratch2/lorenhung/atlas-npu-rtl/src/npu-model")
 EXPORT = ("/scratch2/lorenhung/atlas-fp8/handoff/atlas_v1/export_smoke/tinyllama/atlas_v1/model.safetensors")
@@ -159,7 +159,7 @@ def load_codes(export: str, name: str, n_rows: int, k: int) -> np.ndarray:
 
 def make_case(c: dict, d: Path, seed: int):
     import torch
-    import ref_numerics as rn
+    import reference.ref_numerics as rn
     Nt, Kt, mb = c["Nt"], c["Kt"], c["mb"]
     N, K, M = Nt * TILE, Kt * TILE, mb * TILE
     w = load_codes(EXPORT, c["tensor"], N, K)                                   # [N, K] uint8 codes, as exported
@@ -183,8 +183,8 @@ def decode_c(raw: np.ndarray, mb: int, Nt: int, M: int, N: int) -> np.ndarray:
 
 
 def analytic(c: dict):
-    import hw_params as hp
-    import hw_cost as hc
+    import chip.hw_params as hp
+    import chip.hw_cost as hc
     burst = c["burst"]
     dma_tile = hp.dma_load_cycles(burst * 1024) / burst            # DERIVED from the measured curve
     compute_tile = 34 * (c["mb"] + 1) + 32 + 35 * c["mb"]            # my kernel's serialized delays per k step
@@ -195,7 +195,7 @@ def analytic(c: dict):
 
 def parent(args):
     import torch
-    import accum_torch as at
+    import mxu.accum_torch as at
     OUT.mkdir(parents=True, exist_ok=True)
     d = OUT / "work"
     d.mkdir(exist_ok=True)

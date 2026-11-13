@@ -23,8 +23,8 @@ from pathlib import Path
 
 import torch
 
-import atlas_fx_ops  # noqa: F401  registers atlas.* ops for torch.export.load
-from fx_export import tensor_record
+import exporter.atlas_fx_ops as atlas_fx_ops  # noqa: F401  registers atlas.* ops for torch.export.load
+from exporter.fx_export import tensor_record
 
 
 def _bytes_equal(a, b):

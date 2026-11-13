@@ -21,8 +21,8 @@ import time
 import torch
 from safetensors import safe_open
 
-sys.path.insert(0, __file__.rsplit("/scripts/", 1)[0] + "/src")
-import ref_numerics as rn
+sys.path.insert(0, __file__.rsplit("/src/scripts/", 1)[0] + "/src")
+import reference.ref_numerics as rn
 from algos import gptq_awq as ga
 from algos.granularity import panel_scale_exp
 

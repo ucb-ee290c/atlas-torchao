@@ -5,8 +5,8 @@ weight rel Frobenius error, and the layer-output rel error ||X (Wd - W)^T|| / ||
 on image 0 and image 1 separately, and on Gaussian inputs. The captured frame (DROID episode 252 frame 30) is an evaluated episode, so it is
 not in any export's calibration set: these are held-out inputs for the exports."""
 import json, sys, torch
-sys.path.insert(0, "/scratch2/lorenhung/atlas-fp8/atlas-torchao-tile/src")
-import ref_numerics as rn
+sys.path.insert(0, __file__.rsplit("/src/scripts/", 1)[0] + "/src")
+import reference.ref_numerics as rn
 from safetensors import safe_open
 
 STOCK = "/scratch2/lorenhung/models/openpi-pytorch/pi0_droid_jointpos_polaris/model.safetensors"

@@ -92,7 +92,7 @@ def test_k0_and_none_bit_identical(tmp_path):
 
 def test_ranking_reproducible():
     need_refs()
-    sys.path.insert(0, str(REPO / "scripts"))
+    sys.path.insert(0, str(REPO / "src" / "scripts"))
     import rank_layers
 
     g = torch.Generator().manual_seed(7)
@@ -113,7 +113,7 @@ def test_ranking_on_cuda():
     """The model on CUDA, the calibration batches on the CPU (as calib.wikitext2_train returns
     them): every layer is scored, with finite scores, and the record names the device."""
     need_refs()
-    sys.path.insert(0, str(REPO / "scripts"))
+    sys.path.insert(0, str(REPO / "src" / "scripts"))
     import rank_layers
 
     g = torch.Generator().manual_seed(7)

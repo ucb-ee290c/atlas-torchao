@@ -6,7 +6,7 @@ import pytest
 import torch
 
 import algos
-import ref_numerics as rn
+import reference.ref_numerics as rn
 from algos import gptq_awq as ga
 from algos.granularity import panel_scale_exp
 from refutil import need_refs
@@ -154,7 +154,7 @@ def test_awq_gptq_end_to_end_with_producer_aware_on_panel_grid():
 
 
 def test_diagonal_h_and_identity_producer_hessian_match_the_dense_forms():
-    """The weights-only proxy used by scripts/tile_diag/awq_producer_validate.py: a 1-D H is the diagonal of the
+    """The weights-only proxy used by src/scripts/tile_diag/awq_producer_validate.py: a 1-D H is the diagonal of the
     dense H, and a producer H of None is the identity."""
     Wu, Wd, Hp, Hd, sx = _pair(seed=1)
     dense = torch.diag(sx ** 2) * 512 / 3

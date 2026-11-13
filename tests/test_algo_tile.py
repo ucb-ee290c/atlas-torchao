@@ -13,12 +13,12 @@ import torch
 import torch.nn.functional as F
 
 import algos
-import atlas_fx_ops  # noqa: F401
-import fx_export
-import load_quantized
-import quant_export
-import ref_numerics as rn
-import tile_native as tn
+import exporter.atlas_fx_ops as atlas_fx_ops  # noqa: F401
+import exporter.fx_export as fx_export
+import exporter.load_quantized as load_quantized
+import exporter.quant_export as quant_export
+import reference.ref_numerics as rn
+import exporter.tile_native as tn
 from algos import base as algo_hooks
 from algos import granularity as gr
 from algos import gptq_awq as ga
@@ -536,7 +536,13 @@ def test_bundle_saved_with_the_old_quantize_act_schema_still_verifies(tmp_path):
     script = textwrap.dedent("""
         import sys
         sys.path[:0] = [sys.argv[1], sys.argv[2]]
-        import torch, algos, atlas_fx_ops, fx_export, quant_export
+        import exporter, reference.ref_numerics
+        sys.modules["ref_numerics"] = reference.ref_numerics      # the frozen copy predates the package layout
+        import atlas_fx_ops                                        # the frozen copy (old schema)
+        sys.modules["exporter.atlas_fx_ops"] = exporter.atlas_fx_ops = atlas_fx_ops  # what fx_export imports
+        import torch, algos
+        import exporter.fx_export as fx_export
+        import exporter.quant_export as quant_export
         schema = str(torch.ops.atlas.quantize_act.default._schema)
         assert "rows" not in schema, schema
         FAST = {"crosscheck": "off", "mxu": "ipt", "mxu_impl": "torch"}
@@ -585,7 +591,7 @@ def test_panel_block_cost_has_no_per_element_rescale_and_old_accounting_is_uncha
     assert tiles < old["granularity_rescale"]["instructions"]["vmul.bf16"] / 100
     assert "dyn_scale_chain" in new                                               # dynamic block chain still counted
     # one Linear 40 tokens x 64 out: 2 x 2 tiles
-    import chip_profile as cp
+    import chip.chip_profile as cp
 
     prior = cp.TILE_OUTPUT_CONSUMER
     try:

@@ -134,7 +134,7 @@ def _bf16_scale_to_e4m3(bits: torch.Tensor, scale_exp) -> torch.Tensor:
     Takes the shift as is, like the C reference. The RTL derives it from an E8M0 byte and clamps it
     to [-128, 127] (OutputConvStage.scala; byte 0 is -127), so byte 255 means +127 and no byte encodes
     a shift outside [-127, 127]: callers that start from a byte clamp first (NEW, found by the
-    Verilator run; scripts/npu_model_crosscheck.py does).
+    Verilator run; src/scripts/npu_model_crosscheck.py does).
     """
     sign = (bits >> 15) & 1
     exp = (bits >> 7) & 0xFF

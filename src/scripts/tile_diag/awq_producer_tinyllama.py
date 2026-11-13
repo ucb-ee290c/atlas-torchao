@@ -11,7 +11,7 @@ import sys
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM
 
-sys.path.insert(0, __file__.rsplit("/scripts/", 1)[0] + "/src")
+sys.path.insert(0, __file__.rsplit("/src/scripts/", 1)[0] + "/src")
 import algos
 from algos import calib as algo_calib
 from algos import gptq_awq as ga

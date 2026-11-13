@@ -5,19 +5,19 @@ Four K-chain results on the SAME FP8 operands (TinyLlama, real activations and w
   b tile-exact exact tile sum + BF16 psum, one RNE per 32-wide K tile, no truncation
   c ipt        accum_torch.ipt_linear_bits (bit-exact IPT: 17 guard bits, truncating alignment)
   d sa         accum_torch.sa_linear_bits (per-add RNE)
-Run: python -I scripts/hw_ipt_error.py   (CPU only)
+Run: python -I src/scripts/hw_ipt_error.py   (CPU only)
 """
 import os, sys, json
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 os.environ.setdefault("OMP_NUM_THREADS", "16")
 os.environ.setdefault("HF_HOME", "/scratch2/lorenhung/hf_cache")
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(ROOT, "src"))
-sys.path.insert(0, os.path.join(ROOT, "scripts"))
+sys.path.insert(0, os.path.join(ROOT, "src", "scripts"))
 import torch
 torch.set_num_threads(16)
-import ref_numerics as rn
-import accum_torch as at
+import reference.ref_numerics as rn
+import mxu.accum_torch as at
 from algos.granularity import scale_exp
 
 CKPT = "/scratch/agarcia05/TinyLlama-1.1B-Chat-v1.0"

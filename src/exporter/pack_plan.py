@@ -16,7 +16,7 @@ import collections
 import copy
 import re
 
-from tile_native import E8M0_BIAS, PACK_ADMISSION
+from exporter.tile_native import E8M0_BIAS, PACK_ADMISSION
 
 SCHEMA = "atlas_torchao.pack_plan.v1"
 UNIT_CODE = 127                       # the compiler's unit pack code, default fold target (pack-range-options.md 4.A)
@@ -91,7 +91,7 @@ def fold_exactness(x, s: int, k: int) -> dict:
     e4m3_vpack(x, s) == e4m3_vpack(bf16(x * 2^k), s + k) byte for byte and that bf16(x * 2^k) == x * 2^k in float32."""
     import torch
 
-    import ref_numerics as rn
+    import reference.ref_numerics as rn
 
     xb = x.to(torch.bfloat16)
     xs = (xb.to(torch.float32) * (2.0 ** k))

@@ -1,13 +1,14 @@
 """Compare the RTL results of AtlasTorchaoStimTest with atlas-torchao's models, bit for bit.
 
-    python scripts/rtl/compare_l1.py --stim stim.json --rtl rtl_out.json [--out result.json]
+    python src/scripts/rtl/compare_l1.py --stim stim.json --rtl rtl_out.json [--out result.json]
 """
 import argparse, json, sys
 from collections import defaultdict
 from pathlib import Path
 import torch
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
-import accum_torch as at, ref_numerics as rn
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
+import mxu.accum_torch as at
+import reference.ref_numerics as rn
 
 
 def main():

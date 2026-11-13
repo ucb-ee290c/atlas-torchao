@@ -5,10 +5,10 @@ cases that show the relaxed checks still fail on a graph that disagrees with the
 import json
 
 import algos
-import atlas_fx_ops  # noqa: F401
-import fx_export
+import exporter.atlas_fx_ops as atlas_fx_ops  # noqa: F401
+import exporter.fx_export as fx_export
 import pytest
-import quant_export
+import exporter.quant_export as quant_export
 import torch
 from test_ladder import FAST
 
@@ -216,7 +216,7 @@ class _Blocks(torch.nn.Module):
 
 
 def _attn_model(order):
-    import ref_attention as ra
+    import reference.ref_attention as ra
 
     torch.manual_seed(0)
     model = _Blocks(order).to(torch.bfloat16).eval()
@@ -263,7 +263,7 @@ def test_attention_site_called_zero_one_and_n_times(tmp_path, strict, order, cal
 def _attn_program(order):
     model, policy = _attn_model(order)
     case = (_ax(1),)
-    import ref_attention  # noqa: F401  (restored by _native_sites)
+    import reference.ref_attention as ref_attention  # noqa: F401  (restored by _native_sites)
     with fx_export._meta_placeholders(model), fx_export._native_sites(model, policy, "uint8") as plan:
         stats = fx_export._observe_acts(model, [case, (_ax(2),)])
         attn_calls, unused = fx_export._attention_calls(stats, plan["attention"])

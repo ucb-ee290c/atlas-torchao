@@ -5,7 +5,7 @@ import pytest
 import torch
 
 import algos
-import ref_numerics as rn
+import reference.ref_numerics as rn
 from algos import gptq_awq as ga
 from test_ladder import tiny_llama
 

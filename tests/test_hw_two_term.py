@@ -4,12 +4,12 @@ import torch
 import torch.nn as nn
 
 import algos
-import chip_ops
-import hw_cost
-import hw_params as hp
-import hw_two_term as tt
+import chip.chip_ops as chip_ops
+import chip.hw_cost as hw_cost
+import chip.hw_params as hp
+import chip.hw_two_term as tt
 import quant_modes
-import ref_numerics as rn
+import reference.ref_numerics as rn
 from algos.granularity import scale_exp
 
 VPU = chip_ops.ChipVPU()
@@ -211,7 +211,7 @@ def _bf16_attn(q, k, v, mask, scale):
 
 
 def test_attention_default_off_bit_identical():
-    import ref_attention as ra
+    import reference.ref_attention as ra
     q, k, v, mask = _qkv()
     a = ra.ref_attention(q, k, v, 0.2, mask)
     b = ra.ref_attention(q, k, v, 0.2, mask, two_term=None)
@@ -221,7 +221,7 @@ def test_attention_default_off_bit_identical():
 
 
 def test_attention_two_pass_by_hand():
-    import ref_attention as ra
+    import reference.ref_attention as ra
     q, k, v, mask = _qkv()
     sc = 0.2
     got = ra.ref_attention(q, k, v, sc, mask, two_term="qp")
@@ -251,7 +251,7 @@ def test_attention_two_pass_by_hand():
 
 @pytest.mark.parametrize("two", ["q", "qp"])
 def test_attention_two_term_error_lower_heavy_q(two):
-    import ref_attention as ra
+    import reference.ref_attention as ra
     q, k, v, mask = _qkv(seed=3)
     want = _bf16_attn(q, k, v, mask, 0.2)
     e = lambda t: float((ra.ref_attention(q, k, v, 0.2, mask, two_term=t).double() - want).norm() / want.norm())
@@ -267,7 +267,7 @@ def test_attention_apply_choices_and_llama_hook():
     base = None
     for opt, n_lin in (("attnq", 0), ("attn", 0), ("all+attn", 14)):
         model = tiny_llama(layers=2)
-        from ref_attention import patch_attention
+        from reference.ref_attention import patch_attention
         sites = patch_attention(model)
         assert len(sites) == 2
         algos.quantize(model, "reference", ["lm_head"], {}, algo=algos.make("granularity:w=channel,a=token,rule=nc"))
@@ -284,7 +284,7 @@ def test_attention_apply_choices_and_llama_hook():
 
 def test_attention_chip_smoke():
     from test_ladder import tiny_llama
-    from ref_attention import patch_attention
+    from reference.ref_attention import patch_attention
     ids = torch.randint(0, 128, (1, 24), generator=torch.Generator().manual_seed(0))
     model = tiny_llama(layers=1)
     algos.quantize(model, "chip", ["lm_head"], {"chip_mxu": "framework"},

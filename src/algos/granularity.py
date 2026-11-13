@@ -248,7 +248,7 @@ def _count_block_cast(rows: int, k: int) -> None:
     pre-vpack vmul: the vpack reads the block's scale register."""
     import sys
 
-    cp = sys.modules.get("chip_profile")
+    cp = sys.modules.get("chip.chip_profile")
     if cp is not None and hasattr(cp, "count_dynamic_scale_chain"):
         cp.count_dynamic_scale_chain(rows, k, "block")
 
@@ -260,7 +260,7 @@ def _count_tile_output(x: torch.Tensor, out_cols: int) -> None:
     otherwise (chip_profile.count_tile_output_rescale; assumption documented in docs/algos/tile-aware.md)."""
     import sys
 
-    cp = sys.modules.get("chip_profile")
+    cp = sys.modules.get("chip.chip_profile")
     if cp is not None and hasattr(cp, "count_tile_output_rescale") and out_cols:
         cp.count_tile_output_rescale(x.numel() // max(1, x.shape[-1]), out_cols)
 

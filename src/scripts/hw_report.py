@@ -1,6 +1,6 @@
 """Per-layer shape / DMA / MXU / flush report for an Atlas FP8 export, plus the pop-scale applicability table.
 
-    python scripts/hw_report.py [--export model.safetensors] [--T 1 32 128 2048] [--mxu ipt|sa]
+    python src/scripts/hw_report.py [--export model.safetensors] [--T 1 32 128 2048] [--mxu ipt|sa]
                                 [--out-json results/hw-verify/hw_report_tinyllama.json] [--out-md -]
 
 Reads the export's header and uint8 E4M3 code tensors (safetensors), policy.json and manifest.json beside
@@ -17,10 +17,10 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
-import hw_cost as hc  # noqa: E402
-import hw_params as hp  # noqa: E402
+import chip.hw_cost as hc  # noqa: E402
+import chip.hw_params as hp  # noqa: E402
 
 DEFAULT_EXPORT = ("/scratch2/lorenhung/atlas-fp8/handoff/atlas_v1/export_smoke/tinyllama/atlas_v1/"
                   "model.safetensors")
@@ -129,7 +129,7 @@ def build(args) -> dict:
                    "npu-model parameterized_matmul kernel stores B as [K,N] and therefore runs vtrpose.xlu "
                    "(66 cycles) per tile; the [N,K] export avoids it.",
         status="RTL read settles the IPT and SA lane orientation; how vload fills an mreg row from VMEM bytes is "
-               "settled by the npu-model simulator run (scripts/npu_model_l2.py, bit comparison) -- see that result.",
+               "settled by the npu-model simulator run (src/scripts/npu_model_l2.py, bit comparison) -- see that result.",
         dma_caveat="The export is row-major over the full K, so a tile is 32 pieces of 32 B at stride K, not one "
                    "contiguous 1 KiB. Headline cycles assume an offline tile-major re-layout (a permutation, no "
                    "transpose) so the DMA streams 4 KiB bursts; the as-stored cost (32 B transfers) is reported "

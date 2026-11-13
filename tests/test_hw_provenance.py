@@ -1,4 +1,4 @@
-"""The hardware-verification sidecar (scripts/hw_provenance.py): hashes, counts and scope."""
+"""The hardware-verification sidecar (src/scripts/hw_provenance.py): hashes, counts and scope."""
 import hashlib
 import json
 import os
@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "scripts"))
 
 import hw_provenance as hp  # noqa: E402
 

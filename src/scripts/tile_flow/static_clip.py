@@ -2,7 +2,7 @@
 E4M3 maximum at the stored static exponent (448 * 2^s, so the cast saturates) and the fraction flushed to zero (below 2^(s-6)).
 usage: static_clip.py MODEL_DIR EXPORT_DIR OUT_JSON SEQLEN BATCH"""
 import json, sys, torch
-import load_quantized
+import exporter.load_quantized as load_quantized
 model_dir, export, out, T, B = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5])
 from datasets import load_dataset
 from transformers import AutoTokenizer

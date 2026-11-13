@@ -1,7 +1,7 @@
 """L1b: the whole matrix unit (InnerProductTreesTop / SystolicArrayTop) against our models, bit for bit.
 
-The Verilator runs themselves (scripts/rtl/run_l1b.sh, which needs mill) are NOT started from here. This file
-  - validates checked-in small stimuli (scripts/rtl/data/l1b_tight_{ipt,sa}.*) against the RTL result stored next to
+The Verilator runs themselves (src/scripts/rtl/run_l1b.sh, which needs mill) are NOT started from here. This file
+  - validates checked-in small stimuli (src/scripts/rtl/data/l1b_tight_{ipt,sa}.*) against the RTL result stored next to
     them, with our models, and with npu-model's rtl_math chain when a checkout is present;
   - tests the comparer logic (a corrupted word must be caught; stray / duplicate MREG writes must be flagged);
   - checks the harness copy still wires the core like npu-model's (skips without the RTL clone) and that npu-model's
@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-RTL_DIR = ROOT / "scripts" / "rtl"
+RTL_DIR = ROOT / "src" / "scripts" / "rtl"
 DATA = RTL_DIR / "data"
 sys.path.insert(0, str(RTL_DIR))
 
@@ -27,7 +27,7 @@ import l1b_gen  # noqa: E402
 RTL_CLONE = Path(os.environ.get("ATLAS_NPU_RTL", "/scratch2/lorenhung/atlas-npu-rtl/src"))
 NPU_MODEL = Path(os.environ.get("NPU_MODEL", str(RTL_CLONE / "npu-model")))
 UNITS = [u for u in ("ipt", "sa") if (DATA / f"l1b_tight_{u}.meta.json").exists() and (DATA / f"l1b_tight_{u}.tiles.json").exists()]
-need_stored = pytest.mark.skipif(not UNITS, reason="no stored L1b stimulus/result in scripts/rtl/data")
+need_stored = pytest.mark.skipif(not UNITS, reason="no stored L1b stimulus/result in src/scripts/rtl/data")
 need_clone = pytest.mark.skipif(not (RTL_CLONE / "mill").exists() or not (NPU_MODEL / "npu_model" / "configs" / "rtl_math.py").exists(),
                                 reason="needs the atlas-npu RTL clone with mill and npu-model ($ATLAS_NPU_RTL, $NPU_MODEL)")
 

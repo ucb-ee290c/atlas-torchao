@@ -1,4 +1,4 @@
-"""Pack-scale plan (src/pack_plan.py, docs/algos/pack-plan.md): REPORTING ONLY. Unit tests on synthetic exponents and a synthetic
+"""Pack-scale plan (src/exporter/pack_plan.py, docs/algos/pack-plan.md): REPORTING ONLY. Unit tests on synthetic exponents and a synthetic
 FX graph text, bit-identical-export checks, and an end-to-end tiny Llama (static recipe, native-FP8 FX capture, verify_bundle)."""
 import importlib.util
 import json
@@ -7,16 +7,16 @@ from pathlib import Path
 import pytest
 import torch
 
-import atlas_fx_ops  # noqa: F401
-import fx_export
-import pack_plan as pp
-import quant_export
-import tile_native as tn
+import exporter.atlas_fx_ops as atlas_fx_ops  # noqa: F401
+import exporter.fx_export as fx_export
+import exporter.pack_plan as pp
+import exporter.quant_export as quant_export
+import exporter.tile_native as tn
 from refutil import need_refs
 from test_export import _quantize_export, _reload
 from test_ladder import FAST  # noqa: F401
 
-SCRIPTS = Path(__file__).resolve().parents[1] / "scripts" / "tile_flow"
+SCRIPTS = Path(__file__).resolve().parents[1] / "src" / "scripts" / "tile_flow"
 STATIC = "atlas_v1_awq_tile_static"
 INPUTS = [(torch.arange(8, dtype=torch.long).reshape(1, 8),),
           (torch.arange(8, 16, dtype=torch.long).reshape(1, 8),)]
@@ -149,7 +149,7 @@ def test_fold_is_bit_exact_and_clamping_alone_is_not(s, k):
     x = (torch.randn(64, 128) * (2.0 ** (s + 5))).to(torch.bfloat16)
     r = pp.fold_exactness(x, s, k)
     assert r["differing_bytes"] == 0 and r["scaling_exact_in_bf16"] is True and r["elements"] == x.numel()
-    import ref_numerics as rn
+    import reference.ref_numerics as rn
     moved_exp_only = rn.e4m3_vpack(x, torch.tensor(s + k, dtype=torch.int32))       # exponent clamped, value left alone
     assert int((rn.e4m3_vpack(x, torch.tensor(s, dtype=torch.int32)) != moved_exp_only).sum()) > 0
 

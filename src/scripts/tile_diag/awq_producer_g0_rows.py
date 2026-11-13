@@ -5,10 +5,10 @@ usage: awq_producer_g0_rows.py ALPHA_NEW   (s for the 'new' column = sx^ALPHA_NE
 import sys
 import torch
 from safetensors import safe_open
-sys.path.insert(0, __file__.rsplit("/scripts/", 1)[0] + "/scripts/tile_diag")
-sys.path.insert(0, __file__.rsplit("/scripts/", 1)[0] + "/src")
+sys.path.insert(0, __file__.rsplit("/src/scripts/", 1)[0] + "/src/scripts/tile_diag")
+sys.path.insert(0, __file__.rsplit("/src/scripts/", 1)[0] + "/src")
 import awq_producer_validate as v
-import ref_numerics as rn
+import reference.ref_numerics as rn
 from algos import gptq_awq as ga
 
 CTRL = "/scratch2/lorenhung/atlas-fp8/exports-tile-diag/pi0/awq_channel_cpu/export/model.safetensors"

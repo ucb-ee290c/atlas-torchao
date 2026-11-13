@@ -27,7 +27,7 @@ import torch.nn as nn
 
 import algos
 import quant_modes
-import tile_native
+import exporter.tile_native as tile_native
 from algos.base import Algo, Scale
 
 

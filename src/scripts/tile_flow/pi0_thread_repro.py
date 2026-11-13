@@ -1,6 +1,6 @@
 import sys, json, torch
 sys.path.insert(0, "src")
-import atlas_fx_ops  # noqa
+import exporter.atlas_fx_ops as atlas_fx_ops  # noqa
 from safetensors.torch import load_file
 B = "/scratch2/lorenhung/atlas-fp8/exports-tile/pi0/gptq_panel_static_noawq"
 n = int(sys.argv[1]); torch.set_num_threads(n)

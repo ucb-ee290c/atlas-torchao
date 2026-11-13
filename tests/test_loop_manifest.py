@@ -1,4 +1,4 @@
-"""scripts/tile_flow/make_loop_manifest.py: the numbers in loop_manifest.json come from the scheduler / source they describe.
+"""src/scripts/tile_flow/make_loop_manifest.py: the numbers in loop_manifest.json come from the scheduler / source they describe.
 The DDPM table is checked against diffusers' own DDPMScheduler.step for every timestep (and a perturbed table must fail the
 same check), the Pi0 float32 time recurrence against its step count for many step counts, the step-count reader against
 synthetic sources. The end-to-end DiT / Pi0 runs need the real bundles and skip when they are absent."""

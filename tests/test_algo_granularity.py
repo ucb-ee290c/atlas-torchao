@@ -224,7 +224,7 @@ def test_block_default_rows_and_scope():
 
 def test_block_runs_on_mxu_steps_and_chip_cost_below_per_token():
     need_refs()
-    import hw_scale
+    import chip.hw_scale as hw_scale
 
     for mode in ("reference_hw", "chip"):
         m0, m1 = tiny_llama(), tiny_llama()

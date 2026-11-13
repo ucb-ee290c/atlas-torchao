@@ -5,7 +5,7 @@ pi0-quant: its integer datapaths follow E4M3Mul, E4M3ProdAddBF16 and AnchorAccum
 its unary BF16 tables are exhaustive outputs of the RTL. This script feeds the same bits to both
 sides and counts disagreements. Every comparison is bit for bit (NaN compares as "both NaN").
 
-    python scripts/npu_model_crosscheck.py [--out result.json] [--npu-model DIR]
+    python src/scripts/npu_model_crosscheck.py [--out result.json] [--npu-model DIR]
 
 Needs torch, the pi0-quant submodule (third_party) and an npu-model checkout (default
 $NPU_MODEL or /scratch2/lorenhung/atlas-npu-rtl/src/npu-model). Only rtl_math.py is imported, by
@@ -23,11 +23,11 @@ from pathlib import Path
 
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
-import accum_torch as at  # noqa: E402
-import chip_ops as co  # noqa: E402
-import ref_numerics as rn  # noqa: E402
+import mxu.accum_torch as at  # noqa: E402
+import chip.chip_ops as co  # noqa: E402
+import reference.ref_numerics as rn  # noqa: E402
 
 DEFAULT_NPU_MODEL = "/scratch2/lorenhung/atlas-npu-rtl/src/npu-model"
 DEFAULT_EXPORT = "/scratch2/lorenhung/atlas-fp8/handoff/atlas_v1/export_smoke/tinyllama/atlas_v1/model.safetensors"

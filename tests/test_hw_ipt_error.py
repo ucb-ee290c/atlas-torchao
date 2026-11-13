@@ -1,11 +1,11 @@
-"""Synthetic checks for scripts/hw_ipt_error.py: float64 oracle vs the bit-exact IPT model."""
+"""Synthetic checks for src/scripts/hw_ipt_error.py: float64 oracle vs the bit-exact IPT model."""
 import os, sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src"))
-sys.path.insert(0, os.path.join(ROOT, "scripts"))
+sys.path.insert(0, os.path.join(ROOT, "src", "scripts"))
 import torch
-import accum_torch as at
-import ref_numerics as rn
+import mxu.accum_torch as at
+import reference.ref_numerics as rn
 import hw_ipt_error as h
 
 

@@ -12,7 +12,7 @@ ops is DECLARED, and reported in graph.allowed_non_atlas_contractions, when it i
   - a plain BF16 scaled_dot_product_attention whose module is NOT in or around any policy attention site (the
     ALLOWED_PLAIN_OPS allow-list). These are counted in graph.unquantized_attention, never hidden.
 Pack plan (informational): `pack_plan` in the result recomputes the per-site pack-scale plan from policy.json and
-fx/graph.txt (src/pack_plan.py, docs/algos/pack-plan.md) and compares it with the recorded `pack_plan_summary`; it never fails
+fx/graph.txt (src/exporter/pack_plan.py, docs/algos/pack-plan.md) and compares it with the recorded `pack_plan_summary`; it never fails
 a check. With --require-pack-range the check `pack_range_plan_present` fails when a static activation site is outside the
 admitted E8M0 range 122..128 and its recorded plan (fx/policy.json, else export/policy.json) is missing or infeasible.
 Everything else (a BF16 matmul / mm / bmm / Linear with a quantized or unknown weight, an SDPA inside a policy
@@ -26,8 +26,8 @@ from pathlib import Path
 import torch
 from safetensors import safe_open
 
-import atlas_fx_ops  # noqa: F401  registers atlas.* ops
-import pack_plan
+import exporter.atlas_fx_ops as atlas_fx_ops  # noqa: F401  registers atlas.* ops
+import exporter.pack_plan as pack_plan
 
 CONTRACT = ("aten.linear", "aten.matmul", "aten.mm", "aten.bmm", "aten.addmm", "aten.baddbmm", "aten.einsum",
             "aten.conv", "aten._convolution", "aten.dot", "aten.mv", "aten.scaled_dot_product", "aten._scaled_dot")
@@ -189,7 +189,7 @@ def pack_plan_report(policy, export, fx):
 
 
 def pack_fold_report(policy, plan_report):
-    """INFORMATIONAL (never a failing check): the pack fold recorded in the export policy (src/pack_fold.py) next to the sites
+    """INFORMATIONAL (never a failing check): the pack fold recorded in the export policy (src/exporter/pack_fold.py) next to the sites
     that are STILL outside the admitted range according to the recomputed plan, by producer class and plan cost."""
     rec = plan_report["recomputed"]
     out = {"informational": True, "folded": "pack_fold_summary" in policy,

@@ -22,8 +22,9 @@ import argparse, json, sys
 from collections import defaultdict
 from pathlib import Path
 import torch
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
-import chip_ops as co, ref_numerics as rn
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
+import chip.chip_ops as co
+import reference.ref_numerics as rn
 
 NPU_MODEL = "/scratch2/lorenhung/atlas-npu-rtl/src/npu-model"
 NAMES = ["add", "sub", "mul", "rcp", "sqrt", "sin", "cos", "tanh", "log", "exp", "exp2", "square", "cube", "rsum", "csum", "fp8",

@@ -3,8 +3,8 @@
 import pytest
 import torch
 
-import hw_scale as H
-import ref_numerics as rn
+import chip.hw_scale as H
+import reference.ref_numerics as rn
 from algos.granularity import scale_exp
 
 BITS = torch.arange(1 << 16, dtype=torch.int32)

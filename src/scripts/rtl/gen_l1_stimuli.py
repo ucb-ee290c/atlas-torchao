@@ -11,9 +11,10 @@ Groups (each case: 32 activation bytes, 32 weight bytes, a BF16 partial, an E8M0
 import argparse, json, sys
 from pathlib import Path
 import torch
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import accum_torch as at, ref_numerics as rn
+import mxu.accum_torch as at
+import reference.ref_numerics as rn
 import npu_model_crosscheck as xc
 
 

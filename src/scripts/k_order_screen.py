@@ -6,18 +6,18 @@ checkpoint). Channel importance = mean|x_k| over 2048 WikiText-2 TRAIN tokens (n
 tokens) x L2 norm of the weight column. For each order the K axis of both code matrices is permuted
 and the bit-exact IPT chain (and the SA chain, for reference) is compared with the float64 exact sum
 of the same FP8 products (identical for every order; asserted).
-Run: python -I scripts/k_order_screen.py   (CPU only)
+Run: python -I src/scripts/k_order_screen.py   (CPU only)
 """
 import os, sys, json
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 os.environ.setdefault("OMP_NUM_THREADS", "16")
 os.environ.setdefault("HF_HOME", "/scratch2/lorenhung/hf_cache")
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(ROOT, "src"))
-sys.path.insert(0, os.path.join(ROOT, "scripts"))
+sys.path.insert(0, os.path.join(ROOT, "src", "scripts"))
 import torch
 torch.set_num_threads(16)
-import accum_torch as at
+import mxu.accum_torch as at
 import hw_ipt_error as hw
 from algos.k_order import order_from_importance, perm_hash
 

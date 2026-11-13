@@ -19,7 +19,7 @@ from __future__ import annotations
 import math
 from dataclasses import asdict, dataclass
 
-import hw_params as hp
+import chip.hw_params as hp
 
 # ---- model dimensions (TinyLlama-1.1B-Chat config.json; dimensions are model facts, not hw constants)
 TINYLLAMA = dict(hidden_size=2048, intermediate_size=5632, num_attention_heads=32,
@@ -413,7 +413,7 @@ def classify_linears(graph: dict | None = None) -> dict:
 
 
 # ------------------------------------------------------------------------------------------------
-# Part 3: two-term FP8 activations (src/hw_two_term.py): the second MXU pass on the resident weight tile
+# Part 3: two-term FP8 activations (src/chip/hw_two_term.py): the second MXU pass on the resident weight tile
 # ------------------------------------------------------------------------------------------------
 # Extra VPU instructions per ACTIVATION tile (32 tokens x 32 K, formed once and shared by all N tiles) and per
 # OUTPUT tile (32 tokens x 32 channels). All elementwise ops cost VPU_TILE_ELEMENTWISE_CYCLES per BF16 tile and

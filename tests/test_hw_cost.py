@@ -1,4 +1,4 @@
-"""Tests for src/hw_cost.py: padding, DMA/MXU cycle formulas against hw_params, reuse threshold, flush stats,
+"""Tests for src/chip/hw_cost.py: padding, DMA/MXU cycle formulas against hw_params, reuse threshold, flush stats,
 and the pop-scale consumer classification on the traced TinyLlama decoder layer."""
 import math
 import os
@@ -9,8 +9,8 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-import hw_cost as hc  # noqa: E402
-import hw_params as hp  # noqa: E402
+import chip.hw_cost as hc  # noqa: E402
+import chip.hw_params as hp  # noqa: E402
 
 EXPORT = ("/scratch2/lorenhung/atlas-fp8/handoff/atlas_v1/export_smoke/tinyllama/atlas_v1/model.safetensors")
 

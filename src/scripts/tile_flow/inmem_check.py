@@ -2,9 +2,11 @@
 codes/exponents bytes and logits of the saved native FX graph. usage: inmem_check.py MODEL RECIPE EXPORT FX CALIB_N SEQLEN_CAL FXSEQ OUT"""
 import json, sys, torch
 from safetensors import safe_open
-import algos, atlas_fx_ops, fx_export  # noqa
+import algos  # noqa
+import exporter.atlas_fx_ops as atlas_fx_ops  # noqa: F401
+import exporter.fx_export as fx_export  # noqa
 from algos import calib as C
-from modelutils import load_llama
+from loaders.modelutils import load_llama
 model_id, recipe, export, fx, n, cal_seq, fx_seq, out = sys.argv[1:9]
 n, cal_seq, fx_seq = int(n), int(cal_seq), int(fx_seq)
 m = load_llama(model_id, seqlen=cal_seq, device="cpu")

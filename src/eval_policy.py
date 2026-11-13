@@ -479,7 +479,7 @@ def main():
                 break
         tt_rec = None
         if getattr(args, "act_two_term", "off") != "off":
-            import hw_two_term
+            import chip.hw_two_term as hw_two_term
 
             tt_rec = hw_two_term.apply(policy, mode, args.act_two_term)
         algo_rec = algos.entry_record(layers, mode, args.algo)

@@ -4,8 +4,8 @@ cancels exactly in this product (Dd[:,j]/s_j * s_j Du[j,:]), so no estimate of s
 nonlinearity (a proxy for the pair's error, not the layer's output error).
 usage: mlp_composite.py OUT.json EXPORT.safetensors:label ..."""
 import sys, json, torch
-sys.path.insert(0, "/scratch2/lorenhung/atlas-fp8/atlas-torchao-tile/src")
-import ref_numerics as rn
+sys.path.insert(0, __file__.rsplit("/src/scripts/", 1)[0] + "/src")
+import reference.ref_numerics as rn
 from safetensors import safe_open
 stock = safe_open("/scratch2/lorenhung/models/openpi-pytorch/pi0_droid_jointpos_polaris/model.safetensors", "pt")
 res = {}

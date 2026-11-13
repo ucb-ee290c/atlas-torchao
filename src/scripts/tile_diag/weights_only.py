@@ -6,8 +6,8 @@ effective row is dq_up * s_j and the down effective column is dq_down / s_j). Al
 within each 32-row group of the stock weight and of the dequantized weight, fraction of codes that decode to zero
 where the stock weight is nonzero, and the stock-weight fraction below the smallest e4m3 normal at that exponent."""
 import sys, json, re, torch
-sys.path.insert(0, "/scratch2/lorenhung/atlas-fp8/atlas-torchao-tile/src")
-import ref_numerics as rn
+sys.path.insert(0, __file__.rsplit("/src/scripts/", 1)[0] + "/src")
+import reference.ref_numerics as rn
 from safetensors import safe_open
 
 STOCK = "/scratch2/lorenhung/models/openpi-pytorch/pi0_droid_jointpos_polaris/model.safetensors"

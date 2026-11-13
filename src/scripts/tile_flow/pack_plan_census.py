@@ -1,5 +1,5 @@
 """Pack-plan census of existing tile static exports, READ-ONLY on the exports: recomputes the per-site pack plan from each
-bundle's export/policy.json and fx/graph.txt (+ fx/graph_signature.txt) with src/pack_plan.py and writes a JSON and a markdown
+bundle's export/policy.json and fx/graph.txt (+ fx/graph_signature.txt) with src/exporter/pack_plan.py and writes a JSON and a markdown
 table to the given output paths (never into the exports root). Compares with the research census
 (docs/algos/pack-range-options.md section 3 / 4.A) and prints every mismatch.
 usage: PYTHONPATH=src python pack_plan_census.py EXPORTS_ROOT OUT_JSON OUT_MD [OUT_MD ...]"""
@@ -7,7 +7,7 @@ import json
 import sys
 from pathlib import Path
 
-import pack_plan
+import exporter.pack_plan as pack_plan
 
 BUNDLE = "atlas_v1_awq_tile_static"
 MODELS = ("tinyllama", "smolvla", "multitask-dit", "pi0")

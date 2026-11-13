@@ -10,16 +10,16 @@ import torch
 import torch.nn as nn
 
 import algos
-import atlas_fx_ops  # noqa: F401
-import fx_export
-import load_quantized
-import quant_export
-import tile_native as tn
+import exporter.atlas_fx_ops as atlas_fx_ops  # noqa: F401
+import exporter.fx_export as fx_export
+import exporter.load_quantized as load_quantized
+import exporter.quant_export as quant_export
+import exporter.tile_native as tn
 from refutil import need_refs
 from test_export import _calib, _quantize_export, _reload
 from test_ladder import FAST, tiny_llama
 
-SCRIPTS = Path(__file__).resolve().parents[1] / "scripts" / "tile_flow"
+SCRIPTS = Path(__file__).resolve().parents[1] / "src" / "scripts" / "tile_flow"
 STATIC = "atlas_v1_awq_tile_static"
 INPUTS = [(torch.arange(8, dtype=torch.long).reshape(1, 8),),
           (torch.arange(8, 16, dtype=torch.long).reshape(1, 8),)]

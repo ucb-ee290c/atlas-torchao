@@ -1,6 +1,6 @@
 """atlas-torchao's Atlas numerics against npu-model's RTL-fitted numerics, bit for bit.
 
-The comparison code is scripts/npu_model_crosscheck.py (run it directly for a report). Skipped when
+The comparison code is src/scripts/npu_model_crosscheck.py (run it directly for a report). Skipped when
 no npu-model checkout is found ($NPU_MODEL, default /scratch2/lorenhung/atlas-npu-rtl/src/npu-model)
 or the pi0-quant submodule is missing.
 """
@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 import torch
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "scripts"))
 
 import npu_model_crosscheck as xc  # noqa: E402
 from refutil import need_refs  # noqa: E402
@@ -57,14 +57,14 @@ def test_vadd_truncation_and_minmax_match(R):
 
 @pytest.mark.parametrize("op", [o for o in xc.UNARY_NAMES if o not in ("sin", "cos")])
 def test_unary_tables_match_the_rtl_tables(R, op):
-    import chip_ops as co
+    import chip.chip_ops as co
     allv = xc.as_bf16(torch.arange(65536, dtype=torch.int32))
     clean([xc._result(op, co.unary_table(op), xc._bits16(R.unary(xc.UNARY_NAMES[op], allv)))])
 
 
 @pytest.mark.parametrize("op", ["sin", "cos"])
 def test_sincos_differ_only_where_the_input_saturates(R, op):
-    import chip_ops as co
+    import chip.chip_ops as co
     allv = xc.as_bf16(torch.arange(65536, dtype=torch.int32))
     ours = co.unary_table(op).to(torch.int64)
     theirs = xc._bits16(R.unary(op, allv)).to(torch.int64)

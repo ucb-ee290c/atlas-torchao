@@ -1,15 +1,15 @@
 """HW-D check: does a per-row weight exponent within +-2 of the nc rule beat nc on an H-weighted error?
 Error per row = tr(dW H dW^T) = ||X dW_row||^2 with X the captured layer input (H = X^T X).
-Run: python -I scripts/hw_exponent_check.py   (CPU only)"""
+Run: python -I src/scripts/hw_exponent_check.py   (CPU only)"""
 import os, sys, json
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 os.environ.setdefault("OMP_NUM_THREADS", "16")
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(ROOT, "src"))
-sys.path.insert(0, os.path.join(ROOT, "scripts"))
+sys.path.insert(0, os.path.join(ROOT, "src", "scripts"))
 import torch
 torch.set_num_threads(16)
-import ref_numerics as rn
+import reference.ref_numerics as rn
 from algos.granularity import scale_exp
 import hw_ipt_error as h
 

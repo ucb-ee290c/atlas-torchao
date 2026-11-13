@@ -15,8 +15,8 @@ CAPSCRIPT = "/scratch2/lorenhung/atlas-bringup/work/representative/capture_scrip
 ORIG = "/scratch2/lorenhung/atlas-bringup/work/asis-layers/pi0/capture/orig/"
 from safetensors import safe_open
 
-sys.path.insert(0, "/scratch2/lorenhung/atlas-fp8/atlas-torchao-tile/src")
-import ref_numerics as rn
+sys.path.insert(0, __file__.rsplit("/src/scripts/", 1)[0] + "/src")
+import reference.ref_numerics as rn
 spec = importlib.util.spec_from_file_location("cap_pi0_old", CAPSCRIPT); old = importlib.util.module_from_spec(spec); spec.loader.exec_module(old)
 import safetensors.torch
 from openpi.models_pytorch.pi0_pytorch import PI0Pytorch

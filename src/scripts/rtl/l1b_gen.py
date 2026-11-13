@@ -17,9 +17,10 @@ kn: mreg row r lane l holds W[n=l][k=r].
 import argparse, json, sys
 from pathlib import Path
 import torch
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import accum_torch as at, ref_numerics as rn
+import mxu.accum_torch as at
+import reference.ref_numerics as rn
 import npu_model_crosscheck as xc
 
 PUSH_W, PUSH_ACC_FP8, PUSH_ACC_BF16, POP_FP8, POP_BF16, MATMUL, MATMUL_ACC = range(7)

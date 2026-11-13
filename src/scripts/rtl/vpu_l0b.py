@@ -11,7 +11,7 @@ import argparse, json, sys
 from collections import defaultdict
 from pathlib import Path
 import torch
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import replay_vector_traces as RV
 

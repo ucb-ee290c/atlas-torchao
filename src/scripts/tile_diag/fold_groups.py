@@ -4,8 +4,8 @@ then report effective-weight errors vs stock for up and down, agreement of the t
 and (for up) the log2 range of row amax inside 32-row groups of the dequantized (quantized-basis) weight.
 usage: fold_groups.py OUT.json EXPORT.safetensors:label ..."""
 import sys, json, torch
-sys.path.insert(0, "/scratch2/lorenhung/atlas-fp8/atlas-torchao-tile/src")
-import ref_numerics as rn
+sys.path.insert(0, __file__.rsplit("/src/scripts/", 1)[0] + "/src")
+import reference.ref_numerics as rn
 from safetensors import safe_open
 stock = safe_open("/scratch2/lorenhung/models/openpi-pytorch/pi0_droid_jointpos_polaris/model.safetensors", "pt")
 out = sys.argv[1]; res = {}

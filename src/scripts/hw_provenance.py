@@ -1,6 +1,6 @@
 """Write a hardware-verification sidecar for an atlas_v1 export.
 
-    python scripts/hw_provenance.py --export DIR --rtl DIR --npu-model DIR \\
+    python src/scripts/hw_provenance.py --export DIR --rtl DIR --npu-model DIR \\
         --results results/hw-verify/l0.json results/hw-verify/l1.json [--out DIR/hw_verification.json]
 
 The sidecar ties "verified against the RTL" to specific things: the RTL and npu-model commits, the
@@ -43,9 +43,9 @@ def git_commit(repo) -> str | None:
 def summarize_result(path) -> dict:
     """{kind, sha256, comparisons, mismatches} of one verification result JSON (L0, L1 or L1b shape)."""
     data = json.loads(Path(path).read_text())
-    if "total_cases" in data:                                   # scripts/npu_model_crosscheck.py (L0)
+    if "total_cases" in data:                                   # src/scripts/npu_model_crosscheck.py (L0)
         kind, n, bad = "differential vs npu-model RTL-fitted numerics (L0)", data["total_cases"], data["total_mismatches"]
-    elif "total_comparisons" in data:                           # scripts/rtl/compare_l1.py (L1) and l1b
+    elif "total_comparisons" in data:                           # src/scripts/rtl/compare_l1.py (L1) and l1b
         kind, n, bad = "atlas-torchao stimuli through the RTL under Verilator", data["total_comparisons"], data["total_mismatches"]
     else:
         raise ValueError(f"{path}: not a recognized verification result")
@@ -74,7 +74,7 @@ def main() -> int:
     ap.add_argument("--export", required=True)
     ap.add_argument("--rtl", default="/scratch2/lorenhung/atlas-npu-rtl/src")
     ap.add_argument("--npu-model", default="/scratch2/lorenhung/atlas-npu-rtl/src/npu-model")
-    ap.add_argument("--torchao", default=str(Path(__file__).resolve().parents[1]))
+    ap.add_argument("--torchao", default=str(Path(__file__).resolve().parents[2]))
     ap.add_argument("--results", nargs="+", required=True)
     ap.add_argument("--out", default=None)
     args = ap.parse_args()

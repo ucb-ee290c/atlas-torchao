@@ -23,8 +23,8 @@ import os
 
 import torch
 
-import chip_ops
-import ref_numerics as rn
+import chip.chip_ops as chip_ops
+import reference.ref_numerics as rn
 from algos import base as algo_hooks
 
 CHOICES = ("off", "all", "down", "attnq", "attn", "all+attn", "all+attnq")
@@ -45,7 +45,7 @@ def add_args(ap) -> None:
 
 def _router():
     """The open chip router (chip profile, inside a model call), else None."""
-    cp = __import__("sys").modules.get("chip_profile")
+    cp = __import__("sys").modules.get("chip.chip_profile")
     return cp._RUNNING[-1] if cp is not None and cp._RUNNING else None
 
 
@@ -66,8 +66,8 @@ def _vop(a, b, sub):
             # sequence) gives; the default models the truncating vadd the RTL has today
             return ((a.float() - b.float()) if sub else (a.float() + b.float())).to(a.dtype)
         return _VPU.sub(a, b) if sub else _VPU.add(a, b)
-    import chip_coverage as cc
-    import chip_numerics
+    import chip.chip_coverage as cc
+    import chip.chip_numerics as chip_numerics
 
     with cc.guard():                       # explicit VPU call, not re-dispatched through the router
         if r.vadd is not None:

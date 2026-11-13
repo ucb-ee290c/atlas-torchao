@@ -26,7 +26,7 @@ from pathlib import Path
 import torch
 from torch.utils import _pytree
 
-import pack_plan
+import exporter.pack_plan as pack_plan
 
 SCHEMA = "atlas_torchao.fx_verification.v1"
 STORAGE_DTYPES = {"uint8": torch.uint8, "float8_e4m3fn": torch.float8_e4m3fn}
@@ -209,7 +209,7 @@ class ActStats:
         self.sites = {}
 
     def record(self, label, x, rule, codes, exp):
-        import tile_native as tn
+        import exporter.tile_native as tn
 
         e = self.sites.setdefault(label, {"calls": 0, "e8m0_code_min": None, "e8m0_code_max": None,
                                           "reserved_codes": 0, "flushed_fraction_sum": 0.0, "reduce": rule[1],
@@ -713,10 +713,10 @@ def _emulated_report(nodes, module, native_paths):
 
 def _tile_native_report(module, policy, native_paths, plan, act_stats):
     """Per-site `tile_native` (NEW): true when the weight exponent table and the activation / attention
-    operand exponents are constant along K at 32-granularity (src/tile_native.py), with the reasons for every
+    operand exponents are constant along K at 32-granularity (src/exporter/tile_native.py), with the reasons for every
     site that is not (per-channel or per-token recipes, block32 along K). `native_fp8` says whether the site
     is carried by atlas.qlinear / qconv2d / qk_matmul / pv_matmul in this graph."""
-    import tile_native as tn
+    import exporter.tile_native as tn
 
     rows, status = {}, {}
     for path, layer in module.named_modules():
@@ -765,7 +765,7 @@ def _pack_plan(program, policy):
 def _admission_report(policy, act_stats):
     """compiler_pack_scale_admission for graph_inspection.json: the policy's static exponents plus the
     dynamic exponents observed in the capture cases (INFORMATIONAL; nothing is clamped)."""
-    import tile_native as tn
+    import exporter.tile_native as tn
 
     rep = dict(policy.get("compiler_pack_scale_admission") or {})
     if act_stats:

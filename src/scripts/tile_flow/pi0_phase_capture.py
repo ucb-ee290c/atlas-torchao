@@ -76,9 +76,9 @@ class Pi0Step(torch.nn.Module):
 
 def load_pi0(export_dir, openpi_dir, checkpoint_dir, tokenizer_path, device="cpu"):
     import eval_pi0
-    import fx_export
-    import load_quantized
-    import pi0_model
+    import exporter.fx_export as fx_export
+    import exporter.load_quantized as load_quantized
+    import loaders.pi0_model as pi0_model
 
     # same driver-level workaround as the single-step bundle: SigLIP's patch embedding exports as aten.conv2d.padding
     fx_export.CONTRACTIONS[torch.ops.aten.conv2d.padding] = (0, 1)
@@ -133,9 +133,9 @@ def main(argv=None):
     ap.add_argument("--dry", action="store_true")
     a = ap.parse_args(argv)
     sys.path.insert(0, str(Path(a.single_step_bundle)))            # pi0_fx.py (only for --stack-cameras)
-    import fx_export
-    import load_quantized
-    import quant_export
+    import exporter.fx_export as fx_export
+    import exporter.load_quantized as load_quantized
+    import exporter.quant_export as quant_export
 
     export_dir, out = Path(a.export_dir), Path(a.out)
     _, policy_json, manifest = load_quantized.read_export(export_dir)

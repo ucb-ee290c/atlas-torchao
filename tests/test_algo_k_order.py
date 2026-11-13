@@ -4,9 +4,9 @@ import copy
 import pytest
 import torch
 
-import accum_torch as at
+import mxu.accum_torch as at
 import algos
-import ref_numerics as rn
+import reference.ref_numerics as rn
 from algos import k_order as ko
 from refutil import need_refs
 from test_algo_atlas_v1 import IDS, _calib

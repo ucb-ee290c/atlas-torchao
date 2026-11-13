@@ -2,8 +2,8 @@
 (same s_j, same calibration): the dequantized up rows (and down columns) approximate W/s_j (W*s_j) in both, so they are compared directly.
 usage: g0_dissect.py LAYER_PREFIX PANEL.safetensors CHANNEL.safetensors"""
 import sys, torch
-sys.path.insert(0, "/scratch2/lorenhung/atlas-fp8/atlas-torchao-tile/src")
-import ref_numerics as rn
+sys.path.insert(0, __file__.rsplit("/src/scripts/", 1)[0] + "/src")
+import reference.ref_numerics as rn
 from safetensors import safe_open
 b, T, C = sys.argv[1], safe_open(sys.argv[2], "pt"), safe_open(sys.argv[3], "pt")
 st = safe_open("/scratch2/lorenhung/models/openpi-pytorch/pi0_droid_jointpos_polaris/model.safetensors", "pt")

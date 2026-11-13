@@ -117,7 +117,7 @@ def test_pop_codec_delta(fp8):
 def test_scale_byte_is_clamped_like_the_rtl():
     """E8M0 byte 255 means +127 (VectorEngine.scala:247 clamps to [-128, 127]); shifts below -127 are not
     encodable in a byte. The pack and unpack clamp the shift the same way (found by the Verilator run)."""
-    import ref_numerics as rn
+    import reference.ref_numerics as rn
     x = torch.tensor([3.0, 100.0, 1.0e-3]).to(torch.bfloat16)
     assert torch.equal(rn.e4m3_vpack(x, 128), rn.e4m3_vpack(x, 127))
     assert torch.equal(rn.e4m3_vpack(x, -200), rn.e4m3_vpack(x, -127))

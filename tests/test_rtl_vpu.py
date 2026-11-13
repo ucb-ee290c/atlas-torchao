@@ -1,8 +1,8 @@
 """L0b: vector-unit gaps (vmul, vadd/vsub, vredsum.row, vredmax/vredmin.row, vredsum.bf16 column, vpack/vunpack).
 
-Verilator runs (scripts/rtl/run_vpu.sh, needs mill) are not started here. This file replays
+Verilator runs (src/scripts/rtl/run_vpu.sh, needs mill) are not started here. This file replays
   - npu-model's captured vector_traces.json through ChipVPU (needs the npu-model checkout and the pi0-quant refs);
-  - a stored subset of our own VectorEngineTop run (scripts/rtl/data/vpu_stored.json) through the comparer.
+  - a stored subset of our own VectorEngineTop run (src/scripts/rtl/data/vpu_stored.json) through the comparer.
 """
 import json
 import os
@@ -12,14 +12,14 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "scripts" / "rtl"))
+sys.path.insert(0, str(ROOT / "src" / "scripts" / "rtl"))
 sys.path.insert(0, str(ROOT / "tests"))
 
 import replay_vector_traces as rv  # noqa: E402
 import vpu_l0b  # noqa: E402
 
 NPU_MODEL = os.environ.get("NPU_MODEL", rv.NPU_MODEL)
-STORED = ROOT / "scripts" / "rtl" / "data" / "vpu_stored.json"
+STORED = ROOT / "src" / "scripts" / "rtl" / "data" / "vpu_stored.json"
 
 
 @pytest.mark.skipif(not (Path(NPU_MODEL) / "tests" / "rtl" / "vector_traces.json").exists(), reason="needs an npu-model checkout ($NPU_MODEL)")

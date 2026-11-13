@@ -8,8 +8,8 @@ Per SigLIP fc2 layer (stock weight [1152, 4304], out x in):
 With FC2_INPUTS.pt: fc2 input channels with exactly zero energy (diag H == 0, the test algos.gptq_awq.gptq uses to zero a weight column),
   and the layer-output rel error ||X (Wd - W)^T|| / ||X W^T|| on those real inputs and on Gaussian inputs."""
 import sys, json, math, torch
-sys.path.insert(0, "/scratch2/lorenhung/atlas-fp8/atlas-torchao-tile/src")
-import ref_numerics as rn
+sys.path.insert(0, __file__.rsplit("/src/scripts/", 1)[0] + "/src")
+import reference.ref_numerics as rn
 from algos.granularity import panel_scale_exp, scale_exp
 from algos.static_calib import bf16_abs_hist, sq_err, search, weight_exponent
 from safetensors import safe_open

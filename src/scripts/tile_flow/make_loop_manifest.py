@@ -213,7 +213,7 @@ def pi0_manifest(single_step_bundle, checkpoint_dir, openpi_dir, stack_cameras=F
     ckpt = json.loads(cfg_path.read_text())
     pi0_py = openpi / "src/openpi/models_pytorch/pi0_pytorch.py"
     default_steps, def_line = sample_actions_default_steps(pi0_py)
-    shim = Path(__file__).resolve().parents[2] / "src" / "pi0_model.py"
+    shim = Path(__file__).resolve().parents[3] / "src" / "loaders" / "pi0_model.py"
     shim_steps = {int(m) for m in re.findall(r"num_steps\s*=\s*(\d+)", shim.read_text())} | \
                  {int(m) for m in re.findall(r"predict\([^)]*,\s*(\d+)\)", (bundle / "pi0_fx.py").read_text())}
     if shim_steps != {default_steps}:

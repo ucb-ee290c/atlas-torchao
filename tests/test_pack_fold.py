@@ -1,4 +1,4 @@
-"""Pack fold (src/pack_fold.py, docs/algos/pack-fold.md): exactness on synthetic layers and a synthetic FX graph, k agreement
+"""Pack fold (src/exporter/pack_fold.py, docs/algos/pack-fold.md): exactness on synthetic layers and a synthetic FX graph, k agreement
 across shared-input groups, the BF16 range guard, negative cases (non-free classes, second consumers), the off-by-default
 contract, and an end-to-end tiny Llama (export, fold, FX capture, verify_bundle, bit-identical logits)."""
 import copy
@@ -10,17 +10,17 @@ from pathlib import Path
 import pytest
 import torch
 
-import atlas_fx_ops  # noqa: F401
-import fx_export
-import pack_fold as pf
-import pack_plan as pp
-import quant_export
-import tile_native as tn
+import exporter.atlas_fx_ops as atlas_fx_ops  # noqa: F401
+import exporter.fx_export as fx_export
+import exporter.pack_fold as pf
+import exporter.pack_plan as pp
+import exporter.quant_export as quant_export
+import exporter.tile_native as tn
 from refutil import need_refs
 from test_export import _quantize_export, _reload
 from test_ladder import FAST  # noqa: F401
 
-SCRIPTS = Path(__file__).resolve().parents[1] / "scripts" / "tile_flow"
+SCRIPTS = Path(__file__).resolve().parents[1] / "src" / "scripts" / "tile_flow"
 STATIC = "atlas_v1_awq_tile_static"
 INPUTS = [(torch.arange(8, dtype=torch.long).reshape(1, 8),),
           (torch.arange(8, 16, dtype=torch.long).reshape(1, 8),)]
@@ -412,7 +412,7 @@ def test_verify_bundle_passes_the_same_checks_and_reports_remaining_sites(tiny, 
 
 
 def test_manifest_hashes_are_recomputed_and_a_second_fold_is_refused(tiny):
-    import load_quantized
+    import exporter.load_quantized as load_quantized
     load_quantized.read_export(tiny.root / "exf", verify=True)                  # sha256 of both files match the manifest
     man = json.loads((tiny.root / "exf" / "manifest.json").read_text())
     assert man["pack_fold"]["source_policy_sha256"] != man["policy_sha256"] and man["pack_fold"]["tensors_changed"] > 0

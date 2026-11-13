@@ -1,7 +1,7 @@
 """Real-text E8M0 codes (127 + nc block exponent) of every Linear activation block of a dynamic a=block export, against 122..128.
 usage: dyn_admission.py MODEL_DIR EXPORT_DIR OUT_JSON SEQLEN BATCH"""
 import json, sys, torch
-import load_quantized
+import exporter.load_quantized as load_quantized
 from algos.granularity import row_group_scale_exp
 model_dir, export, out, T, B = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5])
 from datasets import load_dataset

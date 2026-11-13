@@ -117,7 +117,7 @@ def _mm_two_term(fm, x, x_q, x_s, b_q, b_s, algo, site, operand, dims):
     returns bf16 fm(x1, b) + fm(Q(r), b) (each pass carries its own 2^(sx+sb) rescale; BF16 vadd)."""
     if x_s is None:                     # attn_fisher(): clean operands (see _cast), no residual pass
         return _mm(fm, x_q, x_s, b_q, b_s).to(torch.bfloat16)
-    import hw_two_term as tt
+    import chip.hw_two_term as tt
 
     x1 = rn.dequantize(x_q, x_s).to(torch.bfloat16)
     r_q, r_s = _cast(algo, site, operand, tt.vsub(x, x1), dims)

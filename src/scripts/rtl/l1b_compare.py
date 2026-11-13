@@ -17,9 +17,9 @@ mreg d and lanes 16..31 to mreg d+1; PopAccFP8 writes the 32 bytes to mreg d. Mo
 import argparse, json, sys
 from pathlib import Path
 import torch
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import accum_torch as at
+import mxu.accum_torch as at
 import npu_model_crosscheck as xc
 
 

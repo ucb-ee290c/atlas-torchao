@@ -1,5 +1,5 @@
 """Multi-Task DiT's own attention blocks (lerobot RoPEAttention) as native FP8 attention sites
-(docs/algos/dit-own-attention.md): instance-forward replacement in src/ref_attention.py."""
+(docs/algos/dit-own-attention.md): instance-forward replacement in src/reference/ref_attention.py."""
 import copy
 import json
 
@@ -8,10 +8,10 @@ import torch
 import torch.nn as nn
 
 import algos
-import atlas_fx_ops  # noqa: F401
-import fx_export
-import quant_export
-import ref_attention as ra
+import exporter.atlas_fx_ops as atlas_fx_ops  # noqa: F401
+import exporter.fx_export as fx_export
+import exporter.quant_export as quant_export
+import reference.ref_attention as ra
 from algos import base as algo_hooks
 from test_ladder import FAST
 

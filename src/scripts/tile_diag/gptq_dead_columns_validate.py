@@ -3,9 +3,9 @@ usage: gptq_dead_columns_validate.py OUT.json [LAYER=23]   (FC2_INPUTS.pt from s
 H = x^T x of the captured fc2 inputs (float32, as algos.gptq_awq.calibrate), GPTQ at the panel-nc exponents (32 rows) of the stock weight,
 block=128, damp=0.01, actorder=True, as the export. Two calibration sets: the whole captured frame (in-sample) and image 0 only (image 1 held out)."""
 import json, sys, time, torch
-sys.path.insert(0, "/scratch2/lorenhung/atlas-fp8/atlas-torchao-tile/src")
-import ref_numerics as rn
-import tile_native as tn
+sys.path.insert(0, __file__.rsplit("/src/scripts/", 1)[0] + "/src")
+import reference.ref_numerics as rn
+import exporter.tile_native as tn
 from algos import gptq_awq as ga
 from algos.granularity import panel_scale_exp
 from safetensors import safe_open

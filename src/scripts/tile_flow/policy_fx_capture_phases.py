@@ -21,9 +21,9 @@ from pathlib import Path
 
 import torch
 
-import fx_export
-import load_quantized
-import quant_export
+import exporter.fx_export as fx_export
+import exporter.load_quantized as load_quantized
+import exporter.quant_export as quant_export
 
 OBS_NAMES = ["state", "images", "input_ids", "attention_mask"]
 

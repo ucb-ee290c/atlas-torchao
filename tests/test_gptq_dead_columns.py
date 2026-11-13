@@ -5,8 +5,8 @@ import pytest
 import torch
 
 import algos
-import ref_numerics as rn
-import tile_native as tn
+import reference.ref_numerics as rn
+import exporter.tile_native as tn
 from algos import gptq_awq as ga
 from algos.base import Scale
 from algos.granularity import panel_scale_exp

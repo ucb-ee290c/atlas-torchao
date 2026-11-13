@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import math
 
-from hw_params import (SCALE_BIAS, SELD_CYCLES, TILE, VPU_TILE_ELEMENTWISE_CYCLES, VREDMAX_ROW_CYCLES,
+from chip.hw_params import (SCALE_BIAS, SELD_CYCLES, TILE, VPU_TILE_ELEMENTWISE_CYCLES, VREDMAX_ROW_CYCLES,
                        VSTORE_CYCLES, VTRPOSE_CYCLES)
 
 MASK32 = 0xFFFFFFFF

@@ -32,8 +32,8 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-import pack_plan
-import tile_native
+import exporter.pack_plan as pack_plan
+import exporter.tile_native as tile_native
 
 POLICY_SCHEMA = "atlas_torchao.execution_policy.v1"        # NEW
 MANIFEST_SCHEMA = "atlas_torchao.export_manifest.v1"       # NEW
@@ -786,11 +786,11 @@ def export(model: nn.Module, export_dir, *, mode: str, report: dict, algo, algo_
 
 
 def _pack_fold_in_place(out: Path, model, policy: dict, graph_dir) -> dict:
-    """--pack-fold: replace the export in `out` by its folded twin (src/pack_fold.py); the unfolded export stays in
+    """--pack-fold: replace the export in `out` by its folded twin (src/exporter/pack_fold.py); the unfolded export stays in
     <out>.unfolded. The producer classes come from an FX capture of the unfolded export."""
     import os
 
-    import pack_fold
+    import exporter.pack_fold as pack_fold
 
     if graph_dir:
         graph, sig = (Path(graph_dir) / "graph.txt").read_text(), (Path(graph_dir) / "graph_signature.txt").read_text()

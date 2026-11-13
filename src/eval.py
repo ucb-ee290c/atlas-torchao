@@ -193,7 +193,7 @@ def main():
             if args.export_only:
                 break
         if getattr(args, "act_two_term", "off") != "off":
-            import hw_two_term
+            import chip.hw_two_term as hw_two_term
 
             rec = hw_two_term.apply(model, mode, args.act_two_term)
             if rec is not None:
