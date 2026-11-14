@@ -593,6 +593,25 @@ def softmax_mask_forms(graph):
     return rows
 
 
+def drop_dead_pure_nodes(program):
+    """Remove call_function nodes that have no users and no side effect (Node.is_impure() False), repeatedly, from a
+    captured program; returns the removed node names. Used when a boundary's host inputs leave a computation unread
+    (the expert's position - min with host RoPE tables): torch.export keeps it and the backend frontend cannot bind
+    an op whose result nothing consumes. Values that reach an output are untouched."""
+    removed = []
+    changed = True
+    while changed:
+        changed = False
+        for node in reversed(list(program.graph.nodes)):
+            if node.op == "call_function" and not node.users and not node.is_impure():
+                removed.append(node.name)
+                program.graph.erase_node(node)
+                changed = True
+    if removed:
+        program.graph_module.recompile()
+    return removed
+
+
 def graph_shape_census(graph):
     """{"dynamic_nodes": [names of nodes whose value has a symbolic (data-dependent or dynamic) dimension],
     "cumsum_nodes": [...]}."""
@@ -1671,6 +1690,8 @@ def capture_fx(module, cases, directory, *, policy, provenance=None, strict=True
             if _without(_inventory(program.named_buffers(), STORAGE_DTYPES[native_fp8] if native_fp8 else torch.uint8),
                         unused) != before:
                 raise FXVerificationError("capture changed code/exponent buffers")
+            if getattr(module, "host_rope", False):
+                report["dead_pure_nodes_removed"] = drop_dead_pure_nodes(program)
             graph_report = inspect_graph(program, module, policy, plan if native_fp8 else None,
                                          native_fp8 or "uint8", unused=unused, act_stats=act_stats, calls=calls,
                                          attn_calls=attn_calls if native_fp8 else None,
