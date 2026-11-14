@@ -50,19 +50,27 @@ import loaders.ckpt_keys as ckpt_keys
 import loaders.policy_norm as policy_norm
 from quant_modes import (ALL_MODES, add_profile_args, add_subset_compare_arg, finalize_report, ladder_deltas,
                          ladder_record, quantize, require_mode_supported, subset_compare_modes)
+import quant_modes
 
 
 
-def load_policy(path, device, dtype):
+def load_policy(path, device, dtype, no_compile=False):
     from lerobot.configs.policies import PreTrainedConfig
     from lerobot.policies.factory import get_policy_class
 
     cfg = PreTrainedConfig.from_pretrained(path)
     cfg.device = device
+    if no_compile and getattr(cfg, "compile_model", False):
+        cfg.compile_model = False   # --no-compile: eager (lerobot Pi0 checkpoints ship compile_model=true)
     policy = get_policy_class(cfg.type).from_pretrained(path, config=cfg)
     # NEW: a non-strict load leaves keys a newer library nests one level deeper (e.g. the DiT's
     # fine-tuned CLIP) at the constructor's weights; repair the nesting or refuse (src/loaders/ckpt_keys.py).
-    key_repair = ckpt_keys.repair_checkpoint_keys(policy, path)
+    if cfg.type in ("pi0", "pi05"):
+        # lerobot's PI0Policy.from_pretrained remaps the checkpoint keys itself and loads strict=True;
+        # the raw-key comparison below would misread its SigLIP `vision_model.` nesting as missing keys.
+        key_repair = {"n_remapped": 0, "rules": [], "skipped": "pi0 from_pretrained loads strict after its own remap"}
+    else:
+        key_repair = ckpt_keys.repair_checkpoint_keys(policy, path)
     policy = policy.to(device=device, dtype=dtype).eval()
     policy.checkpoint_key_repair = key_repair
     # lerobot's SmolVLA integrates the flow in float32: the action expert output is cast to float32
@@ -117,6 +125,8 @@ def build_processors(cfg, args, rename, norm_stats=None):
     pre = {"device_processor": {"device": args.device, "float_dtype": args.dtype},
            "rename_observations_processor": {"rename_map": rename}}
     post = {"device_processor": {"device": "cpu"}}
+    if getattr(args, "tokenizer_name", None):
+        pre["tokenizer_processor"] = {"tokenizer_name": args.tokenizer_name}
     if norm_stats is not None:
         npre, npost = policy_norm.overrides(cfg, norm_stats)
         pre, post = policy_norm.merge_overrides(pre, npre), policy_norm.merge_overrides(post, npost)
@@ -368,6 +378,10 @@ def build_parser():
                     help="torch.use_deterministic_algorithms(True), cuDNN deterministic, cuBLAS "
                          "workspace config")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--tokenizer-name", default=None,
+                    help="override the saved tokenizer_processor's tokenizer (e.g. a local PaliGemma copy)")
+    ap.add_argument("--no-compile", action="store_true",
+                    help="set compile_model=False on the policy config (run eager)")
     policy_norm.add_args(ap)
     add_profile_args(ap)
     add_subset_compare_arg(ap)
@@ -442,8 +456,14 @@ def main():
     clean = None
     calib_cache = []
     rmse_dir = Path(args.rmse_dir) if args.rmse_dir else Path(args.out).with_name(Path(args.out).stem + "_rmse")
-    for mode in args.modes:
-        policy, cfg = load_policy(args.policy, args.device, dtype)
+    kept = None          # (policy, cfg, layers, algo_rec) of ref_conv, kept for a following native_fp8 (NEW)
+    for i_mode, mode in enumerate(args.modes):
+        shared = kept is not None and quant_modes.can_share_native(args.modes, i_mode)
+        if shared:
+            policy, cfg, ref_layers, ref_algo_rec = kept
+        else:
+            policy, cfg = load_policy(args.policy, args.device, dtype, args.no_compile)
+        kept = None
         result["provenance"].setdefault("checkpoint_key_repair", policy.checkpoint_key_repair)
         preprocess, postprocess = build_processors(cfg, args, rename, norm_stats)
         require_guarded_normalization(mode, cfg, preprocess, postprocess, norm)
@@ -451,7 +471,10 @@ def main():
             result["data"] = {"dataset": args.dataset, "test_episodes": test_eps,
                               "frames": len(idx), "fps": meta.fps}
         calib = _calib_loader(calib_cache, args, cfg, preprocess, norm)
-        if args.from_export and mode != "bf16":
+        if shared:
+            # NEW: the same quantized model (codes, exponents, calibration) with the FP8 kernels switched in
+            layers = quant_modes.share_native(policy, ref_layers, args)
+        elif args.from_export and mode != "bf16":
             import exporter.load_quantized as load_quantized
 
             # no calibration; every exported tensor overwrites the checkpoint's (docs/algos/export.md)
@@ -482,7 +505,8 @@ def main():
             import chip.hw_two_term as hw_two_term
 
             tt_rec = hw_two_term.apply(policy, mode, args.act_two_term)
-        algo_rec = algos.entry_record(layers, mode, args.algo)
+        algo_rec = ({**ref_algo_rec, "shared_from_mode": quant_modes.SHARED_NATIVE_FROM} if shared
+                    else algos.entry_record(layers, mode, args.algo))
         eq = layers["ladder"].get("equivalent_to") if layers is not None else None
         if eq in result["modes"]:
             # the op class this step adds is absent from the model: same model, same numbers
@@ -497,7 +521,7 @@ def main():
             import layer_rmse
 
             if clean is None:
-                clean, _ = load_policy(args.policy, args.device, dtype)
+                clean, _ = load_policy(args.policy, args.device, dtype, args.no_compile)
             rm = layer_rmse.LayerRMSE(clean, policy)
 
             def before(batch, frame_seed):
@@ -535,6 +559,8 @@ def main():
             entry["vs_bf16"] = agreement(preds, ref)
         result["modes"][mode] = entry
         print(mode, json.dumps(entry, default=str)[:400], flush=True)
+        if quant_modes.can_share_native(args.modes, i_mode + 1) and not args.export_only:
+            kept = (policy, cfg, layers, algo_rec)
         del policy
         if args.device.startswith("cuda"):
             torch.cuda.empty_cache()

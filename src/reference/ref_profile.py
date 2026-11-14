@@ -23,6 +23,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import algos
+import reference.native_fp8 as native_fp8
 import reference.ref_numerics as rn
 from algos import base as algo_hooks
 
@@ -59,10 +60,11 @@ class RefQuantLinear(nn.Module):
             w_q, s_w, self.weight_block = algo_hooks.weight_cast(self.algo, name, self.weight.detach(), "linear")
         self.register_buffer("weight_codes", w_q, persistent=False)
         self.register_buffer("weight_scale_exp", s_w, persistent=False)
+        self.native = native_fp8.is_native(fm)   # NEW native_fp8: fm is the FP8 kernel, fed codes
         if fm is not None and self.weight_block:
             raise NotImplementedError(f"{name}: per-block weight scales under an MXU accumulation model "
-                                      "need per-block partial sums; not defined in algo/base")
-        if fm is not None:
+                                      "(or native_fp8) need per-block partial sums; not defined in algo/base")
+        if fm is not None and not self.native:
             # Persistent normalized weight: exact E4M3 values at scale 1 (quant_linear.py:161-162).
             # Kept as one tensor so the reference models' weight cache stays valid across calls.
             self.register_buffer("weight_norm", rn.e4m3_unpack(w_q), persistent=False)
@@ -84,7 +86,7 @@ class RefQuantLinear(nn.Module):
             q2, s2 = rn.quantize(w_r)
         self.register_buffer("weight_lo_codes", q2, persistent=False)
         self.register_buffer("weight_lo_scale_exp", s2, persistent=False)
-        if fm is not None:
+        if fm is not None and not native_fp8.is_native(fm):
             self.register_buffer("weight_lo_norm", rn.e4m3_unpack(q2), persistent=False)
         self.algo.note("weight", f"linear:residual_{self.residual}", self.layer_name)
 
@@ -152,6 +154,9 @@ class RefQuantLinear(nn.Module):
         if self.algo is not None:
             return self._forward_algo(x, dtype)
         x_q, s_x = rn.quantize(x)                                   # quant_linear.py:153
+        if native_fp8.is_native(self.fm):
+            y = self.fm.linear(x_q, s_x, self.weight_codes, self.weight_scale_exp, dtype, self.layer_name)
+            return y if self.bias is None else y + self.bias
         if self.fm is not None:
             x_norm = rn.e4m3_unpack(x_q)                            # quant_linear.py:161
             y_unscaled = self.fm(x_norm, self.weight_norm, None, static=True)   # quant_linear.py:166
@@ -172,7 +177,11 @@ class RefQuantLinear(nn.Module):
         x_q, s_x, blk = algo_hooks.act_cast(self.algo, self.layer_name, x, "linear")
         if self.residual:
             return self._forward_residual(x, x_q, s_x, blk, dtype)
-        if self.fm is not None:
+        if native_fp8.is_native(self.fm):
+            if blk:
+                raise NotImplementedError(f"{self.layer_name}: per-K-block activation scales under native_fp8")
+            y = self.fm.linear(x_q, s_x, self.weight_codes, self.weight_scale_exp, dtype, self.layer_name)
+        elif self.fm is not None:
             if blk:
                 raise NotImplementedError(f"{self.layer_name}: per-block activation scales under an "
                                           "MXU accumulation model are not defined in algo/base")
@@ -193,6 +202,8 @@ class RefQuantLinear(nn.Module):
         per-channel exponent table (e.g. granularity) broadcasts to [..., out] and its table is
         built under the chip guard (the algorithm counts the extra vmuls; the multiply itself is
         counted by the router like any other pass)."""
+        if native_fp8.is_native(self.fm):
+            return self.fm.linear(x_q, s_x, w_q, s_w, dtype, self.layer_name)
         if self.fm is not None:
             y = self.fm(rn.e4m3_unpack(x_q), w_norm, None, static=True)
             return (y * algo_hooks.output_scale(s_x, s_w)).to(dtype=dtype, device=device)
@@ -221,7 +232,7 @@ class RefQuantLinear(nn.Module):
         s_w = int(s_w) if s_w.numel() == 1 else f"{tuple(s_w.shape)}"
         return (f"in_features={self.in_features}, out_features={self.out_features}, "
                 f"weight_scale_exp={s_w}, "
-                f"profile={'reference' if self.fm is None else 'reference_hw'}")
+                f"profile={'reference' if self.fm is None else 'native_fp8' if native_fp8.is_native(self.fm) else 'reference_hw'}")
 
 
 def quantize_reference(model: nn.Module, skip=(), fm_factory=None) -> dict:

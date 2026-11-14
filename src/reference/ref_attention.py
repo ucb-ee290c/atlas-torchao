@@ -41,6 +41,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import algos
+import reference.native_fp8 as native_fp8
 import reference.ref_numerics as rn
 from algos import base as algo_hooks
 
@@ -48,6 +49,7 @@ ATTN_KEY = "atlas_ref"
 _PROF = None
 _PROF_TAG = ""        # suffix of the attn_fisher key (the SmolVLA route runs every layer through one site)
 _LAYER_CTRS: list = []  # cfg dicts holding a per-forward layer counter "_i" (SmolVLA text / expert route)
+_SITE = ""            # the ref_attention site being computed (native_fp8 keys its kernel counts by it)
 
 
 def new_forward() -> None:
@@ -76,6 +78,9 @@ def _mm(fm, a_q, a_s, b_q, b_s, dtype_out=torch.float32, role=None, pop_shift=0)
     if a_s is None: 
         y = torch.matmul(a_q, b_q.transpose(-1, -2).to(a_q.dtype)).to(dtype_out)
         return y if not pop_shift else y * (2.0 ** int(pop_shift))
+    if native_fp8.is_native(fm):
+        # NEW (native_fp8): the same codes on the FP8 tensor cores, float32 out, x 2^(sa+sb+pop_shift)
+        return fm.attention(a_q, a_s, b_q, b_s, int(pop_shift), f"{_SITE}:{role}", role or "attention")
     if fm is not None:
         y = fm(rn.e4m3_unpack(a_q), rn.e4m3_unpack(b_q), None)
         if pop_shift:
@@ -137,6 +142,8 @@ def ref_attention(q, k, v, scaling, mask=None, fm_qk=None, fm_av=None, variant="
     two_term (NEW, opt-in, hw_two_term): None (default, unchanged), "q" (S = fm(Q1,K) + fm(Q2,K)) or
     "qp" (also O = fm(P1,V) + fm(P2,V)); K and V stay single-term.
     """
+    global _SITE
+    _SITE = site
     q, k, v = q.to(torch.bfloat16), k.to(torch.bfloat16), v.to(torch.bfloat16)    # 649-651, 815-817
     hd = (-2, -1)
     q_q, s_q = _cast(algo, site, "q", q, hd)
@@ -478,10 +485,10 @@ class RefQuantConv2d(nn.Module):
                 self.algo, name, self.weight.detach().reshape(self.out_channels, -1), "conv2d")   # 357, 362
         if self.weight_block and fm is not None:
             raise NotImplementedError(f"{name}: per-block weight scales under an MXU accumulation model "
-                                      "are not defined in algo/base")
+                                      "or native_fp8 are not defined in algo/base")
         self.register_buffer("weight_codes", w_q, persistent=False)
         self.register_buffer("weight_scale_exp", s_w, persistent=False)
-        if fm is not None:
+        if fm is not None and not native_fp8.is_native(fm):
             self.register_buffer("weight_norm", rn.e4m3_unpack(w_q), persistent=False)
 
     def forward(self, x):
@@ -494,6 +501,9 @@ class RefQuantConv2d(nn.Module):
         x_flat = cols.permute(0, 2, 1).reshape(B * oh * ow, -1).to(w.dtype)         # 356
         if self.algo is not None:
             y = self._mm_algo(x_flat, w)
+        elif native_fp8.is_native(self.fm):
+            x_q, s_x = rn.quantize(x_flat)                                          # 361
+            y = self.fm.linear(x_q, s_x, self.weight_codes, self.weight_scale_exp, w.dtype, self.layer_name, "conv2d")
         elif self.fm is not None:
             x_q, s_x = rn.quantize(x_flat)                                          # 361
             y = self.fm(rn.e4m3_unpack(x_q), self.weight_norm, None, static=True)    # 369
@@ -510,6 +520,11 @@ class RefQuantConv2d(nn.Module):
     def _mm_algo(self, x_flat, w):
         """The matmul of forward with the algorithm's activation hooks (c, d online)."""
         x_q, s_x, blk = algo_hooks.act_cast(self.algo, self.layer_name, x_flat, "conv2d")
+        if native_fp8.is_native(self.fm):
+            if blk or self.weight_block:
+                raise NotImplementedError(f"{self.layer_name}: per-K-block scales under native_fp8")
+            return self.fm.linear(x_q, s_x, self.weight_codes, self.weight_scale_exp, w.dtype, self.layer_name,
+                                  "conv2d")
         if self.fm is not None:
             if blk:
                 raise NotImplementedError(f"{self.layer_name}: per-block activation scales under an "
