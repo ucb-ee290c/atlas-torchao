@@ -380,6 +380,102 @@ def _smolvla_additive_attention_mask(module):
                 mod.forward = previous
 
 
+VISION_EMBEDDINGS = ("SmolVLMVisionEmbeddings", "Idefics3VisionEmbeddings")
+
+
+def _vision_position_ids(embeddings):
+    """The position ids the embeddings module's own forward gives a full-size image with an all-true patch mask
+    (num_patches_per_side patches per side): run eagerly on a zero image, read at the position_embedding call."""
+    n, p = embeddings.num_patches_per_side, embeddings.patch_size
+    weight = embeddings.position_embedding.weight
+    seen = []
+    hook = embeddings.position_embedding.register_forward_pre_hook(lambda m, args: seen.append(args[0].clone()))
+    try:
+        with torch.no_grad():
+            embeddings.forward(torch.zeros(1, embeddings.patch_embedding.weight.shape[1], n * p, n * p,
+                                           dtype=embeddings.patch_embedding.weight.dtype, device=weight.device),
+                               torch.ones(1, n, n, dtype=torch.bool, device=weight.device))
+    finally:
+        hook.remove()
+    if len(seen) != 1:
+        raise FXVerificationError(f"vision embeddings: position_embedding called {len(seen)} times")
+    return seen[0]
+
+
+@contextlib.contextmanager
+def _static_vision_position_ids(module):
+    """For the capture only: the SmolVLM (Idefics3-style) vision embeddings at full image size take the static path.
+    Their forward builds position ids from the patch attention mask (bucketized fractional coordinates, then a
+    boolean-mask index_put), which torch.export records with a data-dependent size (tensor<?xi64>). SmolVLA's
+    embed_image passes no patch mask, so the vision transformer uses an all-true one, and at
+    num_patches_per_side patches per side the ids are 0 .. n*n - 1 in row-major order.
+
+    Checked, not assumed: before the capture each such module's own forward is run eagerly on a full-size image with
+    an all-true mask and its ids must equal arange(n*n). The capture-time forward then computes
+    patch_embedding(x).flatten(2).transpose(1, 2) + position_embedding(arange(n*n)[None].expand(B, -1)), the same
+    operations on the same ids, and on every concrete (eager) call it asserts the patch mask it was given is all
+    true. Any other input size, or a mask of another shape, runs the original forward (and the capture's
+    static-shape check then fails closed). Restored afterwards. Yields the module paths converted."""
+    import types
+
+    patched = []
+    try:
+        for path, mod in module.named_modules():
+            if type(mod).__name__ not in VISION_EMBEDDINGS:
+                continue
+            n = mod.num_patches_per_side
+            ids = _vision_position_ids(mod)
+            static = torch.arange(n * n, device=ids.device)
+            if not (ids.dtype == torch.int64 and ids.shape == (1, n * n) and torch.equal(ids[0], static)):
+                raise FXVerificationError(f"{path}: full-size vision position ids are not arange({n * n})")
+            original = mod.forward
+
+            def forward(self, pixel_values, patch_attention_mask, _original=original, _path=path):
+                batch, _, height, width = pixel_values.shape
+                side = self.num_patches_per_side
+                if ((height // self.patch_size, width // self.patch_size) != (side, side)
+                        or tuple(patch_attention_mask.shape) != (batch, side, side)):
+                    return _original(pixel_values, patch_attention_mask)
+                if not (torch.compiler.is_compiling() or torch.compiler.is_exporting()):
+                    if not bool(patch_attention_mask.all()):
+                        raise FXVerificationError(f"{_path}: the patch attention mask is not all true")
+                embeddings = self.patch_embedding(pixel_values).flatten(2).transpose(1, 2)
+                position_ids = torch.arange(side * side, device=pixel_values.device)[None].expand(batch, -1)
+                return embeddings + self.position_embedding(position_ids)
+
+            patched.append((mod, mod.__dict__.get("forward"), path))
+            mod.forward = types.MethodType(forward, mod)
+        yield [p[2] for p in patched]
+    finally:
+        for mod, previous, _ in patched:
+            if previous is None:
+                del mod.forward
+            else:
+                mod.forward = previous
+
+
+def smolvla_attention_inputs(pad_masks, att_masks, keep_self_for_padded=False):
+    """Host-side attention inputs of SmolVLA's text / expert layers, computed as VLAFlowMatching.forward does in its
+    graph: the boolean keep mask make_att_2d_masks(pad_masks, att_masks) (lerobot's own function) as the additive BF16
+    mask additive_attention_mask(keep), [B, S, S] (the layers slice dims 1 and 2), and the position ids
+    cumsum(pad_masks, dim=1) - 1, int64 [B, S]. Passing both as boundary inputs (as TinyLlama's layer boundary
+    passes its mask) leaves no cumsum in the graph.
+
+    keep_self_for_padded: also keep the diagonal entry of every padded query row (pad_masks False), so that no row
+    is fully masked. Off by default; see tests/test_smolvla_host_inputs.py for when it is exact.
+    Returns (mask, position_ids, keep)."""
+    from lerobot.policies.common.vla_utils import make_att_2d_masks
+
+    keep = make_att_2d_masks(pad_masks, att_masks)
+    if keep_self_for_padded:
+        eye = torch.eye(keep.shape[-1], dtype=torch.bool, device=keep.device)
+        keep = keep | (eye & ~pad_masks.bool()[:, :, None])
+        if not bool(keep.any(-1).all()):
+            raise ValueError("a query row keeps no entry")
+    position_ids = torch.cumsum(pad_masks, dim=1) - 1
+    return additive_attention_mask(keep).contiguous(), position_ids.contiguous(), keep
+
+
 _MASK_VIEWS = {torch.ops.aten.slice.Tensor, torch.ops.aten.unsqueeze.default, torch.ops.aten.expand.default,
                torch.ops.aten.view.default, torch.ops.aten.reshape.default, torch.ops.aten.alias.default}
 _SOFTMAX = {torch.ops.aten.softmax.int, torch.ops.aten._softmax.default}
@@ -427,6 +523,21 @@ def softmax_mask_forms(graph):
             row["form"] = "unmasked"
         rows.append(row)
     return rows
+
+
+def graph_shape_census(graph):
+    """{"dynamic_nodes": [names of nodes whose value has a symbolic (data-dependent or dynamic) dimension],
+    "cumsum_nodes": [...]}."""
+    dynamic, cumsum = [], []
+    for node in graph.nodes:
+        values = node.meta.get("val")
+        values = values if isinstance(values, (tuple, list)) else [values]
+        if any(isinstance(v, torch.Tensor) and not all(isinstance(d, int) for d in v.shape) for v in values) or \
+                isinstance(node.meta.get("val"), torch.SymInt):
+            dynamic.append(node.name)
+        if node.op == "call_function" and node.target == torch.ops.aten.cumsum.default:
+            cumsum.append(node.name)
+    return {"dynamic_nodes": dynamic, "cumsum_nodes": cumsum}
 
 
 def _scope(node):
@@ -627,23 +738,40 @@ def native_attention(module, policy):
 
 
 REFERENCE_OPERAND = NativeRule("dynamic", "head", "ref", None)
+PATCH_ROWS, IM2COL = "patch_rows_qlinear", "im2col_qconv2d"
+
+
+def conv_patch_rows(layer, height, width):
+    """True when RefQuantConv2d `layer` on an [.., height, width] input is a patch embedding: stride equal to the
+    kernel, no padding, dilation 1 (groups is always 1) and the input an exact multiple of the kernel, and its bias
+    (if any) already in the weight dtype. Its im2col rows are then the non-overlapping patches in the same order
+    (F.unfold: column index c * kh * kw + i * kw + j, row index oh_i * ow + ow_j), so
+    x.reshape(B, C, oh, kh, ow, kw).permute(0, 2, 4, 1, 3, 5).reshape(B * oh * ow, C * kh * kw) is the same
+    tensor, and qlinear's `y + bias` is qconv2d's bias add on the same words. Any other Conv2d keeps atlas.qconv2d."""
+    kh, kw = layer.kernel_size
+    return (tuple(layer.stride) == (kh, kw) and tuple(layer.padding) == (0, 0) and tuple(layer.dilation) == (1, 1)
+            and height % kh == 0 and width % kw == 0
+            and (layer.bias is None or layer.bias.dtype == layer.weight.dtype))
 
 
 @contextlib.contextmanager
 def _native_sites(module, policy, storage, *, attention=True, conv=True):
     """For the capture only: route each candidate Linear through atlas.quantize_act + atlas.qlinear, each
-    Conv2d through im2col + quantize_act + atlas.qconv2d, and each attention module's Q.K and P.V through
+    Conv2d through im2col + quantize_act + atlas.qconv2d (a patch-embedding Conv2d, conv_patch_rows: through its
+    patch rows + quantize_act + atlas.qlinear), and each attention module's Q.K and P.V through
     quantize_act + atlas.qk_matmul / atlas.pv_matmul (softmax and masks stay ordinary nodes); for float8
     storage, hold the weight codes as a float8_e4m3fn bitcast of the same bytes. The caller's forwards,
     buffers and ref_attention functions are restored afterwards. Yields the plan:
-    {"linear": {path: rule}, "conv2d": {path: rule}, "attention": native_attention(...) or None}."""
+    {"linear": {path: rule}, "conv2d": {path: rule}, "attention": native_attention(...) or None,
+     "conv2d_lowering": {path: PATCH_ROWS | IM2COL} (filled as the convolutions are called)}."""
     import exporter.atlas_fx_ops as atlas_fx_ops
     import reference.ref_attention as ref_attention
 
     code_dtype = STORAGE_DTYPES[storage]
     candidates = native_candidates(module, policy)
     undo, patched = [], []
-    plan = {"linear": {}, "conv2d": {}, "attention": native_attention(module, policy) if attention else None}
+    plan = {"linear": {}, "conv2d": {}, "attention": native_attention(module, policy) if attention else None,
+            "conv2d_lowering": {}}
     try:
         for path, (layer, nrule) in candidates.items():
             is_conv = type(layer).__name__ == "RefQuantConv2d"
@@ -666,9 +794,25 @@ def _native_sites(module, policy, storage, *, attention=True, conv=True):
                 return torch.ops.atlas.qlinear(codes, scale, layer.weight_codes, layer.weight_scale_exp,
                                                layer.bias, out_dtype, atlas_fx_ops.WEIGHT_FORMAT)
 
-            def conv_forward(x, layer=layer, nrule=nrule, out_dtype=out_dtype):
-                # RefQuantConv2d.forward up to the quantizer: im2col stays visible (aten.im2col, permute)
+            def conv_forward(x, layer=layer, nrule=nrule, out_dtype=out_dtype, path=path):
                 B, _, H, W = x.shape
+                if conv_patch_rows(layer, H, W):
+                    # stride == kernel, no padding, dilation 1: the unfolded input is the image cut into
+                    # non-overlapping patches, so the same [B*oh*ow, C*kh*kw] rows (same order, same values) are
+                    # a reshape / permute, and the conv is one qlinear on them with the same codes, exponents,
+                    # bias and output dtype, reshaped back as RefQuantConv2d.forward does.
+                    kh, kw = layer.kernel_size
+                    oh, ow = H // kh, W // kw
+                    x_flat = _cast_if_needed(x.reshape(B, -1, oh, kh, ow, kw).permute(0, 2, 4, 1, 3, 5)
+                                             .reshape(B * oh * ow, -1), layer.weight.dtype)
+                    codes, scale = _qact(x_flat, nrule, storage, label=layer.layer_name)
+                    y = torch.ops.atlas.qlinear(codes, scale, layer.weight_codes, layer.weight_scale_exp,
+                                                layer.bias, out_dtype, atlas_fx_ops.WEIGHT_FORMAT)
+                    plan["conv2d_lowering"][path] = PATCH_ROWS
+                    return y.reshape(B, oh * ow, layer.out_channels).permute(0, 2, 1).reshape(
+                        B, layer.out_channels, oh, ow)
+                plan["conv2d_lowering"][path] = IM2COL
+                # RefQuantConv2d.forward up to the quantizer: im2col stays visible (aten.im2col, permute)
                 oh = (H + 2 * layer.padding[0] - layer.dilation[0] * (layer.kernel_size[0] - 1) - 1) // layer.stride[0] + 1
                 ow = (W + 2 * layer.padding[1] - layer.dilation[1] * (layer.kernel_size[1] - 1) - 1) // layer.stride[1] + 1
                 cols = torch.nn.functional.unfold(x, kernel_size=layer.kernel_size, stride=layer.stride,
@@ -741,16 +885,19 @@ def _check_act(label, act, rule, storage, depends_on_input):
                                   f"rows={getattr(rule, 'rows', 32)}")
 
 
-def _inspect_native_site(path, layer, site, rule, nodes, lifted, depends_on_input, storage, calls=1):
+def _inspect_native_site(path, layer, site, rule, nodes, lifted, depends_on_input, storage, calls=1, lowering=None):
     """One Linear (or Conv2d) call = one atlas.qlinear (atlas.qconv2d) node fed directly by the lifted code and
     exponent buffers and by its own atlas.quantize_act node whose input depends on the user input; nothing
     else decodes or contracts in its scope (a Conv2d keeps its visible im2col). A module the boundary calls
     `calls` times (the eager replay's count, 1 by default) has exactly `calls` such nodes, each with its own
-    quantize_act, all sharing the one code / exponent buffer pair."""
+    quantize_act, all sharing the one code / exponent buffer pair. A Conv2d captured as patch rows (lowering
+    PATCH_ROWS, conv_patch_rows) is an atlas.qlinear on its reshaped / permuted input, with no im2col."""
     import exporter.atlas_fx_ops as atlas_fx_ops
 
     conv = type(layer).__name__ == "RefQuantConv2d"
-    op = torch.ops.atlas.qconv2d.default if conv else torch.ops.atlas.qlinear.default
+    patch_rows = conv and lowering == PATCH_ROWS
+    op = torch.ops.atlas.qconv2d.default if conv and not patch_rows else torch.ops.atlas.qlinear.default
+    key = "qconv2d" if op == torch.ops.atlas.qconv2d.default else "qlinear"
     prefix = path + "." if path else ""
     code, exp = lifted.get(prefix + "weight_codes"), lifted.get(prefix + "weight_scale_exp")
     placeholder, bias = lifted.get(prefix + "weight"), lifted.get(prefix + "bias")
@@ -785,15 +932,18 @@ def _inspect_native_site(path, layer, site, rule, nodes, lifted, depends_on_inpu
            "calls": calls,
            "code_buffer": prefix + "weight_codes", "scale_buffer": prefix + "weight_scale_exp",
            "code_dtype": str(layer.weight_codes.dtype).replace("torch.", ""),
-           "qlinear" if not conv else "qconv2d": mine[0].name, "quantize_act": acts[0].name,
+           "op": key, key: mine[0].name, "quantize_act": acts[0].name,
            "activation_rule": {"mode": rule[0], "reduce": rule[1], "rule": rule[2], "static_exp": rule[3]},
            "nodes_in_scope": [n.name for n in scope]}
     if calls > 1:                                    # per-call node names (the keys above name the first call)
-        row["qlinear_nodes" if not conv else "qconv2d_nodes"] = [n.name for n in mine]
+        row[key + "_nodes"] = [n.name for n in mine]
         row["quantize_act_nodes"] = [a.name for a in acts]
     if conv:
+        row["lowering"] = PATCH_ROWS if patch_rows else IM2COL
         row["im2col_nodes"] = [n.name for n in scope if n.target == torch.ops.aten.im2col.default]
-        if len(row["im2col_nodes"]) != calls:
+        if patch_rows and row["im2col_nodes"]:
+            raise FXVerificationError(f"{layer.layer_name}: patch-row Conv2d still holds im2col nodes")
+        if not patch_rows and len(row["im2col_nodes"]) != calls:
             raise FXVerificationError(f"{layer.layer_name}: expected {calls} im2col node(s) before quantize_act, "
                                       f"found {len(row['im2col_nodes'])}")
     return row
@@ -1105,7 +1255,8 @@ def inspect_graph(program, module, policy, plan=None, storage="uint8", unused=()
             raise FXVerificationError(f"{site}: the eager replay called it {expected_calls} times but it is not listed as unused")
         if path in native_paths:
             rows.append(_inspect_native_site(path, layer, selected[site], native_paths[path], nodes, lifted,
-                                             depends_on_input, storage, expected_calls))
+                                             depends_on_input, storage, expected_calls,
+                                             (plan.get("conv2d_lowering") or {}).get(path)))
             continue
         if layer.fm is not None or getattr(layer, "residual", None):
             raise FXVerificationError(f"{site}: initial FX path requires framework accumulation and no residual passes")
@@ -1191,11 +1342,14 @@ def inspect_graph(program, module, policy, plan=None, storage="uint8", unused=()
         native_rows = [row for row in rows if row.get("native")]
         native_modules = {row["module"] for row in native_rows} | {row["module"] for row in attention_rows}
         report["native_fp8_sites"] = len(native_rows)
-        report["native_fp8_linear_sites"] = sum(row["kind"] == "linear" for row in native_rows)
-        report["native_fp8_conv2d_sites"] = sum(row["kind"] == "conv2d" for row in native_rows)
+        # by the carrying operator: a Conv2d captured as patch rows (atlas.qlinear) counts as a qlinear site
+        report["native_fp8_linear_sites"] = sum(row["op"] == "qlinear" for row in native_rows)
+        report["native_fp8_conv2d_sites"] = sum(row["op"] == "qconv2d" for row in native_rows)
+        report["native_fp8_conv2d_patch_row_sites"] = [row["site"] for row in native_rows
+                                                       if row.get("lowering") == PATCH_ROWS]
         # nodes, not sites: a module called N times is one site and N qlinear nodes (calls == 1 everywhere: same numbers)
-        report["native_fp8_linear_calls"] = sum(row["calls"] for row in native_rows if row["kind"] == "linear")
-        report["native_fp8_conv2d_calls"] = sum(row["calls"] for row in native_rows if row["kind"] == "conv2d")
+        report["native_fp8_linear_calls"] = sum(row["calls"] for row in native_rows if row["op"] == "qlinear")
+        report["native_fp8_conv2d_calls"] = sum(row["calls"] for row in native_rows if row["op"] == "qconv2d")
         report["native_fp8_attention_modules"] = attention_rows
         report["still_emulated"] = _emulated_report(nodes, module, native_modules | set(unused) | set(unused_attention or {}))
         if not report["still_emulated"]["emulated_modules"]:
@@ -1401,7 +1555,8 @@ def capture_fx(module, cases, directory, *, policy, provenance=None, strict=True
             if not before:
                 raise FXVerificationError("no quantized weight buffers at this boundary")
             native_info, baseline, act_stats, attn_calls, unused_attention = None, None, None, {}, {}
-            with _meta_placeholders(module), _capture_buffer_roles(module) as roles, \
+            with _static_vision_position_ids(module) as static_vision, _meta_placeholders(module), \
+                    _capture_buffer_roles(module) as roles, \
                     _alias_parameters_as_attributes(module, policy) as aliases, _inert_autocast_disable(), \
                     _mse_loss_without_identity_broadcast(), _smolvla_additive_attention_mask(module) as additive:
                 report["capture_buffer_roles"] = {"made_persistent": len(roles["persistent"]),
@@ -1409,6 +1564,10 @@ def capture_fx(module, cases, directory, *, policy, provenance=None, strict=True
                                                   "tied_aliases_held_as_attributes": aliases}
                 if additive:
                     report["additive_attention_mask"] = {"modules": additive, "form": "scores + where(keep, 0, bf16_min)"}
+                if static_vision:
+                    report["static_vision_position_ids"] = {"modules": static_vision,
+                                                            "form": "arange(num_patches) (checked against the module's "
+                                                                    "own ids at full size, all-true patch mask)"}
                 if native_fp8:
                     if native_fp8 not in STORAGE_DTYPES:
                         raise FXVerificationError(f"unknown native storage {native_fp8!r}")
@@ -1435,6 +1594,7 @@ def capture_fx(module, cases, directory, *, policy, provenance=None, strict=True
                                    "ops_module": "exporter.atlas_fx_ops", "weight_format": "atlas_e4m3",
                                    "sites": sorted(set({**plan["linear"], **plan["conv2d"]}) - set(unused)),
                                    "conv2d_sites": sorted(set(plan["conv2d"]) - set(unused)),
+                                   "conv2d_lowering": dict(sorted(plan["conv2d_lowering"].items())),
                                    "attention_modules": sorted(plan["attention"]["paths"]) if plan["attention"] else [],
                                    "code_bytes_equal_uint8_source": True}
                     before = held
@@ -1447,6 +1607,14 @@ def capture_fx(module, cases, directory, *, policy, provenance=None, strict=True
                                          native_fp8 or "uint8", unused=unused, act_stats=act_stats, calls=calls,
                                          attn_calls=attn_calls if native_fp8 else None,
                                          unused_attention=unused_attention if native_fp8 else None)
+            report["graph_shape_census"] = census = graph_shape_census(program.graph)
+            if getattr(module, "static_graph", False) and census["dynamic_nodes"]:
+                raise FXVerificationError(f"dynamically shaped values in a static boundary's graph: "
+                                          f"{census['dynamic_nodes'][:5]}")
+            forbidden = sorted({str(n.target) for n in program.graph.nodes if n.op == "call_function"
+                                and str(n.target) in getattr(module, "forbidden_graph_targets", ())})
+            if forbidden:
+                raise FXVerificationError(f"the boundary's graph holds {forbidden}")
             if report.get("additive_attention_mask"):
                 forms = softmax_mask_forms(program.graph)
                 counts = dict(collections.Counter(row["form"] for row in forms))
@@ -1569,10 +1737,20 @@ def causal_layer_cases(model, index, seqlen, seed, device, count=2):
 
 class SmolVLAFlowLoss(torch.nn.Module):
     """Tensor-in / tensor-out boundary of a LeRobot SmolVLA policy: the flow-matching loss forward
-    (`VLAFlowMatching.forward`) for given images, language tokens, state, actions, noise and time. It runs the
-    vision tower (patch-embedding Conv2d, vision attention), the connector, the text/expert layers and the
-    action projections once, with no sampling loop, no KV cache and no random draw; the full action
-    sampler (10 denoising steps with a KV cache) is a different boundary."""
+    (`VLAFlowMatching.forward`) for given images, language tokens, state, actions, noise and time, with the text /
+    expert attention mask and position ids as inputs (smolvla_attention_inputs; host-computed from the pad and block
+    masks with lerobot's own functions, as TinyLlama's layer boundary takes its mask). It runs the vision tower
+    (patch-embedding Conv2d, vision attention), the connector, the text/expert layers and the action projections
+    once, with no sampling loop, no KV cache and no random draw; the full action sampler (10 denoising steps with a
+    KV cache) is a different boundary.
+
+    Inputs: n_images images, lang_tokens, state, actions, noise, time, attention_mask (BF16 additive [B, S, S]),
+    position_ids (int64 [B, S]). The forward is VLAFlowMatching.forward with make_att_2d_masks and the cumsum
+    replaced by the two inputs; the pad / block masks embed_prefix / embed_suffix return only feed those, so the
+    language pad mask is not an input (embed_prefix gets an all-true one, which the graph never reads)."""
+
+    static_graph = True
+    forbidden_graph_targets = ("aten.cumsum.default",)
 
     def __init__(self, policy, n_images=1):
         super().__init__()
@@ -1580,23 +1758,40 @@ class SmolVLAFlowLoss(torch.nn.Module):
         self.n_images = n_images
 
     def forward(self, *tensors):
+        from lerobot.policies.common.flow_matching import FlowConvention, make_flow_matching_inputs
+
+        model = self.policy.model
         images = list(tensors[:self.n_images])
-        lang_tokens, lang_masks, state, actions, noise, time = tensors[self.n_images:]
+        lang_tokens, state, actions, noise, time, attention_mask, position_ids = tensors[self.n_images:]
         masks = [torch.ones(image.shape[0], dtype=torch.bool, device=image.device) for image in images]
-        return self.policy.model.forward(images, masks, lang_tokens, lang_masks, state, actions, noise, time)
+        x_t, u_t, _ = make_flow_matching_inputs(actions, noise, time, convention=FlowConvention.NOISE_AT_ONE)
+        prefix_embs, _, _ = model.embed_prefix(images, masks, lang_tokens, torch.ones_like(lang_tokens, dtype=torch.bool),
+                                               state=state)
+        suffix_embs, _, _ = model.embed_suffix(x_t, time)
+        (_, suffix_out), _ = model.vlm_with_expert.forward(
+            attention_mask=attention_mask, position_ids=position_ids, past_key_values=None,
+            inputs_embeds=[prefix_embs, suffix_embs], use_cache=False)
+        suffix_out = suffix_out[:, -model.config.chunk_size:]
+        suffix_out = suffix_out.to(dtype=torch.float32)
+        v_t = model.action_out_proj(suffix_out)
+        return torch.nn.functional.mse_loss(u_t, v_t, reduction="none")
 
 
 class SmolVLATextLayers(torch.nn.Module):
     """The first `layers` layers of a LeRobot SmolVLA policy's VLM text model and action expert (SmolVLMWithExpertModel,
     use_cache=False, as VLAFlowMatching.forward runs them) at their own boundary: (prefix embeddings, suffix embeddings,
-    pad masks, autoregressive block masks) -> suffix output after the expert's final norm. The attention mask
-    (make_att_2d_masks) and position ids (cumsum of the pad mask - 1) are built in the graph exactly as in the
-    flow-loss forward; the vision tower, the connector and the action projections are outside (their sites are listed
-    as unused). Layer 0 is joint self-attention and layer 1 the prefix + expert cross-attention when
-    self_attn_every_n_layers is 2, so two layers hold both masked attention patterns.
+    attention mask, position ids) -> suffix output after the expert's final norm. The attention mask (BF16 additive
+    [B, S, S]) and the position ids (int64 [B, S]) are inputs, computed on the host by smolvla_attention_inputs from the
+    pad and block masks exactly as the flow-loss forward builds them; the vision tower, the connector and the action
+    projections are outside (their sites are listed as unused). Layer 0 is joint self-attention and layer 1 the
+    prefix + expert cross-attention when self_attn_every_n_layers is 2, so two layers hold both masked attention
+    patterns.
 
     The boundary sets the instance's num_vlm_layers / num_expert_layers to `layers` (so get_model_layers pairs expert
     layer i with VLM layer i and forward stops after `layers` layers); restore() puts the counts back."""
+
+    static_graph = True
+    forbidden_graph_targets = ("aten.cumsum.default",)
 
     def __init__(self, policy, layers=2):
         super().__init__()
@@ -1613,35 +1808,55 @@ class SmolVLATextLayers(torch.nn.Module):
         inner = self.policy.model.vlm_with_expert
         inner.num_vlm_layers, inner.num_expert_layers = self._saved
 
-    def forward(self, prefix_embs, suffix_embs, pad_masks, att_masks):
-        from lerobot.policies.common.vla_utils import make_att_2d_masks
-
+    def forward(self, prefix_embs, suffix_embs, attention_mask, position_ids):
         (_, suffix_out), _ = self.policy.model.vlm_with_expert.forward(
-            attention_mask=make_att_2d_masks(pad_masks, att_masks), position_ids=torch.cumsum(pad_masks, dim=1) - 1,
+            attention_mask=attention_mask, position_ids=position_ids,
             past_key_values=None, inputs_embeds=[prefix_embs, suffix_embs], use_cache=False)
         return suffix_out
 
 
-def smolvla_text_cases(policy, n_images, seed, device, count=2):
-    """Inputs of SmolVLATextLayers for the smolvla_cases inputs: the policy's own embed_prefix / embed_suffix on them
-    (x_t = t * noise + (1 - t) * actions, as make_flow_matching_inputs with the noise at t = 1)."""
+def _smolvla_embedded(policy, n_images, case):
+    """(prefix, suffix, pad_masks, att_masks) of one smolvla_raw_cases tuple: the policy's own embed_prefix /
+    embed_suffix (x_t = t * noise + (1 - t) * actions, make_flow_matching_inputs with the noise at t = 1) and the
+    concatenated pad / block masks, as VLAFlowMatching.forward has them."""
+    from lerobot.policies.common.flow_matching import FlowConvention, make_flow_matching_inputs
+
     model = policy.model
-    cases = []
+    images = list(case[:n_images])
+    lang_tokens, lang_masks, state, actions, noise, time = case[n_images:]
+    masks = [torch.ones(image.shape[0], dtype=torch.bool, device=image.device) for image in images]
     with torch.no_grad():
-        for case in smolvla_cases(policy, n_images, seed, device, count):
-            images = list(case[:n_images])
-            lang_tokens, lang_masks, state, actions, noise, time = case[n_images:]
-            masks = [torch.ones(image.shape[0], dtype=torch.bool, device=image.device) for image in images]
-            prefix, prefix_pad, prefix_att = model.embed_prefix(images, masks, lang_tokens, lang_masks, state=state)
-            t = time[:, None, None]
-            suffix, suffix_pad, suffix_att = model.embed_suffix(t * noise + (1 - t) * actions, time)
-            cases.append(tuple(v.contiguous() for v in (prefix, suffix, torch.cat([prefix_pad, suffix_pad], dim=1),
-                                                         torch.cat([prefix_att, suffix_att], dim=1))))
+        x_t, _, _ = make_flow_matching_inputs(actions, noise, time, convention=FlowConvention.NOISE_AT_ONE)
+        prefix, prefix_pad, prefix_att = model.embed_prefix(images, masks, lang_tokens, lang_masks, state=state)
+        suffix, suffix_pad, suffix_att = model.embed_suffix(x_t, time)
+    if not bool(suffix_pad.all()):
+        raise ValueError("padded suffix (action) tokens: the expert's mask slice would drop their diagonal")
+    return (prefix, suffix, torch.cat([prefix_pad, suffix_pad], dim=1), torch.cat([prefix_att, suffix_att], dim=1))
+
+
+def smolvla_flow_inputs(policy, n_images, case, keep_self_for_padded=False):
+    """SmolVLAFlowLoss inputs for one smolvla_raw_cases tuple (images, lang_tokens, lang_masks, state, actions, noise,
+    time): the same tensors without lang_masks, then the host attention mask and position ids."""
+    _, _, pad, att = _smolvla_embedded(policy, n_images, case)
+    mask, position_ids, _ = smolvla_attention_inputs(pad, att, keep_self_for_padded)
+    images, (lang_tokens, _, state, actions, noise, time) = case[:n_images], case[n_images:]
+    return (*images, lang_tokens, state, actions, noise, time, mask, position_ids)
+
+
+def smolvla_text_cases(policy, n_images, seed, device, count=2, keep_self_for_padded=False):
+    """Inputs of SmolVLATextLayers for the smolvla_raw_cases inputs: the policy's own embed_prefix / embed_suffix on
+    them and the host attention mask and position ids (smolvla_attention_inputs)."""
+    cases = []
+    for case in smolvla_raw_cases(policy, n_images, seed, device, count):
+        prefix, suffix, pad, att = _smolvla_embedded(policy, n_images, case)
+        mask, position_ids, _ = smolvla_attention_inputs(pad, att, keep_self_for_padded)
+        cases.append(tuple(v.contiguous() for v in (prefix, suffix, mask, position_ids)))
     return cases
 
 
-def smolvla_cases(policy, n_images, seed, device, count=2, image_size=None):
-    """`count` fixed input tuples for SmolVLAFlowLoss (images in [-1, 1], as prepare_images gives)."""
+def smolvla_raw_cases(policy, n_images, seed, device, count=2, image_size=None):
+    """`count` fixed policy-level input tuples (images in [-1, 1], as prepare_images gives; lang_tokens, an all-true
+    lang_masks, state, actions, noise, time): the inputs VLAFlowMatching.forward takes."""
     config = policy.model.config
     size = image_size or tuple(config.resize_imgs_with_padding)
     dtype = next(policy.parameters()).dtype
@@ -1656,6 +1871,12 @@ def smolvla_cases(policy, n_images, seed, device, count=2, image_size=None):
                 torch.randn(1, config.chunk_size, config.max_action_dim, generator=g), torch.tensor([0.25 + 0.5 * i]))
         cases.append(tuple(value.to(device) for value in case))
     return cases
+
+
+def smolvla_cases(policy, n_images, seed, device, count=2, image_size=None, keep_self_for_padded=False):
+    """`count` fixed input tuples for SmolVLAFlowLoss: smolvla_raw_cases through smolvla_flow_inputs."""
+    return [smolvla_flow_inputs(policy, n_images, case, keep_self_for_padded)
+            for case in smolvla_raw_cases(policy, n_images, seed, device, count, image_size)]
 
 
 def main(argv=None):
@@ -1679,7 +1900,8 @@ def main(argv=None):
                         help="capture boundary: causal-LM logits (default), one decoder layer of a causal LM "
                              "(CausalLayer: hidden, cos, sin, mask -> hidden; see --layer) or the SmolVLA "
                              "flow-matching loss forward, or its first --layers text / expert layers "
-                             "(SmolVLATextLayers: prefix, suffix embeddings, pad and block masks -> suffix output)")
+                             "(SmolVLATextLayers: prefix, suffix embeddings, attention mask, position ids -> suffix output); "
+                             "both SmolVLA boundaries take the host-computed attention mask and position ids")
     parser.add_argument("--layers", type=int, default=2, help="text / expert layers with --boundary smolvla_text_layers")
     parser.add_argument("--layer", type=int, default=0, help="decoder layer index with --boundary causal_lm_layer")
     parser.add_argument("--n-images", type=int, default=1, help="cameras at the smolvla_flow_loss boundary")
