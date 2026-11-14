@@ -594,21 +594,43 @@ def softmax_mask_forms(graph):
 
 
 def drop_dead_pure_nodes(program):
-    """Remove call_function nodes that have no users and no side effect (Node.is_impure() False), repeatedly, from a
-    captured program; returns the removed node names. Used when a boundary's host inputs leave a computation unread
-    (the expert's position - min with host RoPE tables): torch.export keeps it and the backend frontend cannot bind
-    an op whose result nothing consumes, and the flow-loss boundary leaves embed_prefix / embed_suffix's pad and block
-    mask construction unread (stage-capture: "frontend trace does not bind complete captured IR"). Values that reach
-    an output are untouched. Applied to boundaries with drop_dead_nodes (the SmolVLA ones)."""
+    """Remove computations nothing reads from a captured program; returns the removed node names. Repeatedly:
+      - call_function nodes with no users and no side effect (Node.is_impure() False);
+      - an aten.detach_ with no users whose input is an aten.lift_fresh_copy (torch.tensor(...) in the traced code:
+        the in-place detach acts on a fresh private copy, so nothing can observe it);
+      - then a lifted CONSTANT_TENSOR input with no users (placeholder, graph-signature input spec and constant).
+    Parameters and buffers are kept even when unread (the backend authenticates them against the export).
+    Used when a boundary's host inputs leave a computation unread: the expert's position - min with host RoPE tables,
+    and embed_prefix / embed_suffix's pad and block masks (including their torch.tensor constants) at the flow-loss
+    boundary. torch.export keeps them, and the backend's stage-capture refuses a program with a node it eliminates
+    without correspondence ("quantized -> prepared correspondence incomplete" / "frontend trace does not bind
+    complete captured IR"). Values that reach an output are untouched. Applied to boundaries with drop_dead_nodes
+    (the SmolVLA ones)."""
+    from torch.export.graph_signature import InputKind
+
     removed = []
+    detach_, fresh = torch.ops.aten.detach_.default, torch.ops.aten.lift_fresh_copy.default
     changed = True
     while changed:
         changed = False
         for node in reversed(list(program.graph.nodes)):
-            if node.op == "call_function" and not node.users and not node.is_impure():
+            if node.op != "call_function" or node.users:
+                continue
+            fresh_detach = (node.target == detach_ and isinstance(node.args[0], torch.fx.Node)
+                            and node.args[0].target == fresh and len(node.args[0].users) == 1)
+            if not node.is_impure() or fresh_detach:
                 removed.append(node.name)
                 program.graph.erase_node(node)
                 changed = True
+    specs = program.graph_signature.input_specs
+    by_name = {node.name: node for node in program.graph.nodes if node.op == "placeholder"}
+    for spec in list(specs):
+        node = by_name.get(getattr(spec.arg, "name", None))
+        if spec.kind == InputKind.CONSTANT_TENSOR and node is not None and not node.users:
+            specs.remove(spec)
+            program.constants.pop(spec.target, None)
+            removed.append(node.name)
+            program.graph.erase_node(node)
     if removed:
         program.graph_module.recompile()
     return removed

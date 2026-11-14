@@ -351,3 +351,42 @@ def test_patch_embedding_capture_has_no_convolution(tmp_path, spec):
     with torch.no_grad():
         for case, out in zip(cases, eager):
             assert torch.equal(program.module()(*case).view(torch.int16), out.view(torch.int16))
+
+
+# -- dead pure nodes ------------------------------------------------------------------------------------------------------
+
+class _Dead(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w = torch.nn.Parameter(torch.randn(4))
+
+    def embed(self, x, y):
+        """Returns a value and masks the caller does not read (as embed_prefix returns its pad / block masks)."""
+        att = torch.tensor([True, False, True], device=x.device)[None, :].expand(x.shape[0], -1)
+        pad = torch.cat([y > 0, torch.ones_like(y, dtype=torch.bool)], dim=1)
+        return x * self.w * torch.tensor(3.0), pad, att
+
+    def forward(self, x, y):
+        out, _, _ = self.embed(x, y)
+        positions = y - torch.min(y, dim=1, keepdim=True).values                 # computed, never read
+        return out + 0 * positions.shape[1]
+
+
+@pinned
+def test_drop_dead_pure_nodes_removes_unread_work_and_constants(tmp_path):
+    module = _Dead().eval()
+    args = (torch.randn(2, 4), torch.arange(6).reshape(2, 3))
+    program = torch.export.export(module, args, strict=True)
+    targets = lambda p: [str(n.target) for n in p.graph.nodes if n.op == "call_function"]   # noqa: E731
+    assert targets(program).count("aten.lift_fresh_copy.default") == 2
+    expected = program.module()(*args)
+    removed = fx_export.drop_dead_pure_nodes(program)
+    assert removed
+    assert targets(program).count("aten.lift_fresh_copy.default") == 1                # the read constant stays
+    assert not [n for n in program.graph.nodes if n.op == "call_function" and not n.users and not n.is_impure()]
+    kinds = [s.kind.name for s in program.graph_signature.input_specs]
+    assert kinds.count("CONSTANT_TENSOR") == 1 and kinds.count("PARAMETER") == 1
+    assert len(program.constants) == 1
+    torch.export.save(program, tmp_path / "p.pt2")
+    loaded = torch.export.load(tmp_path / "p.pt2")
+    assert torch.equal(loaded.module()(*args), expected) and torch.equal(program.module()(*args), expected)
