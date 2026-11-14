@@ -880,9 +880,12 @@ def _native_sites(module, policy, storage, *, attention=True, conv=True):
 
     code_dtype = STORAGE_DTYPES[storage]
     candidates = native_candidates(module, policy)
+    # a boundary with bias_add (the SmolVLA ones) carries each Linear's bias as a separate BF16 addition after a
+    # bias-free atlas.qlinear: the pinned backend's already-quantized intake admits only the 4-operand contraction
+    bias_add = bool(getattr(module, "bias_add", False))
     undo, patched = [], []
     plan = {"linear": {}, "conv2d": {}, "attention": native_attention(module, policy) if attention else None,
-            "conv2d_lowering": {}}
+            "conv2d_lowering": {}, "bias_add": bias_add}
     try:
         for path, (layer, nrule) in candidates.items():
             is_conv = type(layer).__name__ == "RefQuantConv2d"
@@ -899,11 +902,19 @@ def _native_sites(module, policy, storage, *, attention=True, conv=True):
             out_dtype = str(layer.weight.dtype).replace("torch.", "")
             plan["conv2d" if is_conv else "linear"][path] = nrule
 
+            def qlinear(codes, scale, layer, out_dtype):
+                if bias_add and layer.bias is not None:
+                    # atlas.qlinear's own body is linear(...) then `y + bias`: the same addition as a separate node
+                    y = torch.ops.atlas.qlinear(codes, scale, layer.weight_codes, layer.weight_scale_exp, None,
+                                                out_dtype, atlas_fx_ops.WEIGHT_FORMAT)
+                    return y + layer.bias
+                return torch.ops.atlas.qlinear(codes, scale, layer.weight_codes, layer.weight_scale_exp,
+                                               layer.bias, out_dtype, atlas_fx_ops.WEIGHT_FORMAT)
+
             def linear_forward(x, layer=layer, nrule=nrule, out_dtype=out_dtype):
                 x = _cast_if_needed(x, layer.weight.dtype)
                 codes, scale = _qact(x, nrule, storage, label=layer.layer_name)
-                return torch.ops.atlas.qlinear(codes, scale, layer.weight_codes, layer.weight_scale_exp,
-                                               layer.bias, out_dtype, atlas_fx_ops.WEIGHT_FORMAT)
+                return qlinear(codes, scale, layer, out_dtype)
 
             def conv_forward(x, layer=layer, nrule=nrule, out_dtype=out_dtype, path=path):
                 B, _, H, W = x.shape
@@ -917,8 +928,7 @@ def _native_sites(module, policy, storage, *, attention=True, conv=True):
                     x_flat = _cast_if_needed(x.reshape(B, -1, oh, kh, ow, kw).permute(0, 2, 4, 1, 3, 5)
                                              .reshape(B * oh * ow, -1), layer.weight.dtype)
                     codes, scale = _qact(x_flat, nrule, storage, label=layer.layer_name)
-                    y = torch.ops.atlas.qlinear(codes, scale, layer.weight_codes, layer.weight_scale_exp,
-                                                layer.bias, out_dtype, atlas_fx_ops.WEIGHT_FORMAT)
+                    y = qlinear(codes, scale, layer, out_dtype)
                     plan["conv2d_lowering"][path] = PATCH_ROWS
                     return y.reshape(B, oh * ow, layer.out_channels).permute(0, 2, 1).reshape(
                         B, layer.out_channels, oh, ow)
@@ -996,7 +1006,8 @@ def _check_act(label, act, rule, storage, depends_on_input):
                                   f"rows={getattr(rule, 'rows', 32)}")
 
 
-def _inspect_native_site(path, layer, site, rule, nodes, lifted, depends_on_input, storage, calls=1, lowering=None):
+def _inspect_native_site(path, layer, site, rule, nodes, lifted, depends_on_input, storage, calls=1, lowering=None,
+                         bias_add=False):
     """One Linear (or Conv2d) call = one atlas.qlinear (atlas.qconv2d) node fed directly by the lifted code and
     exponent buffers and by its own atlas.quantize_act node whose input depends on the user input; nothing
     else decodes or contracts in its scope (a Conv2d keeps its visible im2col). A module the boundary calls
@@ -1022,7 +1033,7 @@ def _inspect_native_site(path, layer, site, rule, nodes, lifted, depends_on_inpu
         what = "exactly one" if calls == 1 else f"exactly {calls} (the eager replay's call count),"
         raise FXVerificationError(f"{layer.layer_name}: expected {what} {op} consuming "
                                   f"the code and exponent buffers directly, found {len(mine)}")
-    acts = []
+    acts, bias_adds = [], []
     for q in mine:
         x_codes, x_exp, _, _, q_bias, out_dtype, weight_format = q.args[:7]
         act = _act_source(x_codes, 0)
@@ -1031,12 +1042,20 @@ def _inspect_native_site(path, layer, site, rule, nodes, lifted, depends_on_inpu
         _check_act(layer.layer_name, act, rule, storage, depends_on_input)
         if out_dtype != str(layer.weight.dtype).replace("torch.", "") or weight_format != atlas_fx_ops.WEIGHT_FORMAT:
             raise FXVerificationError(f"{layer.layer_name}: {op} dtype/format attributes differ from the layer")
-        if (layer.bias is None) != (q_bias is None) or (bias is not None and q_bias is not bias):
+        if bias_add and key == "qlinear" and layer.bias is not None:
+            # bias-free qlinear whose only consumer is add(qlinear, bias)
+            users = list(q.users)
+            if (q_bias is not None or bias is None or len(users) != 1 or users[0].target != torch.ops.aten.add.Tensor
+                    or tuple(users[0].args) != (q, bias)):
+                raise FXVerificationError(f"{layer.layer_name}: bias is not one add(qlinear, bias) after a bias-free {op}")
+            bias_adds.append(users[0])
+        elif (layer.bias is None) != (q_bias is None) or (bias is not None and q_bias is not bias):
             raise FXVerificationError(f"{layer.layer_name}: bias is not consumed by {op}")
         acts.append(act)
     scope = [n for n in nodes if n.op == "call_function" and _scope(n) == path]
     allowed = ALLOWED_NATIVE_SCOPE_TARGETS | (CONV_SCOPE_TARGETS if conv else set())
-    stray = sorted({str(n.target) for n in scope if n.target not in allowed and n not in mine and n not in acts})
+    stray = sorted({str(n.target) for n in scope if n.target not in allowed and n not in mine and n not in acts
+                    and n not in bias_adds})
     if stray:
         raise FXVerificationError(f"{layer.layer_name}: decode/contraction ops remain in the layer: {stray}")
     row = {"site": layer.layer_name, "module": path, "kind": "conv2d" if conv else "linear", "native": True,
@@ -1044,6 +1063,7 @@ def _inspect_native_site(path, layer, site, rule, nodes, lifted, depends_on_inpu
            "code_buffer": prefix + "weight_codes", "scale_buffer": prefix + "weight_scale_exp",
            "code_dtype": str(layer.weight_codes.dtype).replace("torch.", ""),
            "op": key, key: mine[0].name, "quantize_act": acts[0].name,
+           **({"bias_add": [n.name for n in bias_adds]} if bias_adds else {}),
            "activation_rule": {"mode": rule[0], "reduce": rule[1], "rule": rule[2], "static_exp": rule[3]},
            "nodes_in_scope": [n.name for n in scope]}
     if calls > 1:                                    # per-call node names (the keys above name the first call)
@@ -1367,7 +1387,7 @@ def inspect_graph(program, module, policy, plan=None, storage="uint8", unused=()
         if path in native_paths:
             rows.append(_inspect_native_site(path, layer, selected[site], native_paths[path], nodes, lifted,
                                              depends_on_input, storage, expected_calls,
-                                             (plan.get("conv2d_lowering") or {}).get(path)))
+                                             (plan.get("conv2d_lowering") or {}).get(path), plan.get("bias_add", False)))
             continue
         if layer.fm is not None or getattr(layer, "residual", None):
             raise FXVerificationError(f"{site}: initial FX path requires framework accumulation and no residual passes")
@@ -1887,6 +1907,7 @@ class SmolVLAFlowLoss(torch.nn.Module):
 
     static_graph = True
     drop_dead_nodes = True
+    bias_add = True
     forbidden_graph_targets = ("aten.cumsum.default",)
 
     def __init__(self, policy, n_images=1, host_rope=False):
@@ -1938,6 +1959,7 @@ class SmolVLATextLayers(torch.nn.Module):
 
     static_graph = True
     drop_dead_nodes = True
+    bias_add = True
     forbidden_graph_targets = ("aten.cumsum.default",)
 
     def __init__(self, policy, layers=2, host_rope=False):

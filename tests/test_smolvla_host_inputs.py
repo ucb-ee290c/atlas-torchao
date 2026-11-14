@@ -323,10 +323,12 @@ class _Patch(torch.nn.Module):
 
 
 @pinned
+@pytest.mark.parametrize("bias_add", [False, True])
 @pytest.mark.parametrize("spec", ["granularity:w=channel,a=token,rule=nc", "none"])
-def test_patch_embedding_capture_has_no_convolution(tmp_path, spec):
+def test_patch_embedding_capture_has_no_convolution(tmp_path, spec, bias_add):
     torch.manual_seed(0)
     module = _Patch().to(torch.bfloat16).eval()
+    module.bias_add = bias_add                       # the SmolVLA boundaries set it
     algo = algos.make(spec)
     report = algos.quantize(module, "ref_conv", options=dict(FAST), algo=algo)
     policy = quant_export.build_policy(module, "ref_conv", report, algo, dict(FAST), [], [], {}, {})
@@ -348,6 +350,12 @@ def test_patch_embedding_capture_has_no_convolution(tmp_path, spec):
     targets = [str(n.target) for n in program.graph.nodes if n.op == "call_function"]
     assert not [t for t in targets if "conv" in t or "im2col" in t]
     assert targets.count("atlas.qlinear.default") == 2
+    qlinears = [n for n in program.graph.nodes if str(n.target) == "atlas.qlinear.default"]
+    if bias_add:                                     # bias-free qlinear, then one add(qlinear, bias) each
+        assert all(n.args[4] is None and [str(u.target) for u in n.users] == ["aten.add.Tensor"] for n in qlinears)
+        assert all(row.get("bias_add") for row in inspection["weight_site_bindings"])
+    else:
+        assert all(n.args[4] is not None for n in qlinears)
     with torch.no_grad():
         for case, out in zip(cases, eager):
             assert torch.equal(program.module()(*case).view(torch.int16), out.view(torch.int16))
