@@ -97,34 +97,48 @@ def _raw_cases(padded):
 
 
 @pinned
-@pytest.mark.parametrize("native", [None, "uint8"])
-def test_text_layers_boundary_takes_the_host_mask_and_positions(tmp_path, native):
+@pytest.mark.parametrize("native,host_rope", [(None, False), ("uint8", False), ("uint8", True)])
+def test_text_layers_boundary_takes_the_host_mask_and_positions(tmp_path, native, host_rope):
     pytest.importorskip("lerobot.policies.smolvla.smolvlm_with_expert")
+    import lerobot.policies.smolvla.smolvlm_with_expert as swe
+
+    original_rope = swe.apply_rope
     policy, qpolicy = _tiny_policy()
     raw = _raw_cases(padded=True)
-    boundary = fx_export.SmolVLATextLayers(policy, layers=2).eval()
+    boundary = fx_export.SmolVLATextLayers(policy, layers=2, host_rope=host_rope).eval()
     cases = []
     for prefix, suffix, pad, ar in raw:
         mask, positions, _ = fx_export.smolvla_attention_inputs(pad, ar)
-        cases.append((prefix, suffix, mask, positions))
+        if host_rope:
+            tables = fx_export.smolvla_rope_tables(positions, prefix.shape[1], 16)
+            cases.append((prefix, suffix, mask, *(t for name in fx_export.ROPE_TABLES for t in tables[name])))
+        else:
+            cases.append((prefix, suffix, mask, positions))
     with torch.no_grad():
+        saved, swe.apply_rope = swe.apply_rope, original_rope
         before = [_OldTextLayers(policy).eval()(*case) for case in raw]   # the old boundary, also at 2 layers
+        swe.apply_rope = saved
     result = fx_export.capture_fx(boundary, cases, tmp_path / "fx", policy=qpolicy, fresh_process=False,
                                   native_fp8=native)
     boundary.restore()
+    assert swe.apply_rope is original_rope
     assert result["status"] == "passed"
     assert result["graph_shape_census"] == {"dynamic_nodes": [], "cumsum_nodes": []}
     program = torch.export.load(tmp_path / "fx" / "model.pt2")
     user = [s for s in program.graph_signature.input_specs if s.kind.name == "USER_INPUT"]
     vals = [next(n for n in program.graph.nodes if n.name == s.arg.name).meta["val"] for s in user]
+    tail = ([(torch.float32, (1, n, 1, 8))] * 2 for n in (9, 6, 3)) if host_rope else ([(torch.int64, (1, 9))],)
     assert [(v.dtype, tuple(v.shape)) for v in vals] == [
-        (torch.bfloat16, (1, 6, 64)), (torch.bfloat16, (1, 3, 48)), (torch.bfloat16, (1, 9, 9)), (torch.int64, (1, 9))]
+        (torch.bfloat16, (1, 6, 64)), (torch.bfloat16, (1, 3, 48)), (torch.bfloat16, (1, 9, 9))] + sum(tail, [])
+    assert all(next(n for n in program.graph.nodes if n.name == s.arg.name).users for s in user)
     forms = fx_export.softmax_mask_forms(program.graph)
     # layer 0 joint self-attention; layer 1 prefix self-attention + expert cross-attention
     assert [row["form"] for row in forms] == ["additive_bf16_min"] * 3
     assert {row["mask_source"] for row in forms} == {user[2].arg.name}         # the mask placeholder, no where
     calls = [n for n in program.graph.nodes if n.op == "call_function"]
     assert not [n for n in calls if "cumsum" in str(n.target)]
+    if host_rope:                                                         # no RoPE angle math left in the graph
+        assert not [n for n in calls if str(n.target) in ("aten.sin.default", "aten.cos.default", "aten.pow.Scalar")]
     mins = (fx_export.BF16_MIN, torch.finfo(torch.float32).min)                # no mask built in the graph
     assert not [n for n in calls if "where" in str(n.target) and any(a in mins for a in n.args if isinstance(a, float))]
     # byte-identical to the old in-graph mask / position boundary on the same raw inputs

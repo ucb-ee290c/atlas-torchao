@@ -476,6 +476,74 @@ def smolvla_attention_inputs(pad_masks, att_masks, keep_self_for_padded=False):
     return additive_attention_mask(keep).contiguous(), position_ids.contiguous(), keep
 
 
+ROPE_TABLES = ("joint", "prefix", "expert")
+
+
+def _rope_table(positions, head_dim, max_wavelength=10_000):
+    """(cos, sin), float32 [B, L, 1, head_dim / 2]: lerobot smolvlm_with_expert.apply_rope's angle arithmetic for
+    `positions` [B, L], line for line (timescale = max_wavelength ** ((2 / D) * arange(D / 2)); radians =
+    positions / timescale)."""
+    d_half = head_dim // 2
+    freq_exponents = (2.0 / head_dim) * torch.arange(d_half, dtype=torch.float32, device=positions.device)
+    timescale = max_wavelength**freq_exponents
+    radians = positions[..., None].to(torch.float32) / timescale[None, None, :].to(torch.float32)
+    radians = radians[..., None, :]
+    return torch.cos(radians), torch.sin(radians)
+
+
+def smolvla_rope_tables(position_ids, prefix_len, head_dim):
+    """Host RoPE tables of SmolVLA's text / expert layers: {"joint", "prefix", "expert"} -> (cos, sin), the angles
+    apply_rope derives from the three position tensors SmolVLMWithExpertModel passes it with use_cache=False:
+    position_ids (joint self-attention layers), position_ids[:, :prefix_len] (the prefix branch of a cross-attention
+    layer) and the expert's position_ids[:, prefix_len:] - its row minimum. Each table has the shape of the in-graph
+    angles it replaces."""
+    expert = position_ids[:, prefix_len:]
+    expert = expert - torch.min(expert, dim=1, keepdim=True).values
+    return {"joint": _rope_table(position_ids, head_dim), "prefix": _rope_table(position_ids[:, :prefix_len], head_dim),
+            "expert": _rope_table(expert, head_dim)}
+
+
+class _HostRope:
+    """smolvlm_with_expert.apply_rope with the angles' cos / sin taken from host tables (smolvla_rope_tables) instead
+    of computed in the graph: the float32 x1 * cos - x2 * sin / x2 * cos + x1 * sin rotation itself is lerobot's,
+    unchanged. A call is matched to its table by the sequence length of `positions` (joint S, prefix P, expert M,
+    which must differ); the position values are not read. install() replaces the module function, restore() puts it
+    back; `tables` is set by the boundary's forward."""
+
+    def __init__(self):
+        self.tables, self._saved = None, None
+
+    def install(self):
+        import lerobot.policies.smolvla.smolvlm_with_expert as swe
+
+        if self._saved is None:
+            self._saved = swe.apply_rope
+            swe.apply_rope = self.apply_rope
+
+    def restore(self):
+        import lerobot.policies.smolvla.smolvlm_with_expert as swe
+
+        if self._saved is not None:
+            swe.apply_rope, self._saved = self._saved, None
+
+    def apply_rope(self, x, positions, max_wavelength=10_000):
+        lengths = {name: self.tables[name][0].shape[1] for name in ROPE_TABLES}
+        if len(set(lengths.values())) != len(lengths):
+            raise ValueError(f"host RoPE tables need distinct sequence lengths: {lengths}")
+        name = next((n for n, length in lengths.items() if length == positions.shape[1]), None)
+        if name is None:
+            raise ValueError(f"no host RoPE table for {positions.shape[1]} positions: {lengths}")
+        cos, sin = self.tables[name]
+        d_half = x.shape[-1] // 2
+        dtype = x.dtype
+        x = x.to(torch.float32)
+        x1, x2 = x.split(d_half, dim=-1)
+        res = torch.empty_like(x)
+        res[..., :d_half] = x1 * cos - x2 * sin
+        res[..., d_half:] = x2 * cos + x1 * sin
+        return res.to(dtype)
+
+
 _MASK_VIEWS = {torch.ops.aten.slice.Tensor, torch.ops.aten.unsqueeze.default, torch.ops.aten.expand.default,
                torch.ops.aten.view.default, torch.ops.aten.reshape.default, torch.ops.aten.alias.default}
 _SOFTMAX = {torch.ops.aten.softmax.int, torch.ops.aten._softmax.default}
@@ -1735,6 +1803,28 @@ def causal_layer_cases(model, index, seqlen, seed, device, count=2):
     return cases
 
 
+def _rope_head_dim(policy):
+    inner = policy.model.vlm_with_expert
+    dims = {inner.vlm.config.text_config.head_dim, inner.lm_expert.config.head_dim}
+    if len(dims) != 1:
+        raise ValueError(f"host RoPE needs one head_dim for the VLM and the expert: {dims}")
+    return dims.pop()
+
+
+def _text_inputs(boundary, batch, length, device, rest):
+    """(position_ids for SmolVLMWithExpertModel.forward) from the boundary's trailing inputs. Without host_rope that
+    is the position-id input. With host_rope the trailing inputs are the six host RoPE tables (cos, sin per
+    ROPE_TABLES entry), installed for apply_rope, and the forward gets an all-zero position tensor of the right shape
+    whose values nothing reads (its slices only select the table; the expert's min-subtraction is dead)."""
+    if not boundary.host_rope:
+        (position_ids,) = rest
+        return position_ids
+    if len(rest) != 2 * len(ROPE_TABLES):
+        raise ValueError(f"host_rope: expected {2 * len(ROPE_TABLES)} table inputs, got {len(rest)}")
+    boundary._rope.tables = {name: (rest[2 * i], rest[2 * i + 1]) for i, name in enumerate(ROPE_TABLES)}
+    return torch.zeros(batch, length, dtype=torch.int64, device=device)
+
+
 class SmolVLAFlowLoss(torch.nn.Module):
     """Tensor-in / tensor-out boundary of a LeRobot SmolVLA policy: the flow-matching loss forward
     (`VLAFlowMatching.forward`) for given images, language tokens, state, actions, noise and time, with the text /
@@ -1745,24 +1835,33 @@ class SmolVLAFlowLoss(torch.nn.Module):
     KV cache) is a different boundary.
 
     Inputs: n_images images, lang_tokens, state, actions, noise, time, attention_mask (BF16 additive [B, S, S]),
-    position_ids (int64 [B, S]). The forward is VLAFlowMatching.forward with make_att_2d_masks and the cumsum
+    position_ids (int64 [B, S]); with host_rope, the six host RoPE tables (smolvla_rope_tables: joint, prefix, expert
+    cos / sin, float32) instead of the position ids, so no RoPE angle, pow, sin or cos is computed in the graph. The forward is VLAFlowMatching.forward with make_att_2d_masks and the cumsum
     replaced by the two inputs; the pad / block masks embed_prefix / embed_suffix return only feed those, so the
     language pad mask is not an input (embed_prefix gets an all-true one, which the graph never reads)."""
 
     static_graph = True
     forbidden_graph_targets = ("aten.cumsum.default",)
 
-    def __init__(self, policy, n_images=1):
+    def __init__(self, policy, n_images=1, host_rope=False):
         super().__init__()
         self.policy = policy
         self.n_images = n_images
+        self.host_rope = host_rope
+        self._rope = _HostRope()
+        if host_rope:
+            self._rope.install()
+
+    def restore(self):
+        self._rope.restore()
 
     def forward(self, *tensors):
         from lerobot.policies.common.flow_matching import FlowConvention, make_flow_matching_inputs
 
         model = self.policy.model
         images = list(tensors[:self.n_images])
-        lang_tokens, state, actions, noise, time, attention_mask, position_ids = tensors[self.n_images:]
+        lang_tokens, state, actions, noise, time, attention_mask, *rest = tensors[self.n_images:]
+        position_ids = _text_inputs(self, attention_mask.shape[0], attention_mask.shape[-1], attention_mask.device, rest)
         masks = [torch.ones(image.shape[0], dtype=torch.bool, device=image.device) for image in images]
         x_t, u_t, _ = make_flow_matching_inputs(actions, noise, time, convention=FlowConvention.NOISE_AT_ONE)
         prefix_embs, _, _ = model.embed_prefix(images, masks, lang_tokens, torch.ones_like(lang_tokens, dtype=torch.bool),
@@ -1788,14 +1887,17 @@ class SmolVLATextLayers(torch.nn.Module):
     patterns.
 
     The boundary sets the instance's num_vlm_layers / num_expert_layers to `layers` (so get_model_layers pairs expert
-    layer i with VLM layer i and forward stops after `layers` layers); restore() puts the counts back."""
+    layer i with VLM layer i and forward stops after `layers` layers); restore() puts the counts back (and, with
+    host_rope, apply_rope: the trailing input is then the six host RoPE tables instead of the position ids)."""
 
     static_graph = True
     forbidden_graph_targets = ("aten.cumsum.default",)
 
-    def __init__(self, policy, layers=2):
+    def __init__(self, policy, layers=2, host_rope=False):
         super().__init__()
         self.policy = policy
+        self.host_rope = host_rope
+        self._rope = _HostRope()
         inner = policy.model.vlm_with_expert
         if not 1 <= layers <= min(inner.num_vlm_layers, inner.num_expert_layers):
             raise ValueError(f"layers {layers} outside 1..{min(inner.num_vlm_layers, inner.num_expert_layers)}")
@@ -1803,12 +1905,16 @@ class SmolVLATextLayers(torch.nn.Module):
             raise ValueError("SmolVLATextLayers needs one expert layer per VLM layer")
         self._saved = (inner.num_vlm_layers, inner.num_expert_layers)
         inner.num_vlm_layers = inner.num_expert_layers = layers
+        if host_rope:
+            self._rope.install()
 
     def restore(self):
         inner = self.policy.model.vlm_with_expert
         inner.num_vlm_layers, inner.num_expert_layers = self._saved
+        self._rope.restore()
 
-    def forward(self, prefix_embs, suffix_embs, attention_mask, position_ids):
+    def forward(self, prefix_embs, suffix_embs, attention_mask, *rest):
+        position_ids = _text_inputs(self, attention_mask.shape[0], attention_mask.shape[-1], attention_mask.device, rest)
         (_, suffix_out), _ = self.policy.model.vlm_with_expert.forward(
             attention_mask=attention_mask, position_ids=position_ids,
             past_key_values=None, inputs_embeds=[prefix_embs, suffix_embs], use_cache=False)
@@ -1834,23 +1940,33 @@ def _smolvla_embedded(policy, n_images, case):
     return (prefix, suffix, torch.cat([prefix_pad, suffix_pad], dim=1), torch.cat([prefix_att, suffix_att], dim=1))
 
 
-def smolvla_flow_inputs(policy, n_images, case, keep_self_for_padded=False):
+def _position_inputs(policy, position_ids, prefix_len, host_rope):
+    if not host_rope:
+        return (position_ids,)
+    tables = smolvla_rope_tables(position_ids, prefix_len, _rope_head_dim(policy))
+    return tuple(t.contiguous() for name in ROPE_TABLES for t in tables[name])
+
+
+def smolvla_flow_inputs(policy, n_images, case, keep_self_for_padded=False, host_rope=False):
     """SmolVLAFlowLoss inputs for one smolvla_raw_cases tuple (images, lang_tokens, lang_masks, state, actions, noise,
-    time): the same tensors without lang_masks, then the host attention mask and position ids."""
-    _, _, pad, att = _smolvla_embedded(policy, n_images, case)
+    time): the same tensors without lang_masks, then the host attention mask and position ids (with host_rope: the
+    host RoPE tables of those position ids)."""
+    prefix, _, pad, att = _smolvla_embedded(policy, n_images, case)
     mask, position_ids, _ = smolvla_attention_inputs(pad, att, keep_self_for_padded)
     images, (lang_tokens, _, state, actions, noise, time) = case[:n_images], case[n_images:]
-    return (*images, lang_tokens, state, actions, noise, time, mask, position_ids)
+    return (*images, lang_tokens, state, actions, noise, time, mask,
+            *_position_inputs(policy, position_ids, prefix.shape[1], host_rope))
 
 
-def smolvla_text_cases(policy, n_images, seed, device, count=2, keep_self_for_padded=False):
+def smolvla_text_cases(policy, n_images, seed, device, count=2, keep_self_for_padded=False, host_rope=False):
     """Inputs of SmolVLATextLayers for the smolvla_raw_cases inputs: the policy's own embed_prefix / embed_suffix on
     them and the host attention mask and position ids (smolvla_attention_inputs)."""
     cases = []
     for case in smolvla_raw_cases(policy, n_images, seed, device, count):
         prefix, suffix, pad, att = _smolvla_embedded(policy, n_images, case)
         mask, position_ids, _ = smolvla_attention_inputs(pad, att, keep_self_for_padded)
-        cases.append(tuple(v.contiguous() for v in (prefix, suffix, mask, position_ids)))
+        cases.append(tuple(v.contiguous() for v in (prefix, suffix, mask,
+                                                     *_position_inputs(policy, position_ids, prefix.shape[1], host_rope))))
     return cases
 
 
@@ -1873,9 +1989,10 @@ def smolvla_raw_cases(policy, n_images, seed, device, count=2, image_size=None):
     return cases
 
 
-def smolvla_cases(policy, n_images, seed, device, count=2, image_size=None, keep_self_for_padded=False):
+def smolvla_cases(policy, n_images, seed, device, count=2, image_size=None, keep_self_for_padded=False,
+                  host_rope=False):
     """`count` fixed input tuples for SmolVLAFlowLoss: smolvla_raw_cases through smolvla_flow_inputs."""
-    return [smolvla_flow_inputs(policy, n_images, case, keep_self_for_padded)
+    return [smolvla_flow_inputs(policy, n_images, case, keep_self_for_padded, host_rope)
             for case in smolvla_raw_cases(policy, n_images, seed, device, count, image_size)]
 
 
@@ -1902,6 +2019,9 @@ def main(argv=None):
                              "flow-matching loss forward, or its first --layers text / expert layers "
                              "(SmolVLATextLayers: prefix, suffix embeddings, attention mask, position ids -> suffix output); "
                              "both SmolVLA boundaries take the host-computed attention mask and position ids")
+    parser.add_argument("--host-rope", action="store_true",
+                        help="SmolVLA boundaries: take the host RoPE cos / sin tables (smolvla_rope_tables) instead of "
+                             "the position ids, so the graph computes no RoPE angle")
     parser.add_argument("--layers", type=int, default=2, help="text / expert layers with --boundary smolvla_text_layers")
     parser.add_argument("--layer", type=int, default=0, help="decoder layer index with --boundary causal_lm_layer")
     parser.add_argument("--n-images", type=int, default=1, help="cameras at the smolvla_flow_loss boundary")
@@ -1929,11 +2049,11 @@ def main(argv=None):
             load_quantized.load_quantized(model_id, args.export_dir, args.device, build=lambda: lerobot_policy,
                                           mode="ref_conv", options={})
             if args.boundary == "smolvla_text_layers":
-                cases = smolvla_text_cases(lerobot_policy, args.n_images, args.seed, args.device)
-                boundary = SmolVLATextLayers(lerobot_policy, args.layers).eval()
+                cases = smolvla_text_cases(lerobot_policy, args.n_images, args.seed, args.device, host_rope=args.host_rope)
+                boundary = SmolVLATextLayers(lerobot_policy, args.layers, host_rope=args.host_rope).eval()
             else:
-                boundary = SmolVLAFlowLoss(lerobot_policy, args.n_images).eval()
-                cases = smolvla_cases(lerobot_policy, args.n_images, args.seed, args.device)
+                boundary = SmolVLAFlowLoss(lerobot_policy, args.n_images, host_rope=args.host_rope).eval()
+                cases = smolvla_cases(lerobot_policy, args.n_images, args.seed, args.device, host_rope=args.host_rope)
             config_dict = __import__("dataclasses").asdict(lerobot_policy.config)
         else:
             model, _, _ = load_quantized.load_quantized(args.model, args.export_dir, args.device,
@@ -1964,7 +2084,8 @@ def main(argv=None):
                                         "capture_source": _capture_source(),
                                         "seed": args.seed, "seqlen": args.seqlen,
                                         **({"layer": args.layer} if args.boundary == "causal_lm_layer" else {}),
-                                        **({"layers": args.layers} if args.boundary == "smolvla_text_layers" else {})})
+                                        **({"layers": args.layers} if args.boundary == "smolvla_text_layers" else {}),
+                                        **({"host_rope": True} if args.host_rope else {})})
     print(json.dumps(report, indent=2))
     return 0
 
