@@ -3,6 +3,7 @@
 import copy
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import tomllib
@@ -102,10 +103,13 @@ def test_causal_cli_captures_local_export_with_local_architecture(tmp_path):
                                    model_record={"kind": "causal_lm", "id": str(config_dir)},
                                    calib_batches=batches, calib_record={"source": "test"})
     directory = tmp_path / "cli_fx"
+    # the script imports the `exporter` package from the repository's src (as `python -m` from src would)
+    src = str(Path(fx_export.__file__).resolve().parent.parent)
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(p for p in (src, os.environ.get("PYTHONPATH")) if p)}
     done = subprocess.run([sys.executable, str(Path(fx_export.__file__).resolve()),
                            "--export-dir", str(export_dir), "--model", str(config_dir),
                            "--out-dir", str(directory), "--device", "cpu", "--seqlen", "8"],
-                          capture_output=True, text=True)
+                          capture_output=True, text=True, env=env)
     assert done.returncode == 0, done.stdout + done.stderr
     report = json.loads((directory / "verification.json").read_text())
     assert report["status"] == "passed"

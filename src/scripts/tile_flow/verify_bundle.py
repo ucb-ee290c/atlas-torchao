@@ -38,8 +38,10 @@ ALLOWED_PLAIN_OPS = {"aten.scaled_dot_product_attention": "plain BF16 scaled_dot
 
 
 def _module_candidates(module):
-    """The module path as recorded (wrapper-prefixed) and with the wrapper's leading 'model.' removed."""
-    return {module, module[len("model."):]} if module and module.startswith("model.") else {module}
+    """The module path as recorded (wrapper-prefixed) and with the wrapper's leading 'policy.' and / or 'model.' removed
+    (_scope_candidates). A SmolVLA bundle's parameter targets read 'policy.model.<...>' while its policy sites read
+    'model.<...>', so stripping only 'model.' never matched a host site there."""
+    return _scope_candidates(module) if module else {module}
 
 
 def _overlaps(module, site):
@@ -418,16 +420,32 @@ def run(export, fx, out, allow_fallback=False, allow_unquantized_attention=True,
                       if sp.kind.name == "BUFFER" and hasattr(sp.arg, "name") and isinstance(sp.target, str)}
     nodes_on_codes = collections.Counter(getattr(n.args[2], "name", None) for n in prog.graph.nodes if n.op == "call_function"
                                          and str(n.target) in ("atlas.qlinear.default", "atlas.qconv2d.default"))
+    ops_on_codes = collections.defaultdict(set)
+    for n in prog.graph.nodes:
+        if n.op == "call_function" and str(n.target) in ("atlas.qlinear.default", "atlas.qconv2d.default"):
+            ops_on_codes[getattr(n.args[2], "name", None)].add(str(n.target).split(".")[1])
     calls_derived = {n: nodes_on_codes.get(placeholder_of.get(code_stems[n]), 0) for n in used}
     calls_declared = {r["site"]: r.get("calls", 1) for r in gi["weight_site_bindings"]}
-    n_lin_nodes = sum(c for n, c in calls_derived.items() if used[n]["kind"] == "linear")
-    n_conv_nodes = sum(c for n, c in calls_derived.items() if used[n]["kind"] == "conv2d")
+    # A Conv2d site is carried by qconv2d (im2col rows), or by qlinear on its patch rows when it is a patch embedding
+    # (stride == kernel, no padding, dilation 1: fx_export.conv_patch_rows). Every other site kind / op pair is wrong.
+    site_ops = {n: ops_on_codes.get(placeholder_of.get(code_stems[n]), set()) for n in used}
+    patch_row_sites = sorted(n for n in used if used[n]["kind"] == "conv2d" and site_ops[n] == {"qlinear"})
+    conv_geometry_ok = all(
+        list((used[n].get("conv") or {}).get("stride", [])) == list((used[n].get("conv") or {}).get("kernel_size", [None]))
+        and list((used[n].get("conv") or {}).get("padding", [])) == [0, 0]
+        and list((used[n].get("conv") or {}).get("dilation", [])) == [1, 1] for n in patch_row_sites)
+    ops_ok = all(site_ops[n] == ({"qlinear"} if used[n]["kind"] == "linear" else site_ops[n] & {"qlinear", "qconv2d"})
+                 and len(site_ops[n]) == 1 for n in used)
+    n_lin_nodes = sum(c for n, c in calls_derived.items() if used[n]["kind"] == "linear" or n in patch_row_sites)
+    n_conv_nodes = sum(c for n, c in calls_derived.items() if used[n]["kind"] == "conv2d" and n not in patch_row_sites)
     multi_call = {n: c for n, c in calls_derived.items() if c != 1}
     check("graph_qlinear_count_equals_quantized_linears",
-          cnt("qlinear") == n_lin_nodes and cnt("qconv2d") == n_conv_nodes and unused_agree
+          cnt("qlinear") == n_lin_nodes and cnt("qconv2d") == n_conv_nodes and unused_agree and ops_ok and conv_geometry_ok
           and all(c >= 1 for c in calls_derived.values()) and calls_derived == {n: calls_declared.get(n, 1) for n in used},
           {"qlinear": cnt("qlinear"), "policy_linear_in_graph": n_lin_used, "qlinear_nodes_derived": n_lin_nodes,
            "qconv2d": cnt("qconv2d"), "policy_conv2d_in_graph": n_conv_used, "qconv2d_nodes_derived": n_conv_nodes,
+           "conv2d_sites_as_patch_row_qlinear": patch_row_sites, "patch_row_geometry_ok": conv_geometry_ok,
+           "one_op_kind_per_site": ops_ok,
            "sites_called_more_than_once": multi_call,
            "policy_sites_not_in_graph": unused_derived, "declared_unused": unused_declared})
     check("graph_qk_pv_counts_equal_attention_sites",

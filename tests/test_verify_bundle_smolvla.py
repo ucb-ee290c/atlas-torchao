@@ -32,6 +32,26 @@ def test_scope_helpers_handle_both_wrapper_names_and_scope_less_nodes():
     assert "model.a" in stems and "layers.0.q" in stems and "policy.model.a" in stems and "model.b" not in stems
 
 
+def test_host_conv_under_the_policy_wrapper_is_declared_bf16_by_policy():
+    """keep_bf16 SmolVLA bundle: the BF16 patch-embedding Conv2d has parameter target 'policy.model.<...>.weight' and the
+    host site 'model.<...>'. It is a declared bf16_by_policy contraction (stripping only 'model.' never matched it); a
+    Conv2d whose site is quantized, or that no site covers, stays unexpected."""
+    vb = _script("verify_bundle")
+    site = "model.vlm_with_expert.vlm.model.vision_model.embeddings.patch_embedding"
+    policy = {"sites": {site: {"status": "host", "kind": "Conv2d"},
+                        "model.action_in_proj": {"status": "quantized", "kind": "linear"}}}
+    conv = {"node": "conv2d", "target": "aten.conv2d.padding", "module": "policy." + site,
+            "operands": [{"name": "to", "dtype": "torch.bfloat16", "shape": [1, 3, 512, 512]},
+                         {"name": "p_w", "dtype": "torch.bfloat16", "shape": [768, 3, 16, 16]},
+                         {"name": "p_b", "dtype": "torch.bfloat16", "shape": [768]}]}
+    for prefix in ("policy.", ""):                                     # SmolVLA wrapper and the LM wrapper 'model.'
+        allowed, unexpected = vb.classify_contractions([conv], policy, {"p_w": f"{prefix}{site}.weight"})
+        assert not unexpected and [a["declared_as"] for a in allowed] == ["bf16_by_policy"], (prefix, unexpected)
+    for target in ("policy.model.action_in_proj.weight", "policy.model.other.weight"):
+        allowed, unexpected = vb.classify_contractions([conv], policy, {"p_w": target})
+        assert not allowed and len(unexpected) == 1
+
+
 # -- a real tiny capture, with a never-called quantized site grafted on ----------------------------------------------------
 
 @pytest.fixture(scope="module")
