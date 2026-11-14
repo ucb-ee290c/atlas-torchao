@@ -38,8 +38,10 @@ ALLOWED_PLAIN_OPS = {"aten.scaled_dot_product_attention": "plain BF16 scaled_dot
 
 
 def _module_candidates(module):
-    """The module path as recorded (wrapper-prefixed) and with the wrapper's leading 'model.' removed."""
-    return {module, module[len("model."):]} if module and module.startswith("model.") else {module}
+    """The module path as recorded (wrapper-prefixed) and with the wrapper's leading 'policy.' and / or 'model.' removed
+    (_scope_candidates). A SmolVLA bundle's parameter targets read 'policy.model.<...>' while its policy sites read
+    'model.<...>', so stripping only 'model.' never matched a host site there."""
+    return _scope_candidates(module) if module else {module}
 
 
 def _overlaps(module, site):
