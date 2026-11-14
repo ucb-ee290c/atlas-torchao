@@ -137,6 +137,8 @@ def test_text_layers_boundary_takes_the_host_mask_and_positions(tmp_path, native
     assert {row["mask_source"] for row in forms} == {user[2].arg.name}         # the mask placeholder, no where
     calls = [n for n in program.graph.nodes if n.op == "call_function"]
     assert not [n for n in calls if "cumsum" in str(n.target)]
+    # drop_dead_pure_nodes (a reloaded program names the unused results of a multi-output op '<op>_unused_<i>')
+    assert not [n for n in calls if not n.users and not n.is_impure() and "_unused_" not in n.name]
     if host_rope:                                                         # no RoPE angle math left in the graph
         assert not [n for n in calls if str(n.target) in ("aten.sin.default", "aten.cos.default", "aten.pow.Scalar")]
     mins = (fx_export.BF16_MIN, torch.finfo(torch.float32).min)                # no mask built in the graph

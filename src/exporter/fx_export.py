@@ -597,7 +597,9 @@ def drop_dead_pure_nodes(program):
     """Remove call_function nodes that have no users and no side effect (Node.is_impure() False), repeatedly, from a
     captured program; returns the removed node names. Used when a boundary's host inputs leave a computation unread
     (the expert's position - min with host RoPE tables): torch.export keeps it and the backend frontend cannot bind
-    an op whose result nothing consumes. Values that reach an output are untouched."""
+    an op whose result nothing consumes, and the flow-loss boundary leaves embed_prefix / embed_suffix's pad and block
+    mask construction unread (stage-capture: "frontend trace does not bind complete captured IR"). Values that reach
+    an output are untouched. Applied to boundaries with drop_dead_nodes (the SmolVLA ones)."""
     removed = []
     changed = True
     while changed:
@@ -1690,7 +1692,7 @@ def capture_fx(module, cases, directory, *, policy, provenance=None, strict=True
             if _without(_inventory(program.named_buffers(), STORAGE_DTYPES[native_fp8] if native_fp8 else torch.uint8),
                         unused) != before:
                 raise FXVerificationError("capture changed code/exponent buffers")
-            if getattr(module, "host_rope", False):
+            if getattr(module, "drop_dead_nodes", False):
                 report["dead_pure_nodes_removed"] = drop_dead_pure_nodes(program)
             graph_report = inspect_graph(program, module, policy, plan if native_fp8 else None,
                                          native_fp8 or "uint8", unused=unused, act_stats=act_stats, calls=calls,
@@ -1862,6 +1864,7 @@ class SmolVLAFlowLoss(torch.nn.Module):
     language pad mask is not an input (embed_prefix gets an all-true one, which the graph never reads)."""
 
     static_graph = True
+    drop_dead_nodes = True
     forbidden_graph_targets = ("aten.cumsum.default",)
 
     def __init__(self, policy, n_images=1, host_rope=False):
@@ -1912,6 +1915,7 @@ class SmolVLATextLayers(torch.nn.Module):
     host_rope, apply_rope: the trailing input is then the six host RoPE tables instead of the position ids)."""
 
     static_graph = True
+    drop_dead_nodes = True
     forbidden_graph_targets = ("aten.cumsum.default",)
 
     def __init__(self, policy, layers=2, host_rope=False):
