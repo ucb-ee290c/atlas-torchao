@@ -12,9 +12,18 @@ for the one-step comparison.
   Pi0 (atlas-pi0 env): (a) prefix, then step with time 1.0, then x = noise + dt * v with dt = -1 (the single-step bundle is
   sample_actions(num_steps=1)) against that bundle's graph in the same process and against its fixture; (b) with --eager-loop the 10-step
   host loop of the manifest (euler.times, float32 dt) against model.sample_actions(num_steps=10) on the same noise.
+  SmolVLA (atlas-lerobot env; no single-step bundle exists, the two positional bundles are the prefix and the denoise_step bundle
+  of smolvla_phase_capture.py): (a) per case of host_cases.safetensors, the host inputs rebuilt from the observation and the
+  manifest alone against the bundles' recorded inputs, the prefix graph's K / V against the manifest (count, per-tensor shape,
+  dtype) and its fixture, step purity (same inputs twice; the K / V inputs unchanged), the step graph on the step bundle's fixture
+  inputs, and the 10-step host loop (euler.times, Python float dt as euler_integrate); (b) with --eager-loop the eager quantized
+  policy rebuilt from the export, in this process: lerobot's own prefill (boolean masks, DynamicCache) against the prefix graph,
+  denoise_step on the eager trajectory against the step graph at every step, and the host loop against sample_actions with the
+  same noise, byte for byte (else the max abs difference); --unpadded adds a case with an all-true language mask.
 usage (PYTHONPATH=<worktree>/src):
   compose_phases.py dit PHASES_DIR SINGLE_STEP_BUNDLE OUT_JSON [--eager-loop EXPORT_DIR] [--seed N]            # atlas-lerobot env
-  compose_phases.py pi0 PHASES_DIR SINGLE_STEP_BUNDLE OUT_JSON [--eager-loop EXPORT_DIR --openpi-dir D --checkpoint-dir D]  # atlas-pi0 env"""
+  compose_phases.py pi0 PHASES_DIR SINGLE_STEP_BUNDLE OUT_JSON [--eager-loop EXPORT_DIR --openpi-dir D --checkpoint-dir D]  # atlas-pi0 env
+  compose_phases.py smolvla PREFIX_BUNDLE DENOISE_STEP_BUNDLE OUT_JSON [--eager-loop EXPORT_DIR] [--unpadded]   # atlas-lerobot env"""
 import argparse
 import json
 import sys
@@ -151,11 +160,181 @@ def compose_pi0(a):
     return 0 if res["ok"] else 1
 
 
+def smolvla_host_loop(step, noise, host, kv, manifest):
+    """The manifest's Euler loop, as euler_integrate runs it: time = full([batch], t, float32) for t in euler.times,
+    x = x + dt * v with the Python float dt."""
+    dt, x, calls = manifest["euler"]["dt"], noise, 0
+    for t in manifest["euler"]["times"]:
+        x = x + dt * step(x, torch.full((x.shape[0],), t, dtype=torch.float32), *host, *kv)
+        calls += 1
+    return x, calls
+
+
+def _kv_matches_manifest(kv, manifest):
+    spec = manifest["graphs"]["prefix"]["outputs"]["kv_cache"]
+    dtype = {"BF16": torch.bfloat16}[spec["dtype"]]
+    rows = [{"name": name, "role": spec["layer_roles"][i // 2], "shape": list(t.shape), "dtype": str(t.dtype),
+             "ok": list(t.shape) == spec["per_tensor_shape"] and t.dtype == dtype}
+            for i, (name, t) in enumerate(zip(spec["names"], kv))]
+    return len(kv) == spec["tensors"] and all(r["ok"] for r in rows), rows
+
+
+def _graph_census(program):
+    """Graph-level checks of a saved phase graph: dead pure nodes, symbolic shapes, softmax mask forms, RoPE / cumsum /
+    float64 nodes, input mutation."""
+    from exporter.fx_export import graph_shape_census, softmax_mask_forms
+
+    calls = [n for n in program.graph.nodes if n.op == "call_function"]
+    forms = softmax_mask_forms(program.graph)
+    return {"dead_pure_nodes": [n.name for n in calls if not n.users and not n.is_impure() and "_unused_" not in n.name],
+            "dynamic_nodes": graph_shape_census(program.graph)["dynamic_nodes"],
+            "softmax_mask_forms": dict(__import__("collections").Counter(r["form"] for r in forms)),
+            "rope_trig_nodes": len([n for n in calls if str(n.target) in ("aten.sin.default", "aten.cos.default")]),
+            "cumsum_nodes": len([n for n in calls if "cumsum" in str(n.target)]),
+            "float64_nodes": [n.name for n in calls if getattr(n.meta.get("val"), "dtype", None) == torch.float64],
+            "user_inputs_mutated": dict(program.graph_signature.user_inputs_to_mutate),
+            "nodes": len(program.graph.nodes)}
+
+
+def compose_smolvla(a):
+    from types import SimpleNamespace
+
+    from safetensors.torch import load_file
+
+    import exporter.fx_export as fx_export
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import smolvla_phase_capture as spc
+
+    pb, sb = Path(a.phases_dir), Path(a.single_step_bundle)
+    manifest = json.loads((pb / "loop_manifest.json").read_text())
+    if (pb / "loop_manifest.json").read_bytes() != (sb / "loop_manifest.json").read_bytes():
+        raise SystemExit("the two bundles carry different loop manifests")
+    pol = manifest["policy"]
+    geometry = SimpleNamespace(tokens_per_image=pol["tokens_per_image"], chunk_size=pol["chunk_size"], head_dim=pol["head_dim"])
+    host_rope = pol["host_rope"]
+    pre_program = torch.export.load(pb / "fx" / "model.pt2")
+    stp_program = torch.export.load(sb / "fx" / "model.pt2")
+    pre, stp = pre_program.module(), stp_program.module()
+    fx_pre, fx_stp = load_file(str(pb / "fx" / "fixtures.safetensors")), load_file(str(sb / "fx" / "fixtures.safetensors"))
+    par_pre = json.loads((pb / "fx" / "parity.json").read_text())["cases"]
+    par_stp = json.loads((sb / "fx" / "parity.json").read_text())["cases"]
+    cases, meta = spc.load_host_cases(pb)
+    if (sb / "host_cases.safetensors").read_bytes() != (pb / "host_cases.safetensors").read_bytes():
+        raise SystemExit("the two bundles were captured on different observations")
+    res = {"prefix_bundle": str(pb), "denoise_step_bundle": str(sb), "host_rope": host_rope,
+           "graphs": {"prefix": _graph_census(pre_program), "denoise_step": _graph_census(stp_program)},
+           "cases": [], "ok": True}
+    composed = {}
+    with torch.no_grad():
+        for i, (images, img_masks, lang_tokens, lang_masks, state, noise) in enumerate(cases):
+            ins, pad = fx_export.smolvla_prefix_inputs(geometry, images, img_masks, lang_tokens, lang_masks, state, host_rope)
+            want_ins = [fx_pre[k] for k in par_pre[i]["inputs"]]
+            kv = pre(*ins)
+            kv_ok, kv_rows = _kv_matches_manifest(kv, manifest)
+            host = fx_export.smolvla_step_host_inputs(geometry, pad, host_rope)
+            before = [tensor_record(t) for t in kv]
+            t0 = torch.full((1,), manifest["euler"]["times"][0], dtype=torch.float32)
+            v1, v2 = stp(noise, t0, *host, *kv), stp(noise, t0, *host, *kv)
+            pure = _bytes_equal(v1, v2) and [tensor_record(t) for t in kv] == before
+            s_ins = [fx_stp[k] for k in par_stp[i]["inputs"]]
+            n_host = len(host)
+            s_host_ok = all(_bytes_equal(x, y) for x, y in zip(host, s_ins[2:2 + n_host]))
+            s_kv_ok = all(_bytes_equal(x, y) for x, y in zip(kv, s_ins[2 + n_host:]))
+            s_out = stp(*s_ins)
+            t1 = time.time()
+            actions, calls = smolvla_host_loop(stp, noise, host, kv, manifest)
+            row = {"case": i, **meta["observations"][i], "padded_language_tokens":
+                   meta["observations"][i]["language_tokens"] - meta["observations"][i]["valid_language_tokens"],
+                   "host_prefix_inputs_equal_recorded": len(ins) == len(want_ins) and all(
+                       _bytes_equal(x, y) for x, y in zip(ins, want_ins)),
+                   "kv_tensors": len(kv), "kv_matches_manifest": kv_ok,
+                   "kv_roles": dict(__import__("collections").Counter(r["role"] for r in kv_rows[::2])),
+                   "prefix_graph_equals_recorded_fixture": all(
+                       _bytes_equal(x, fx_pre[k]) for x, k in zip(kv, par_pre[i]["outputs"])),
+                   "step_pure_same_inputs_twice": _bytes_equal(v1, v2),
+                   "step_kv_inputs_unchanged": [tensor_record(t) for t in kv] == before,
+                   "step_bundle_host_inputs_equal_rebuilt": s_host_ok, "step_bundle_kv_equal_prefix_graph": s_kv_ok,
+                   "step_graph_equals_recorded_fixture": _bytes_equal(s_out, fx_stp[par_stp[i]["outputs"][0]]),
+                   "host_loop_step_calls": calls, "host_loop_seconds": round(time.time() - t1, 1),
+                   "actions_shape": list(actions.shape), "actions_dtype": str(actions.dtype)}
+            if i == 0:
+                res["kv_per_tensor"] = kv_rows
+            res["cases"].append(row)
+            composed[i] = (actions, kv, host, pad)
+            res["ok"] &= (row["host_prefix_inputs_equal_recorded"] and kv_ok and pure and s_host_ok and s_kv_ok
+                          and row["step_graph_equals_recorded_fixture"] and row["prefix_graph_equals_recorded_fixture"])
+            Path(a.out).write_text(json.dumps(res, indent=1))
+            print(json.dumps(row), flush=True)
+        if a.eager_loop:
+            res["eager"] = _smolvla_eager(a, spc, fx_export, pre, stp, cases, composed, manifest, geometry, host_rope, res)
+    Path(a.out).write_text(json.dumps(res, indent=1))
+    print(json.dumps({k: v for k, v in res.items() if k != "kv_per_tensor"}, indent=1))
+    return 0 if res["ok"] else 1
+
+
+def _smolvla_eager(a, spc, fx_export, pre, stp, cases, composed, manifest, geometry, host_rope, res):
+    """Checks 1, 4 and 6 against lerobot's own inference path on the eager quantized policy (no boundary is constructed
+    here, so apply_rope is lerobot's)."""
+    from lerobot.policies.common.vla_utils import make_att_2d_masks
+
+    policy, _, _, _ = spc.load_policy(a.eager_loop)
+    model = policy.model
+    times, dt = manifest["euler"]["times"], manifest["euler"]["dt"]
+    work = [(i, c, composed[i]) for i, c in enumerate(cases)]
+    if a.unpadded:
+        images, img_masks, lang_tokens, lang_masks, state, noise = cases[0]
+        c = (images, img_masks, lang_tokens, torch.ones_like(lang_masks), state, noise)
+        ins, pad = fx_export.smolvla_prefix_inputs(geometry, *c[:5], host_rope)
+        kv = pre(*ins)
+        host = fx_export.smolvla_step_host_inputs(geometry, pad, host_rope)
+        work.append(("unpadded_case_0", c, (smolvla_host_loop(stp, noise, host, kv, manifest)[0], kv, host, pad)))
+    rows = []
+    for i, (images, img_masks, lang_tokens, lang_masks, state, noise), (actions, kv, host, pad) in work:
+        t0 = time.time()
+        embs, e_pad, e_att = model.embed_prefix(list(images), img_masks, lang_tokens, lang_masks, state=state)
+        _, cache = model.vlm_with_expert.forward(attention_mask=make_att_2d_masks(e_pad, e_att),
+                                                 position_ids=torch.cumsum(e_pad, dim=1) - 1, past_key_values=None,
+                                                 inputs_embeds=[embs, None], use_cache=True)
+        eager_kv = [t for layer in cache.layers for t in (layer.keys.transpose(1, 2), layer.values.transpose(1, 2))]
+        prefix_diff = max(_diff(x, y) for x, y in zip(kv, eager_kv))
+        x, steps = noise, []
+        for t in times:
+            tt = torch.full((x.shape[0],), t, dtype=torch.float32)
+            v_e = model.denoise_step(e_pad, cache, x, tt)
+            v_g = stp(x, tt, *host, *kv)
+            steps.append({"t": t, "bytes_equal": _bytes_equal(v_g, v_e), "max_abs_diff": _diff(v_g, v_e)})
+            x = x + dt * v_e
+        t1 = time.time()
+        eager = model.sample_actions(list(images), img_masks, lang_tokens, lang_masks, state, noise=noise)
+        row = {"case": i, "padded_language_tokens": int((~lang_masks.bool()).sum()),
+               "prefix_masks_equal_embed_prefix": torch.equal(pad, e_pad),
+               "prefix_kv_bytes_equal_lerobot_prefill": all(_bytes_equal(x, y) for x, y in zip(kv, eager_kv)),
+               "prefix_kv_max_abs_diff": prefix_diff,
+               "step_bytes_equal_denoise_step_all_steps": all(r["bytes_equal"] for r in steps),
+               "step_max_abs_diff": max(r["max_abs_diff"] for r in steps), "per_step": steps,
+               "eager_loop_equals_sample_actions": _bytes_equal(x, eager),
+               "host_loop_bytes_equal_sample_actions": _bytes_equal(actions, eager),
+               "host_loop_max_abs_diff": _diff(actions, eager),
+               "differing_elements": int((actions != eager).sum()), "elements": actions.numel(),
+               "eager_seconds": round(time.time() - t1, 1), "reference_seconds": round(t1 - t0, 1)}
+        rows.append(row)
+        res["ok"] &= (row["prefix_kv_bytes_equal_lerobot_prefill"] and row["step_bytes_equal_denoise_step_all_steps"]
+                      and row["host_loop_bytes_equal_sample_actions"] and row["prefix_masks_equal_embed_prefix"])
+        if a.cache_dir:
+            Path(a.cache_dir).mkdir(parents=True, exist_ok=True)
+            torch.save({"eager": eager, "composed": actions}, Path(a.cache_dir) / f"smolvla_loop_case{i}.pt")
+        res["eager"] = rows
+        Path(a.out).write_text(json.dumps(res, indent=1))
+        print(json.dumps({k: v for k, v in row.items() if k != "per_step"}), flush=True)
+    return rows
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("model", choices=("dit", "pi0"))
-    ap.add_argument("phases_dir")
-    ap.add_argument("single_step_bundle")
+    ap.add_argument("model", choices=("dit", "pi0", "smolvla"))
+    ap.add_argument("phases_dir", help="dit / pi0: the phases directory; smolvla: the prefix bundle")
+    ap.add_argument("single_step_bundle", help="dit / pi0: the single-step bundle; smolvla: the denoise_step bundle")
     ap.add_argument("out")
     ap.add_argument("--eager-loop", metavar="EXPORT_DIR")
     ap.add_argument("--seed", type=int, default=0)
@@ -164,9 +343,12 @@ def main(argv=None):
     ap.add_argument("--openpi-dir")
     ap.add_argument("--checkpoint-dir")
     ap.add_argument("--tokenizer-path", default="/scratch2/lorenhung/models/big_vision/paligemma_tokenizer.model")
+    ap.add_argument("--unpadded", action="store_true", help="smolvla: also an all-true language mask case (eager loop)")
     a = ap.parse_args(argv)
     if a.model == "pi0":
         return compose_pi0(a)
+    if a.model == "smolvla":
+        return compose_smolvla(a)
     from safetensors.torch import load_file
 
     ph, ss = Path(a.phases_dir), Path(a.single_step_bundle)
