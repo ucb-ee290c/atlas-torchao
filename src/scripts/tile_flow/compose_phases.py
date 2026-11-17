@@ -160,14 +160,29 @@ def compose_pi0(a):
     return 0 if res["ok"] else 1
 
 
-def smolvla_host_loop(step, noise, host, kv, manifest):
+def smolvla_host_loop(step, noise, host, kv, manifest, geometry=None):
     """The manifest's Euler loop, as euler_integrate runs it: time = full([batch], t, float32) for t in euler.times,
-    x = x + dt * v with the Python float dt."""
+    x = x + dt * v with the Python float dt (with host_time_embedding the host also computes each time's embedding)."""
+    from exporter.fx_export import smolvla_step_inputs
+
+    host_time = manifest["policy"].get("host_time_embedding", False)
     dt, x, calls = manifest["euler"]["dt"], noise, 0
     for t in manifest["euler"]["times"]:
-        x = x + dt * step(x, torch.full((x.shape[0],), t, dtype=torch.float32), *host, *kv)
+        tt = torch.full((x.shape[0],), t, dtype=torch.float32)
+        x = x + dt * step(*smolvla_step_inputs(geometry, x, tt, host, kv, host_time))
         calls += 1
     return x, calls
+
+
+def smolvla_manifest_geometry(manifest):
+    """The host-input geometry (fx_export.smolvla_geometry's fields) as the loop manifest records it."""
+    from types import SimpleNamespace
+
+    pol = manifest["policy"]
+    te = pol.get("time_embedding") or {}
+    return SimpleNamespace(tokens_per_image=pol["tokens_per_image"], chunk_size=pol["chunk_size"], head_dim=pol["head_dim"],
+                           time_dim=te.get("time_dim"), min_period=te.get("min_period"), max_period=te.get("max_period"),
+                           time_dtype={"F32": torch.float32, "BF16": torch.bfloat16}.get(te.get("dtype")))
 
 
 def _kv_matches_manifest(kv, manifest):
@@ -211,8 +226,15 @@ def compose_smolvla(a):
     if (pb / "loop_manifest.json").read_bytes() != (sb / "loop_manifest.json").read_bytes():
         raise SystemExit("the two bundles carry different loop manifests")
     pol = manifest["policy"]
-    geometry = SimpleNamespace(tokens_per_image=pol["tokens_per_image"], chunk_size=pol["chunk_size"], head_dim=pol["head_dim"])
+    geometry = smolvla_manifest_geometry(manifest)
     host_rope = pol["host_rope"]
+    host_time = pol.get("host_time_embedding", False)
+    embed = None
+    if pol.get("host_text_embeddings"):          # the host gathers from the export's own table (the manifest's recipe)
+        from safetensors import safe_open
+
+        with safe_open(str(pb / "export" / "model.safetensors"), "pt") as f:
+            embed = fx_export.smolvla_token_embedder(f.get_tensor(fx_export.SMOLVLA_EMBED_TOKENS))
     pre_program = torch.export.load(pb / "fx" / "model.pt2")
     stp_program = torch.export.load(sb / "fx" / "model.pt2")
     pre, stp = pre_program.module(), stp_program.module()
@@ -223,27 +245,32 @@ def compose_smolvla(a):
     if (sb / "host_cases.safetensors").read_bytes() != (pb / "host_cases.safetensors").read_bytes():
         raise SystemExit("the two bundles were captured on different observations")
     res = {"prefix_bundle": str(pb), "denoise_step_bundle": str(sb), "host_rope": host_rope,
+           "host_text_embeddings": embed is not None, "host_time_embedding": host_time,
            "graphs": {"prefix": _graph_census(pre_program), "denoise_step": _graph_census(stp_program)},
            "cases": [], "ok": True}
     composed = {}
     with torch.no_grad():
         for i, (images, img_masks, lang_tokens, lang_masks, state, noise) in enumerate(cases):
-            ins, pad = fx_export.smolvla_prefix_inputs(geometry, images, img_masks, lang_tokens, lang_masks, state, host_rope)
+            ins, pad = fx_export.smolvla_prefix_inputs(geometry, images, img_masks, lang_tokens, lang_masks, state, host_rope,
+                                                       embed)
             want_ins = [fx_pre[k] for k in par_pre[i]["inputs"]]
             kv = pre(*ins)
             kv_ok, kv_rows = _kv_matches_manifest(kv, manifest)
             host = fx_export.smolvla_step_host_inputs(geometry, pad, host_rope)
             before = [tensor_record(t) for t in kv]
             t0 = torch.full((1,), manifest["euler"]["times"][0], dtype=torch.float32)
-            v1, v2 = stp(noise, t0, *host, *kv), stp(noise, t0, *host, *kv)
+            step_in = fx_export.smolvla_step_inputs(geometry, noise, t0, host, kv, host_time)
+            v1, v2 = stp(*step_in), stp(*step_in)
             pure = _bytes_equal(v1, v2) and [tensor_record(t) for t in kv] == before
             s_ins = [fx_stp[k] for k in par_stp[i]["inputs"]]
-            n_host = len(host)
-            s_host_ok = all(_bytes_equal(x, y) for x, y in zip(host, s_ins[2:2 + n_host]))
-            s_kv_ok = all(_bytes_equal(x, y) for x, y in zip(kv, s_ins[2 + n_host:]))
+            n_host, n_time = len(host), int(host_time)
+            s_time_ok = all(_bytes_equal(x, y) for x, y in zip(
+                fx_export.smolvla_time_inputs(geometry, s_ins[1], host_time), s_ins[2:2 + n_time]))
+            s_host_ok = s_time_ok and all(_bytes_equal(x, y) for x, y in zip(host, s_ins[2 + n_time:2 + n_time + n_host]))
+            s_kv_ok = all(_bytes_equal(x, y) for x, y in zip(kv, s_ins[2 + n_time + n_host:]))
             s_out = stp(*s_ins)
             t1 = time.time()
-            actions, calls = smolvla_host_loop(stp, noise, host, kv, manifest)
+            actions, calls = smolvla_host_loop(stp, noise, host, kv, manifest, geometry)
             row = {"case": i, **meta["observations"][i], "padded_language_tokens":
                    meta["observations"][i]["language_tokens"] - meta["observations"][i]["valid_language_tokens"],
                    "host_prefix_inputs_equal_recorded": len(ins) == len(want_ins) and all(
@@ -267,13 +294,14 @@ def compose_smolvla(a):
             Path(a.out).write_text(json.dumps(res, indent=1))
             print(json.dumps(row), flush=True)
         if a.eager_loop:
-            res["eager"] = _smolvla_eager(a, spc, fx_export, pre, stp, cases, composed, manifest, geometry, host_rope, res)
+            res["eager"] = _smolvla_eager(a, spc, fx_export, pre, stp, cases, composed, manifest, geometry, host_rope, res,
+                                          embed)
     Path(a.out).write_text(json.dumps(res, indent=1))
     print(json.dumps({k: v for k, v in res.items() if k != "kv_per_tensor"}, indent=1))
     return 0 if res["ok"] else 1
 
 
-def _smolvla_eager(a, spc, fx_export, pre, stp, cases, composed, manifest, geometry, host_rope, res):
+def _smolvla_eager(a, spc, fx_export, pre, stp, cases, composed, manifest, geometry, host_rope, res, embed=None):
     """Checks 1, 4 and 6 against lerobot's own inference path on the eager quantized policy (no boundary is constructed
     here, so apply_rope is lerobot's)."""
     from lerobot.policies.common.vla_utils import make_att_2d_masks
@@ -285,10 +313,10 @@ def _smolvla_eager(a, spc, fx_export, pre, stp, cases, composed, manifest, geome
     if a.unpadded:
         images, img_masks, lang_tokens, lang_masks, state, noise = cases[0]
         c = (images, img_masks, lang_tokens, torch.ones_like(lang_masks), state, noise)
-        ins, pad = fx_export.smolvla_prefix_inputs(geometry, *c[:5], host_rope)
+        ins, pad = fx_export.smolvla_prefix_inputs(geometry, *c[:5], host_rope, embed)
         kv = pre(*ins)
         host = fx_export.smolvla_step_host_inputs(geometry, pad, host_rope)
-        work.append(("unpadded_case_0", c, (smolvla_host_loop(stp, noise, host, kv, manifest)[0], kv, host, pad)))
+        work.append(("unpadded_case_0", c, (smolvla_host_loop(stp, noise, host, kv, manifest, geometry)[0], kv, host, pad)))
     rows = []
     for i, (images, img_masks, lang_tokens, lang_masks, state, noise), (actions, kv, host, pad) in work:
         t0 = time.time()
@@ -302,7 +330,8 @@ def _smolvla_eager(a, spc, fx_export, pre, stp, cases, composed, manifest, geome
         for t in times:
             tt = torch.full((x.shape[0],), t, dtype=torch.float32)
             v_e = model.denoise_step(e_pad, cache, x, tt)
-            v_g = stp(x, tt, *host, *kv)
+            v_g = stp(*fx_export.smolvla_step_inputs(geometry, x, tt, host, kv,
+                                                     manifest["policy"].get("host_time_embedding", False)))
             steps.append({"t": t, "bytes_equal": _bytes_equal(v_g, v_e), "max_abs_diff": _diff(v_g, v_e)})
             x = x + dt * v_e
         t1 = time.time()

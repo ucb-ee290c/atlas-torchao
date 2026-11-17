@@ -5,7 +5,9 @@ the Euler loop (loop_manifest.json from make_loop_manifest.py smolvla; docs/algo
   prefix:       SmolVLAPrefix (image_0, image_1, lang_tokens, state, mask, positions) -> (k_0, v_0, ..., k_15, v_15)
   denoise_step: SmolVLADenoiseStep (x_t, time, mask, positions, k_0, v_0, ..., k_15, v_15) -> v_t
   (positions: the position ids, or with --host-rope the host RoPE tables; fx_export.smolvla_prefix_inputs /
-  smolvla_step_host_inputs compute them and the masks on the host)
+  smolvla_step_host_inputs compute them and the masks on the host. With --host-text-embeddings the prefix takes
+  lerobot's embed_language_tokens(lang_tokens) instead of lang_tokens; with --host-time-embedding the step takes the
+  flow-timestep embedding right after time, fx_export.smolvla_time_inputs)
 
 Capture cases: --frames LIBERO frames of the protocol the export was made with (eval_policy.py --dataset lerobot/libero
 --n-test-episodes 32 --n-frames 256 --seed 0: test episodes by seed, frames by seed + 1), evenly spaced over those 256,
@@ -152,19 +154,22 @@ def euler_step_of_case(i, n_cases, num_steps):
     return round(i * (num_steps - 1) / max(1, n_cases - 1))
 
 
-def trajectory_points(policy, prefix_cases, pads, kvs, noises, times, dt, step_indices, host_rope):
+def trajectory_points(policy, prefix_cases, pads, kvs, noises, times, dt, step_indices, host_rope,
+                      host_time_embedding=False):
     """[(x_t, time)] at the given Euler step of each case, from the eager SmolVLADenoiseStep loop."""
     import exporter.fx_export as fx_export
 
-    step = fx_export.SmolVLADenoiseStep(policy, host_rope=host_rope).eval()
+    geometry = fx_export.smolvla_geometry(policy)
+    step = fx_export.SmolVLADenoiseStep(policy, host_rope=host_rope, host_time_embedding=host_time_embedding).eval()
     points = []
     try:
         with torch.no_grad():
             for pad, kv, noise, k in zip(pads, kvs, noises, step_indices):
-                host = fx_export.smolvla_step_host_inputs(fx_export.smolvla_geometry(policy), pad, host_rope)
+                host = fx_export.smolvla_step_host_inputs(geometry, pad, host_rope)
                 x = noise
                 for t in times[:k]:
-                    x = x + dt * step(x, torch.full((x.shape[0],), t, dtype=torch.float32), *host, *kv)
+                    tt = torch.full((x.shape[0],), t, dtype=torch.float32)
+                    x = x + dt * step(*fx_export.smolvla_step_inputs(geometry, x, tt, host, kv, host_time_embedding))
                 points.append((x.contiguous(), torch.full((x.shape[0],), times[k], dtype=torch.float32)))
     finally:
         step.restore()
@@ -202,6 +207,8 @@ def main(argv=None):
     ap.add_argument("--out", required=True)
     ap.add_argument("--frames", type=int, default=4)
     ap.add_argument("--host-rope", action="store_true")
+    ap.add_argument("--host-text-embeddings", action="store_true", help="prefix: host language-token embeddings")
+    ap.add_argument("--host-time-embedding", action="store_true", help="denoise_step: host flow-timestep embedding")
     ap.add_argument("--dataset-root", help="local snapshot of lerobot/libero (default: lerobot's hub cache)")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--dry", action="store_true")
@@ -211,35 +218,41 @@ def main(argv=None):
 
     export_dir, out, lm_path = Path(a.export_dir), Path(a.out), Path(a.loop_manifest)
     lm = json.loads(lm_path.read_text())
-    if lm.get("model") != "smolvla" or lm["policy"]["host_rope"] != a.host_rope:
-        raise SystemExit(f"{lm_path} is not a SmolVLA loop manifest with host_rope {a.host_rope}")
+    flags = {"host_rope": a.host_rope, "host_text_embeddings": a.host_text_embeddings,
+             "host_time_embedding": a.host_time_embedding}
+    if lm.get("model") != "smolvla" or any(lm["policy"].get(k, False) != v for k, v in flags.items()):
+        raise SystemExit(f"{lm_path} is not a SmolVLA loop manifest with {flags}")
     policy, cfg, policy_json, manifest = load_policy(export_dir, a.device)
     obs, record = observations(policy, cfg, manifest["model"]["id"], a.frames, a.dataset_root, a.device)
     n_images = len(obs[0]["images"])
     geometry = fx_export.smolvla_geometry(policy)
+    embed = policy.model.vlm_with_expert.embed_language_tokens if a.host_text_embeddings else None   # lerobot's own
     prefix_cases, pads = [], []
     for o in obs:
         case, pad = fx_export.smolvla_prefix_inputs(geometry, o["images"], o["img_masks"], o["lang_tokens"],
-                                                    o["lang_masks"], o["state"], a.host_rope)
+                                                    o["lang_masks"], o["state"], a.host_rope, embed)
         check_against_manifest(lm, "prefix", case)
         prefix_cases.append(case)
         pads.append(pad)
     steps = None
     if a.phase == "prefix":
         cases = prefix_cases
-        boundary = fx_export.SmolVLAPrefix(policy, n_images, host_rope=a.host_rope).eval()
+        boundary = fx_export.SmolVLAPrefix(policy, n_images, host_rope=a.host_rope,
+                                           host_text_embeddings=a.host_text_embeddings).eval()
     else:
-        kvs = fx_export.smolvla_prefix_outputs(policy, n_images, prefix_cases, a.host_rope)
+        kvs = fx_export.smolvla_prefix_outputs(policy, n_images, prefix_cases, a.host_rope, a.host_text_embeddings)
         for kv in kvs:
             check_against_manifest(lm, "prefix", prefix_cases[0], kv)
         steps = [euler_step_of_case(i, len(obs), lm["denoising_steps"]) for i in range(len(obs))]
         points = trajectory_points(policy, prefix_cases, pads, kvs, [o["noise"] for o in obs], lm["euler"]["times"],
-                                   lm["euler"]["dt"], steps, a.host_rope)
-        cases = [(x, t, *fx_export.smolvla_step_host_inputs(geometry, pad, a.host_rope), *(k.contiguous() for k in kv))
+                                   lm["euler"]["dt"], steps, a.host_rope, a.host_time_embedding)
+        cases = [fx_export.smolvla_step_inputs(geometry, x, t, fx_export.smolvla_step_host_inputs(geometry, pad, a.host_rope),
+                                               tuple(k.contiguous() for k in kv), a.host_time_embedding)
                  for (x, t), pad, kv in zip(points, pads, kvs)]
         for case in cases:
             check_against_manifest(lm, "denoise_step", case)
-        boundary = fx_export.SmolVLADenoiseStep(policy, host_rope=a.host_rope).eval()
+        boundary = fx_export.SmolVLADenoiseStep(policy, host_rope=a.host_rope,
+                                                host_time_embedding=a.host_time_embedding).eval()
     try:
         if a.dry:
             with torch.no_grad():
@@ -260,7 +273,7 @@ def main(argv=None):
                         "export_manifest_sha256": quant_export.sha256_file(export_dir / "manifest.json"),
                         "export_provenance": manifest.get("provenance", {}), "export_recipe": manifest.get("recipe", {}),
                         "architecture_locator": manifest["model"]["id"], "boundary": f"smolvla_{a.phase}",
-                        "phase": a.phase, "host_rope": a.host_rope, "n_images": n_images,
+                        "phase": a.phase, **flags, "n_images": n_images,
                         "boundary_driver": str(here), "boundary_driver_sha256": hashlib.sha256(here.read_bytes()).hexdigest(),
                         "boundary_note": "per-phase boundary; the host owns the Euler loop (loop_manifest)",
                         "loop_manifest": {"file": "../loop_manifest.json",

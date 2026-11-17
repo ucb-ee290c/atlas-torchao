@@ -353,7 +353,10 @@ def _hf_file(repo_id, name):
     return Path(hf_hub_download(repo_id, name, local_files_only=True))
 
 
-def smolvla_manifest(policy_id, n_images, host_rope=False):
+SMOLVLA_EMBED_TOKENS = "model.vlm_with_expert.vlm.model.text_model.embed_tokens.weight"   # = fx_export's
+
+
+def smolvla_manifest(policy_id, n_images, host_rope=False, host_text_embeddings=False, host_time_embedding=False):
     import torch
     import lerobot.policies.common.flow_matching as fm
     import lerobot.policies.smolvla.modeling_smolvla as ms
@@ -411,6 +414,18 @@ def smolvla_manifest(policy_id, n_images, host_rope=False):
                        for name in ("suffix", "expert") for f in ("cos", "sin")} if host_rope else
                       {"position_ids": {"shape": [1, chunk], "dtype": "I64"}})
     noise = {"shape": [1, chunk, adim], "dtype": "F32", "distribution": "standard normal (sample_noise, float32)"}
+    text_hidden = text["hidden_size"]
+    time_dim = int(text_hidden * cfg["expert_width_multiplier"])           # smolvlm_with_expert: expert_hidden_size
+    time_embedding = {"function": "lerobot.policies.common.vla_utils.create_sinusoidal_pos_embedding(time, "
+                                  f"{time_dim}, min_period {cfg['min_period']}, max_period {cfg['max_period']}) (float64), "
+                                  "then .type(dtype=action_emb.dtype) as embed_suffix does (fx_export.smolvla_time_inputs)",
+                      "time_dim": time_dim, "min_period": cfg["min_period"], "max_period": cfg["max_period"],
+                      "dtype": "F32", "dtype_source": "action_in_proj's output dtype (float32 for these policies; the "
+                                                      "capture driver checks the case dtypes against this manifest)"}
+    lang_input = ({"lang_embeddings": {"shape": [1, lang, text_hidden], "dtype": "BF16",
+                                       "form": "embed_tokens.weight[lang_tokens] (embed_language_tokens on the host)"}}
+                  if host_text_embeddings else {"lang_tokens": {"shape": [1, lang], "dtype": "I64"}})
+    time_input = {"time_embedding": {"shape": [1, time_dim], "dtype": time_embedding["dtype"]}} if host_time_embedding else {}
     return {
         "schema": SCHEMA, "model": "smolvla", "objective": "flow matching, Euler (noise at t = 1)",
         "sources": {"policy_config": str(cfg_path), "policy_config_sha256": _sha(cfg_path),
@@ -437,14 +452,16 @@ def smolvla_manifest(policy_id, n_images, host_rope=False):
                   "max_state_dim": cfg["max_state_dim"], "tokenizer_max_length": lang, "num_vlm_layers": layers,
                   "self_attn_every_n_layers": every, "attention_mode": cfg["attention_mode"],
                   "vlm_model_name": cfg["vlm_model_name"], "image_size": cfg["resize_imgs_with_padding"],
-                  "cameras": cameras, "host_rope": host_rope},
+                  "cameras": cameras, "host_rope": host_rope, "host_text_embeddings": host_text_embeddings,
+                  "host_time_embedding": host_time_embedding, "text_hidden_size": text_hidden,
+                  "time_embedding": time_embedding},
         "graphs": {
             "prefix": {"path": "prefix bundle fx/", "calls_per_action_chunk": 1,
                        "boundary": "SmolVLAPrefix: embed_prefix (vision tower + connector per camera, language "
                                    "embedding, state_proj) and every VLM text layer up to its K / V",
                        "inputs": {**{f"image_{i}": {"shape": [1, 3, *cfg["resize_imgs_with_padding"][::-1]],
                                                     "dtype": "BF16"} for i in range(n_images)},
-                                  "lang_tokens": {"shape": [1, lang], "dtype": "I64"},
+                                  **lang_input,
                                   "state": {"shape": [1, cfg["max_state_dim"]], "dtype": "BF16"},
                                   "attention_mask": {"shape": [1, prefix_len, prefix_len], "dtype": "BF16",
                                                      "form": "additive: 0 kept, BF16 minimum masked"},
@@ -454,7 +471,7 @@ def smolvla_manifest(policy_id, n_images, host_rope=False):
                      "boundary": "SmolVLADenoiseStep: embed_suffix (action / time MLP) + the action expert reading the "
                                  "prefix K / V + action_out_proj",
                      "inputs": {"x_t": {"shape": noise["shape"], "dtype": noise["dtype"]},
-                                "time": {"shape": [1], "dtype": "F32"},
+                                "time": {"shape": [1], "dtype": "F32"}, **time_input,
                                 "attention_mask": {"shape": [1, chunk, prefix_len + chunk], "dtype": "BF16",
                                                    "form": "additive: 0 kept, BF16 minimum masked"},
                                 **step_positions, "kv_cache": kv},
@@ -462,7 +479,8 @@ def smolvla_manifest(policy_id, n_images, host_rope=False):
         "per_call_inputs": {
             "prefix": f"once per action chunk: {n_images} camera images, tokenized instruction, state",
             "step": {"changes_every_call": ["x_t (previous Euler output; the noise at the first call)",
-                                            "time (euler.times[i], float32, expanded to batch)"],
+                                            "time (euler.times[i], float32, expanded to batch)",
+                                            *(["time_embedding (of that time; host)"] if host_time_embedding else [])],
                      "constant_over_the_loop": ["attention_mask and positions (they depend only on the prefix pad mask)",
                                                 f"kv_cache ({kv['tensors']} tensors, the prefix graph outputs; the step "
                                                 "graph never writes them)"]}},
@@ -477,14 +495,22 @@ def smolvla_manifest(policy_id, n_images, host_rope=False):
             "step position_ids": "sum(prefix_pad_masks) + arange(chunk); the cross-attention layers use arange(chunk) "
                                  "(position_ids minus its row minimum)",
             **({"rope_tables": rope} if host_rope else {}),
+            **({"lang_embeddings": f"export tensor {SMOLVLA_EMBED_TOKENS}[lang_tokens] (BF16 [vocab, {text_hidden}]), "
+                                   "the gather nn.Embedding does (embed_language_tokens; fx_export.smolvla_token_embedder); "
+                                   "embed_prefix's sqrt(hidden) scaling stays in the prefix graph"}
+               if host_text_embeddings else {}),
+            **({"time_embedding": time_embedding} if host_time_embedding else {}),
             "language_padding": "padded language tokens stay padded (keep_self_for_padded off): their prefix rows are "
                                 "fully masked, which the additive form keeps uniform, as the boolean form does"},
         "initial_noise": noise | {"draws": 1},
-        "loop": ["k_0, v_0, ... = prefix(images, lang_tokens, state, mask, positions)      # 1 call",
+        "loop": [("k_0, v_0, ... = prefix(images, lang_embeddings, state, mask, positions) # 1 call" if host_text_embeddings
+                  else "k_0, v_0, ... = prefix(images, lang_tokens, state, mask, positions)      # 1 call"),
                  "x = normal(1, chunk, max_action_dim) float32                             # host",
                  "mask, positions = step host inputs (from prefix_pad_masks)                # host, once",
                  f"for t in euler.times:                                                   # {len(times)} iterations",
-                 "    v = step(x, full([1], t, float32), mask, positions, k_0, v_0, ...)    # step calls",
+                 ("    v = step(x, tt := full([1], t, float32), time_embedding(tt), mask, positions, k_0, v_0, ...)"
+                  if host_time_embedding else
+                  "    v = step(x, full([1], t, float32), mask, positions, k_0, v_0, ...)    # step calls"),
                  "    x = x + dt * v                                                        # host, float32",
                  f"actions = x[:, :, :{cfg['output_features']['action']['shape'][0]}]        # host, unpad"],
         "host_operations": [
@@ -507,6 +533,10 @@ def main(argv=None):
     ap.add_argument("--policy", default="lerobot/smolvla_libero", help="smolvla: policy repo id (local HF cache)")
     ap.add_argument("--n-images", type=int, default=2, help="smolvla: cameras at the prefix boundary")
     ap.add_argument("--host-rope", action="store_true", help="smolvla: the phase graphs take host RoPE tables")
+    ap.add_argument("--host-text-embeddings", action="store_true",
+                    help="smolvla: the prefix graph takes the host language-token embeddings")
+    ap.add_argument("--host-time-embedding", action="store_true",
+                    help="smolvla: the step graph takes the host flow-timestep embedding")
     ap.add_argument("--out", required=True)
     ap.add_argument("--checkpoint-dir")
     ap.add_argument("--openpi-dir")
@@ -517,7 +547,7 @@ def main(argv=None):
     if a.model == "dit":
         manifest = dit_manifest(a.single_step_bundle)
     elif a.model == "smolvla":
-        manifest = smolvla_manifest(a.policy, a.n_images, a.host_rope)
+        manifest = smolvla_manifest(a.policy, a.n_images, a.host_rope, a.host_text_embeddings, a.host_time_embedding)
     else:
         if not a.checkpoint_dir or not a.openpi_dir:
             ap.error("pi0 needs --checkpoint-dir and --openpi-dir")

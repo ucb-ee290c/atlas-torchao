@@ -2231,7 +2231,9 @@ class SmolVLAPrefix(torch.nn.Module):
     boundary: images, language tokens and state -> the post-RoPE K / V of every VLM text layer, once per action chunk.
 
     Inputs: n_images images, lang_tokens, state, attention_mask (BF16 additive [B, P, P]), position_ids (int64 [B, P]),
-    with host_rope the host "prefix" RoPE table (cos, sin; float32 [B, P, 1, head_dim / 2]) instead of the position ids.
+    with host_rope the host "prefix" RoPE table (cos, sin; float32 [B, P, 1, head_dim / 2]) instead of the position ids,
+    with host_text_embeddings lerobot's embed_language_tokens(lang_tokens) computed on the host (BF16 [B, L, hidden];
+    _HostTokenEmbeddings, as at the flow-loss boundary) instead of the token ids.
     Both come from smolvla_prefix_inputs (lerobot's make_att_2d_masks and cumsum on embed_prefix's pad / block masks),
     as at the flow-loss boundary; the language pad mask is therefore not an input (embed_prefix gets an all-true one,
     which only feeds those masks).
@@ -2246,22 +2248,32 @@ class SmolVLAPrefix(torch.nn.Module):
     bias_add = True
     forbidden_graph_targets = ("aten.cumsum.default",)
 
-    def __init__(self, policy, n_images=1, host_rope=False):
+    def __init__(self, policy, n_images=1, host_rope=False, host_text_embeddings=False):
         super().__init__()
         self.policy = policy
         self.n_images = n_images
         self.host_rope = host_rope
+        self.host_text_embeddings = host_text_embeddings
         self._rope = _HostRope()
+        self._tokens = _HostTokenEmbeddings(policy.model.vlm_with_expert)
         if host_rope:
             self._rope.install()
+        if host_text_embeddings:
+            self._tokens.install()
 
     def restore(self):
         self._rope.restore()
+        self._tokens.restore()
 
     def forward(self, *tensors):
         model = self.policy.model
         images = list(tensors[:self.n_images])
         lang_tokens, state, attention_mask, *rest = tensors[self.n_images:]
+        if self.host_text_embeddings:
+            # lang_tokens is the host embedding; embed_prefix gets an all-zero token tensor of its shape, whose values
+            # nothing reads (the patched embed_language_tokens returns the host embedding)
+            self._tokens.embeddings = lang_tokens
+            lang_tokens = torch.zeros(lang_tokens.shape[:-1], dtype=torch.int64, device=lang_tokens.device)
         batch, length = attention_mask.shape[0], attention_mask.shape[-1]
         if self.host_rope:
             if len(rest) != 2:
@@ -2292,7 +2304,9 @@ class SmolVLADenoiseStep(torch.nn.Module):
     K / V, the noisy actions x_t and the time t -> the velocity v_t. The host owns the Euler loop
     (x_t + dt * v_t over euler_integrate's time grid, loop_manifest.json) and calls this num_steps times per chunk.
 
-    Inputs: x_t (float32 [B, chunk, max_action_dim]), time (float32 [B]), attention_mask (BF16 additive
+    Inputs: x_t (float32 [B, chunk, max_action_dim]), time (float32 [B]), with host_time_embedding the flow-timestep
+    embedding computed on the host (smolvla_time_inputs: lerobot's create_sinusoidal_pos_embedding cast as embed_suffix
+    casts it; _HostTimeEmbedding), attention_mask (BF16 additive
     [B, chunk, P + chunk]), position_ids (int64 [B, chunk]) or with host_rope the "suffix" and "expert" RoPE tables
     (cos, sin each), then k_0, v_0, ..., k_{L-1}, v_{L-1} (SmolVLAPrefix outputs). smolvla_step_host_inputs computes the
     mask and positions on the host exactly as denoise_step does in its graph (they depend only on the prefix pad mask,
@@ -2311,12 +2325,16 @@ class SmolVLADenoiseStep(torch.nn.Module):
     bias_add = True
     forbidden_graph_targets = ("aten.cumsum.default",)
 
-    def __init__(self, policy, host_rope=False):
+    def __init__(self, policy, host_rope=False, host_time_embedding=False):
         super().__init__()
         self.policy = policy
         self.host_rope = host_rope
+        self.host_time_embedding = host_time_embedding
         self._rope = _HostRope()
+        self._time = _HostTimeEmbedding()
         self._wrapped = []
+        if host_time_embedding:
+            self._time.install()
         if not policy.model.config.use_cache:
             raise ValueError("config.use_cache is off: denoise_step recomputes the prefix and reads no KV cache")
         self.layers = policy.model.vlm_with_expert.num_vlm_layers
@@ -2336,9 +2354,13 @@ class SmolVLADenoiseStep(torch.nn.Module):
                 setattr(inner, name, previous)
         self._wrapped = []
         self._rope.restore()
+        self._time.restore()
 
-    def forward(self, x_t, time, attention_mask, *rest):
+    def forward(self, x_t, time, *rest):
         model = self.policy.model
+        if self.host_time_embedding:
+            self._time.embedding, rest = rest[0], rest[1:]
+        attention_mask, *rest = rest
         n_kv = 2 * self.layers
         if len(rest) < n_kv:
             raise ValueError(f"expected {n_kv} K / V inputs, got {len(rest)} trailing inputs")
@@ -2362,7 +2384,8 @@ class SmolVLADenoiseStep(torch.nn.Module):
 
 def smolvla_geometry(policy):
     """What the host needs to build the SmolVLA phase inputs: tokens_per_image ((image_size / patch_size)^2 /
-    scale_factor^2 of the VLM config, the connector's pixel shuffle), chunk_size and the RoPE head_dim. Refuses the
+    scale_factor^2 of the VLM config, the connector's pixel shuffle), chunk_size, the RoPE head_dim and the time
+    embedding's dimension, periods and dtype (smolvla_time_inputs). Refuses the
     configurations whose embed_prefix adds more tokens (image special tokens, prefix_length padding). The loop manifest
     records the same three numbers (compose_phases.py builds the host inputs from those)."""
     model = policy.model
@@ -2370,8 +2393,13 @@ def smolvla_geometry(policy):
         raise ValueError("the SmolVLA phase inputs cover add_image_special_tokens=False and prefix_length=0")
     vlm_config = model.vlm_with_expert.vlm.config
     side = vlm_config.vision_config.image_size // vlm_config.vision_config.patch_size
+    with torch.no_grad():           # embed_suffix casts the time embedding to action_in_proj's output dtype
+        time_dtype = model.action_in_proj(torch.zeros(1, 1, model.config.max_action_dim, dtype=torch.float32,
+                                                      device=next(model.parameters()).device)).dtype
     return SimpleNamespace(tokens_per_image=side * side // vlm_config.scale_factor ** 2,
-                           chunk_size=model.config.chunk_size, head_dim=_rope_head_dim(policy))
+                           chunk_size=model.config.chunk_size, head_dim=_rope_head_dim(policy),
+                           time_dim=model.vlm_with_expert.expert_hidden_size, min_period=model.config.min_period,
+                           max_period=model.config.max_period, time_dtype=time_dtype)
 
 
 def smolvla_prefix_masks(geometry, img_masks, lang_masks):
@@ -2386,13 +2414,47 @@ def smolvla_prefix_masks(geometry, img_masks, lang_masks):
     return pad, att[None, :].expand(batch, -1)
 
 
-def smolvla_prefix_inputs(geometry, images, img_masks, lang_tokens, lang_masks, state, host_rope=False):
+def smolvla_prefix_inputs(geometry, images, img_masks, lang_tokens, lang_masks, state, host_rope=False, embed=None):
     """(SmolVLAPrefix inputs, prefix_pad_masks) for one observation: sample_actions' make_att_2d_masks and cumsum on
-    the prefix masks (smolvla_attention_inputs), with host_rope the "prefix" RoPE table of those positions."""
+    the prefix masks (smolvla_attention_inputs), with host_rope the "prefix" RoPE table of those positions. With
+    `embed` (host_text_embeddings): the language tokens are replaced by embed(lang_tokens), lerobot's
+    embed_language_tokens or the same gather from the export's embed_tokens table (smolvla_token_embedder)."""
     pad, att = smolvla_prefix_masks(geometry, img_masks, lang_masks)
     mask, position_ids, _ = smolvla_attention_inputs(pad, att)
     positions = _rope_table(position_ids, geometry.head_dim) if host_rope else (position_ids,)
+    if embed is not None:
+        with torch.no_grad():
+            lang_tokens = embed(lang_tokens)
     return tuple(t.contiguous() for t in (*images, lang_tokens, state, mask, *positions)), pad
+
+
+SMOLVLA_EMBED_TOKENS = "model.vlm_with_expert.vlm.model.text_model.embed_tokens.weight"
+
+
+def smolvla_token_embedder(table):
+    """The host side of embed_language_tokens from the export's table (SMOLVLA_EMBED_TOKENS, BF16 [vocab, hidden]):
+    nn.Embedding's forward is this gather (padding_idx only affects gradients, max_norm is None)."""
+    return lambda tokens: torch.nn.functional.embedding(tokens, table)
+
+
+def smolvla_time_inputs(geometry, time, host_time_embedding=False):
+    """() or (time embedding,): with host_time_embedding, lerobot's create_sinusoidal_pos_embedding(time, time_dim,
+    min_period, max_period) cast to geometry.time_dtype (embed_suffix's .type(dtype=action_emb.dtype)). Changes with
+    the time, i.e. at every denoising step."""
+    if not host_time_embedding:
+        return ()
+    from lerobot.policies.common.vla_utils import create_sinusoidal_pos_embedding
+
+    with torch.no_grad():
+        emb = create_sinusoidal_pos_embedding(time, geometry.time_dim, geometry.min_period, geometry.max_period,
+                                              device=time.device)
+        return (emb.type(dtype=geometry.time_dtype).contiguous(),)
+
+
+def smolvla_step_inputs(geometry, x_t, time, host, kv, host_time_embedding=False):
+    """The SmolVLADenoiseStep input tuple: x_t, time, (the host time embedding), the per-chunk host inputs
+    (smolvla_step_host_inputs) and the prefix K / V."""
+    return (x_t, time, *smolvla_time_inputs(geometry, time, host_time_embedding), *host, *kv)
 
 
 def smolvla_step_host_inputs(geometry, prefix_pad_masks, host_rope=False):
@@ -2423,9 +2485,9 @@ def smolvla_step_host_inputs(geometry, prefix_pad_masks, host_rope=False):
     return tuple(t.contiguous() for t in (additive_attention_mask(keep), *positions))
 
 
-def smolvla_prefix_outputs(policy, n_images, prefix_cases, host_rope=False):
+def smolvla_prefix_outputs(policy, n_images, prefix_cases, host_rope=False, host_text_embeddings=False):
     """The eager SmolVLAPrefix outputs (flat K / V tuples) for `prefix_cases`; the boundary is restored afterwards."""
-    boundary = SmolVLAPrefix(policy, n_images, host_rope=host_rope).eval()
+    boundary = SmolVLAPrefix(policy, n_images, host_rope=host_rope, host_text_embeddings=host_text_embeddings).eval()
     try:
         with torch.no_grad():
             return [boundary(*case) for case in prefix_cases]
@@ -2433,18 +2495,22 @@ def smolvla_prefix_outputs(policy, n_images, prefix_cases, host_rope=False):
         boundary.restore()
 
 
-def smolvla_phase_cases(policy, n_images, observations, host_rope=False):
+def smolvla_phase_cases(policy, n_images, observations, host_rope=False, host_text_embeddings=False,
+                        host_time_embedding=False):
     """(prefix cases, step cases) for observations [(images, img_masks, lang_tokens, lang_masks, state, x_t, time)]:
     the prefix inputs, and the step inputs on the eager prefix K / V of the same observation with that x_t and time."""
     geometry = smolvla_geometry(policy)
+    embed = policy.model.vlm_with_expert.embed_language_tokens if host_text_embeddings else None
     prefix_cases, pads = [], []
     for images, img_masks, lang_tokens, lang_masks, state, _, _ in observations:
-        case, pad = smolvla_prefix_inputs(geometry, images, img_masks, lang_tokens, lang_masks, state, host_rope)
+        case, pad = smolvla_prefix_inputs(geometry, images, img_masks, lang_tokens, lang_masks, state, host_rope, embed)
         prefix_cases.append(case)
         pads.append(pad)
-    kvs = smolvla_prefix_outputs(policy, n_images, prefix_cases, host_rope)
-    step_cases = [(obs[5].contiguous(), obs[6].contiguous(), *smolvla_step_host_inputs(geometry, pad, host_rope),
-                   *(t.contiguous() for t in kv)) for obs, pad, kv in zip(observations, pads, kvs)]
+    kvs = smolvla_prefix_outputs(policy, n_images, prefix_cases, host_rope, host_text_embeddings)
+    step_cases = [smolvla_step_inputs(geometry, obs[5].contiguous(), obs[6].contiguous(),
+                                      smolvla_step_host_inputs(geometry, pad, host_rope),
+                                      tuple(t.contiguous() for t in kv), host_time_embedding)
+                  for obs, pad, kv in zip(observations, pads, kvs)]
     return prefix_cases, step_cases
 
 
@@ -2560,10 +2626,10 @@ def main(argv=None):
                         help="SmolVLA boundaries: take the host RoPE cos / sin tables (smolvla_rope_tables) instead of "
                              "the position ids, so the graph computes no RoPE angle")
     parser.add_argument("--host-text-embeddings", action="store_true",
-                        help="--boundary smolvla_flow_loss: take lerobot's embed_language_tokens(lang_tokens), computed on "
-                             "the host, instead of the token ids, so the graph holds no token embedding lookup")
+                        help="--boundary smolvla_flow_loss / smolvla_prefix: take lerobot's embed_language_tokens(lang_tokens), "
+                             "computed on the host, instead of the token ids, so the graph holds no token embedding lookup")
     parser.add_argument("--host-time-embedding", action="store_true",
-                        help="--boundary smolvla_flow_loss: take the flow-timestep embedding (lerobot's "
+                        help="--boundary smolvla_flow_loss / smolvla_denoise_step: take the flow-timestep embedding (lerobot's "
                              "create_sinusoidal_pos_embedding, cast as embed_suffix casts it) computed on the host as a "
                              "last input, so the graph holds none of its float64 math")
     parser.add_argument("--layers", type=int, default=2, help="text / expert layers with --boundary smolvla_text_layers")
@@ -2603,11 +2669,15 @@ def main(argv=None):
                                  *case[args.n_images:args.n_images + 3], case[args.n_images + 4], case[args.n_images + 5])
                                 for case in smolvla_raw_cases(lerobot_policy, args.n_images, args.seed, args.device)]
                 prefix_cases, step_cases = smolvla_phase_cases(lerobot_policy, args.n_images, observations,
-                                                               host_rope=args.host_rope)
+                                                               host_rope=args.host_rope,
+                                                               host_text_embeddings=args.host_text_embeddings,
+                                                               host_time_embedding=args.host_time_embedding)
                 if args.boundary == "smolvla_prefix":
-                    cases, boundary = prefix_cases, SmolVLAPrefix(lerobot_policy, args.n_images, args.host_rope).eval()
+                    cases, boundary = prefix_cases, SmolVLAPrefix(lerobot_policy, args.n_images, args.host_rope,
+                                                                  args.host_text_embeddings).eval()
                 else:
-                    cases, boundary = step_cases, SmolVLADenoiseStep(lerobot_policy, args.host_rope).eval()
+                    cases, boundary = step_cases, SmolVLADenoiseStep(lerobot_policy, args.host_rope,
+                                                                     args.host_time_embedding).eval()
             else:
                 if (args.host_text_embeddings or args.host_time_embedding) and args.boundary != "smolvla_flow_loss":
                     parser.error("--host-text-embeddings / --host-time-embedding apply to --boundary smolvla_flow_loss")

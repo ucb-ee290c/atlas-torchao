@@ -51,12 +51,17 @@ def _lerobot_prefill(model, images, img_masks, lang_tokens, lang_masks, state):
     return pad, att, cache
 
 
-def _host_loop(step, noise, host, kv):
+def _host_loop(step, noise, host, kv, geometry=None, host_time_embedding=False):
     times, dt = _grid()
     x = noise
     for t in times:
-        x = x + dt * step(x, torch.full((1,), t, dtype=torch.float32), *host, *kv)
+        tt = torch.full((1,), t, dtype=torch.float32)
+        x = x + dt * step(*fx_export.smolvla_step_inputs(geometry, x, tt, host, kv, host_time_embedding))
     return x
+
+
+def _embed_table(policy):
+    return policy.model.vlm_with_expert.vlm.model.text_model.embed_tokens.weight.detach()
 
 
 # -- eager equivalence with lerobot's own inference path --------------------------------------------------------------------
@@ -171,8 +176,8 @@ def test_euler_grid_is_euler_integrates(steps):
 # -- captured graphs --------------------------------------------------------------------------------------------------------
 
 @pinned
-@pytest.mark.parametrize("host_rope", [False, True])
-def test_phase_graphs_capture_and_compose_to_sample_actions(tmp_path, quantized, host_rope):
+@pytest.mark.parametrize("host_rope,host_embeddings", [(False, False), (True, False), (True, True)])
+def test_phase_graphs_capture_and_compose_to_sample_actions(tmp_path, quantized, host_rope, host_embeddings):
     policy, qpolicy = quantized
     model = policy.model
     observations, raw = [], []
@@ -181,11 +186,12 @@ def test_phase_graphs_capture_and_compose_to_sample_actions(tmp_path, quantized,
         raw.append((images, img_masks, lang_tokens, lang_masks, state, noise))
         observations.append((images, img_masks, lang_tokens, lang_masks, state, noise,
                              torch.full((1,), [1.0, 0.4][i], dtype=torch.float32)))
-    prefix_cases, step_cases = fx_export.smolvla_phase_cases(policy, N_IMAGES, observations, host_rope)
+    prefix_cases, step_cases = fx_export.smolvla_phase_cases(policy, N_IMAGES, observations, host_rope,
+                                                             host_embeddings, host_embeddings)
     programs = {}
     for name, cases in (("prefix", prefix_cases), ("step", step_cases)):
-        boundary = (fx_export.SmolVLAPrefix(policy, N_IMAGES, host_rope) if name == "prefix" else
-                    fx_export.SmolVLADenoiseStep(policy, host_rope)).eval()
+        boundary = (fx_export.SmolVLAPrefix(policy, N_IMAGES, host_rope, host_embeddings) if name == "prefix" else
+                    fx_export.SmolVLADenoiseStep(policy, host_rope, host_embeddings)).eval()
         try:
             report = fx_export.capture_fx(boundary, cases, tmp_path / name, policy=qpolicy, fresh_process=name == "step",
                                           native_fp8="uint8")
@@ -200,20 +206,86 @@ def test_phase_graphs_capture_and_compose_to_sample_actions(tmp_path, quantized,
         assert not [n for n in calls if not n.users and not n.is_impure() and "_unused_" not in n.name]
         assert not program.graph_signature.user_inputs_to_mutate
         trig = [n for n in calls if str(n.target) in ("aten.sin.default", "aten.cos.default")]
-        if host_rope:                       # only the step's time embedding (create_sinusoidal_pos_embedding, float64)
+        if host_rope and not host_embeddings:   # only the step's time embedding (create_sinusoidal_pos_embedding, float64)
             assert len(trig) == (2 if name == "step" else 0)
             assert all(n.meta["val"].dtype == torch.float64 for n in trig)
+        if host_embeddings:                     # host RoPE, token and time embeddings; constant vision position table
+            assert not trig and not [n for n in calls if getattr(n.meta.get("val"), "dtype", None) == torch.float64]
+            assert not [n for n in calls if str(n.target) == "aten.embedding.default"]
+            assert not [n for n in calls if str(n.target) == "aten.cat.default" and len(n.args[0]) == 1]
         programs[name] = program.module()
     # the prefix graph stops after the last layer's K / V: that layer's query, o_proj and MLP are never called
     last = model.vlm_with_expert.num_vlm_layers - 1
     assert f"policy.model.vlm_with_expert.vlm.model.text_model.layers.{last}.mlp.up_proj" in \
         __import__("json").loads((tmp_path / "prefix" / "verification.json").read_text())["unused_quantized_modules"]
     geometry = fx_export.smolvla_geometry(policy)
+    embed = fx_export.smolvla_token_embedder(_embed_table(policy)) if host_embeddings else None
     with torch.no_grad():
         for images, img_masks, lang_tokens, lang_masks, state, noise in raw:
-            case, pad = fx_export.smolvla_prefix_inputs(geometry, images, img_masks, lang_tokens, lang_masks, state, host_rope)
+            case, pad = fx_export.smolvla_prefix_inputs(geometry, images, img_masks, lang_tokens, lang_masks, state, host_rope,
+                                                        embed)
             kv = programs["prefix"](*case)
             host = fx_export.smolvla_step_host_inputs(geometry, pad, host_rope)
-            loop = _host_loop(programs["step"], noise, host, kv)
+            loop = _host_loop(programs["step"], noise, host, kv, geometry, host_embeddings)
             want = model.sample_actions(list(images), img_masks, lang_tokens, lang_masks, state, noise=noise)
             assert _equal(loop, want)
+
+
+# -- host token and time embeddings ----------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("valid", [LANG, 2])
+def test_host_token_and_time_embeddings_are_lerobots(quantized, valid):
+    """With host_text_embeddings (prefix) and host_time_embedding (step) the phases still give lerobot's prefill K / V,
+    denoise_step at every Euler time and sample_actions, byte for byte; the host token embeddings equal lerobot's
+    embed_language_tokens and the gather from the embed_tokens table, the host time embedding lerobot's
+    create_sinusoidal_pos_embedding cast as embed_suffix casts it."""
+    from lerobot.policies.common.vla_utils import create_sinusoidal_pos_embedding
+
+    policy, _ = quantized
+    model = policy.model
+    inner = model.vlm_with_expert
+    geometry = fx_export.smolvla_geometry(policy)
+    images, img_masks, lang_tokens, lang_masks, state, noise = observation(5, N_IMAGES, valid_tokens=valid)
+    with torch.no_grad():
+        pad, att, cache = _lerobot_prefill(model, images, img_masks, lang_tokens, lang_masks, state)
+        case, ppad = fx_export.smolvla_prefix_inputs(geometry, images, img_masks, lang_tokens, lang_masks, state, True,
+                                                     fx_export.smolvla_token_embedder(_embed_table(policy)))
+        assert _equal(case[N_IMAGES], inner.embed_language_tokens(lang_tokens))        # lerobot's own lookup
+        (kv,) = fx_export.smolvla_prefix_outputs(policy, N_IMAGES, [case], host_rope=True, host_text_embeddings=True)
+        assert "embed_language_tokens" not in inner.__dict__                          # restored
+        for i, layer in enumerate(cache.layers):
+            assert _equal(kv[2 * i], layer.keys.transpose(1, 2)) and _equal(kv[2 * i + 1], layer.values.transpose(1, 2))
+        host = fx_export.smolvla_step_host_inputs(geometry, ppad, True)
+        times, dt = _grid()
+        x = noise
+        for t in times:
+            tt = torch.full((1,), t, dtype=torch.float32)
+            (temb,) = fx_export.smolvla_time_inputs(geometry, tt, True)
+            action_emb = model.action_in_proj(x)
+            want = create_sinusoidal_pos_embedding(tt, inner.expert_hidden_size, model.config.min_period,
+                                                   model.config.max_period, device=x.device).type(dtype=action_emb.dtype)
+            assert _equal(temb, want)
+            step = fx_export.SmolVLADenoiseStep(policy, host_rope=True, host_time_embedding=True).eval()
+            try:
+                v = step(*fx_export.smolvla_step_inputs(geometry, x, tt, host, kv, True))
+            finally:
+                step.restore()
+            assert _equal(v, model.denoise_step(pad, cache, x, tt))
+            x = x + dt * v
+        assert _equal(x, model.sample_actions(list(images), img_masks, lang_tokens, lang_masks, state, noise=noise))
+
+
+def test_boundaries_restore_token_and_time_embeddings(quantized):
+    import lerobot.policies.smolvla.modeling_smolvla as modeling
+
+    policy, _ = quantized
+    inner = policy.model.vlm_with_expert
+    original = modeling.create_sinusoidal_pos_embedding
+    prefix = fx_export.SmolVLAPrefix(policy, N_IMAGES, host_rope=True, host_text_embeddings=True)
+    assert "embed_language_tokens" in inner.__dict__
+    prefix.restore()
+    assert "embed_language_tokens" not in inner.__dict__
+    step = fx_export.SmolVLADenoiseStep(policy, host_rope=True, host_time_embedding=True)
+    assert modeling.create_sinusoidal_pos_embedding is not original
+    step.restore()
+    assert modeling.create_sinusoidal_pos_embedding is original
