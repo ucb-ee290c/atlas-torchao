@@ -121,6 +121,17 @@ storage decoding, not an emulated matmul, so they are exempt from the native-FP8
 be fed by a decode. With `--native-fp8`, an FP8 head is an `atlas.qlinear` like the other Linears. The tied
 embedding is the only other reader allowed on that head's code buffer.
 
+**Node names.** torch.export numbers the nodes of each op in creation order (`to`, `to_1`, ...). The embedding
+decode runs first, so without a fix its casts would shift every later node of the same op: layer 0's rotary cos /
+sin casts would become `to_7` / `to_8` instead of the default's `to_4` / `to_5`. Backend tools identify boundaries
+by node name; the independent reference (`rotary-host/reference/whole_reference.py`) treats `to_7` / `to_8` as the
+rotary outputs it must replay itself. So after the export, `fx_export` gives each decode node of a storage module
+its own name, `<module path>_<op>[_k]` (for example `model_model_embed_tokens_to_2`). It also lowers the suffix of
+every other node by the number of decode nodes of the same op numbered before it. Every node outside the embedding
+and the head then has the default capture's name. Only names change: targets, arguments and node order are
+untouched, and the replay outputs are compared byte for byte as before. The default capture has no storage module,
+so its graph is not touched. A head's contraction (`aten.linear` of the NVFP4 head) keeps its name.
+
 ## Sizes
 
 `src/scripts/export_sizes.py EXPORT_DIR` reads the safetensors header and splits the stored bytes into

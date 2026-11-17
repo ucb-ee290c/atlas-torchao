@@ -24,6 +24,7 @@ OPTION_SETS = [
     {"tie": "none", "lm_head": "nvfp4", "embedding": "nvfp4"},
     {"tie": "none", "lm_head": "fp8", "embedding": "nvfp4"},
     {"tie": "none", "lm_head": "bf16", "embedding": "fp8"},
+    {"tie": "none", "lm_head": "fp8", "embedding": "fp8"},
     {"tie": "lm_head_from_embedding", "lm_head": "fp8", "embedding": "fp8"},
     {"tie": "embedding_from_lm_head", "lm_head": "nvfp4", "embedding": "nvfp4"},
 ]
@@ -171,7 +172,7 @@ def test_tied_embedding_reads_head_codes(tmp_path):
     assert torch.equal(emb(ids), want)
 
 
-@pytest.mark.parametrize("opts", [OPTION_SETS[6], OPTION_SETS[7], OPTION_SETS[3]], ids=he.label)
+@pytest.mark.parametrize("opts", [OPTION_SETS[7], OPTION_SETS[8], OPTION_SETS[3]], ids=he.label)
 def test_native_capture(tmp_path, opts):
     _, d = _export(tmp_path, opts)
     m = _reload(d)
@@ -187,6 +188,69 @@ def test_native_capture(tmp_path, opts):
         assert storage["model.embed_tokens"]["code_buffer"] == "model.lm_head.weight_codes"
     if opts["lm_head"] == "fp8":
         assert "model.lm_head" in report["native_fp8_detail"]["sites"]
+
+
+CAPTURE_CASES = [(torch.arange(8, dtype=torch.long).reshape(1, 8),),
+                 (torch.arange(8, 16, dtype=torch.long).reshape(1, 8),)]
+
+
+def _capture(tmp_path, opts):
+    """(native-FP8 capture report, saved program) of the option's export, reloaded."""
+    _, d = _export(tmp_path, opts)
+    m = _reload(d)
+    policy = json.loads((d / "policy.json").read_text())
+    report = fx_export.capture_fx(fx_export.CausalLogits(m).eval(), CAPTURE_CASES, tmp_path / "fx", policy=policy,
+                                  strict=True, fresh_process=False, native_fp8="uint8")
+    return report, torch.export.load(tmp_path / "fx" / "model.pt2")
+
+
+def _rotary_inputs(program):
+    """Names of the casts that deliver rotary cos / sin to the layers: the first aten.to after aten.cos / aten.sin."""
+    found = []
+    for op in (torch.ops.aten.cos.default, torch.ops.aten.sin.default):
+        (src,) = [n for n in program.graph.nodes if n.target == op]
+        frontier = list(src.users)
+        while frontier:
+            node = frontier.pop(0)
+            if getattr(node.target, "overloadpacket", None) is torch.ops.aten.to:
+                found.append(node.name)
+                break
+            frontier.extend(node.users)
+    return found
+
+
+def _names_outside(program, scopes):
+    return [(n.name, str(n.target)) for n in program.graph.nodes
+            if n.op == "call_function" and not fx_export._scope(n).startswith(scopes)]
+
+
+@pytest.fixture(scope="module")
+def default_capture(tmp_path_factory):
+    return _capture(tmp_path_factory.mktemp("default"), dict(he.DEFAULTS))
+
+
+# a tied BF16 pair is not captured: strict export cannot name the held alias parameter (KeyError in torch.export);
+# ties are not an option for TinyLlama (docs/algos/head-embed.md), so this is recorded, not fixed
+_TIED_BF16 = pytest.mark.xfail(raises=KeyError, strict=True, reason="tied BF16 alias is not captured by strict export")
+
+
+@pytest.mark.parametrize("opts", [pytest.param(o, marks=_TIED_BF16) if o["tie"] != "none" and o["lm_head"] == "bf16"
+                                  else o for o in OPTION_SETS], ids=he.label)
+def test_capture_keeps_default_node_names(tmp_path, opts, default_capture):
+    """The storage-decode nodes get their own names, so the rotary cos / sin inputs (and every node outside the
+    embedding and the head) keep the default capture's names, which backend tools key boundaries on."""
+    default_report, default_program = default_capture
+    assert "renamed_for_storage_decode" not in default_report          # default: the graph is not touched
+    report, program = _capture(tmp_path, opts)
+    assert report["status"] == "passed"
+    rotary = _rotary_inputs(program)
+    assert len(rotary) == 2 and rotary == _rotary_inputs(default_program)
+    outside = ("model.model.embed_tokens", "model.lm_head")
+    assert _names_outside(program, outside) == _names_outside(default_program, outside)
+    if opts["embedding"] != "bf16":
+        decode = [n.name for n in program.graph.nodes
+                  if n.op == "call_function" and fx_export._scope(n) == "model.model.embed_tokens"]
+        assert decode and all(name.startswith("model_model_embed_tokens_") for name in decode)
 
 
 def test_tied_fp8_embedding_with_per_tensor_head_exponent():

@@ -906,6 +906,68 @@ def _storage_report(program, nodes, module, policy, lifted):
     return rows
 
 
+def _split_name(name):
+    """(base, suffix) of an FX node name as torch.fx's namespace forms it: `to_4` -> ("to", 4), `to` -> ("to", 0)."""
+    base, sep, num = name.rpartition("_")
+    return (base, int(num)) if sep and base and num.isdigit() else (name, 0)
+
+
+def _name_storage_nodes(program, module):
+    """Own names for the storage-decode nodes (exporter.head_embed; none by default, then the graph is untouched).
+
+    torch.export numbers call_function nodes per op name in creation order (`to`, `to_1`, ...), so the decode
+    nodes of a quantized embedding, which run first, shift every later node of the same op: layer 0's rotary
+    cos / sin casts become `to_7` / `to_8` instead of the default's `to_4` / `to_5`, and backend tools that
+    identify boundaries by node name see a different graph. This renames each non-contraction node in a storage
+    module's scope to `<module path>_<op name>[_k]` and lowers the suffix of every other node by the number of
+    storage nodes of its op name numbered before it, which gives the names the default capture has. Names only:
+    the targets, arguments and order of the nodes are unchanged. Returns {old: new} of the renamed nodes."""
+    import exporter.head_embed as head_embed
+
+    paths = {path: path.replace(".", "_") for path, layer in module.named_modules()
+             if isinstance(layer, (head_embed.QuantEmbedding, head_embed.NVFP4Linear))}
+    if not paths:
+        return {}
+    graph = program.graph
+    nodes = [n for n in graph.nodes if n.op == "call_function"]
+    storage = {n for n in nodes if _scope(n) in paths and n.target not in CONTRACTIONS}
+    removed = collections.defaultdict(list)                  # op name -> suffixes of its storage nodes
+    for node in storage:
+        base, num = _split_name(node.name)
+        removed[base].append(num)
+    renames, own = {}, collections.Counter()
+    for node in nodes:
+        base, num = _split_name(node.name)
+        if node in storage:
+            stem = f"{paths[_scope(node)]}_{base}"
+            new = stem if not own[stem] else f"{stem}_{own[stem]}"
+            own[stem] += 1
+        else:
+            num -= sum(1 for k in removed.get(base, ()) if k < num)
+            new = f"{base}_{num}" if num else base
+        if new != node.name:
+            renames[node.name] = new
+    if not renames:
+        return {}
+    names = [renames.get(n.name, n.name) for n in graph.nodes]
+    if len(set(names)) != len(names):
+        raise FXVerificationError("storage-node renaming would give two nodes one name")
+    for node in nodes:
+        node.name = renames.get(node.name, node.name)
+    signature = program.graph_signature
+    for spec in list(signature.input_specs) + list(signature.output_specs):
+        if getattr(spec.arg, "name", None) in renames:
+            spec.arg.name = renames[spec.arg.name]
+    for entry in program.module_call_graph:
+        if entry.signature is not None:
+            for arg in list(entry.signature.inputs) + list(entry.signature.outputs):
+                if getattr(arg, "name", None) in renames:
+                    arg.name = renames[arg.name]
+    program.graph_module.recompile()
+    program.validate()
+    return renames
+
+
 def _tile_native_report(module, policy, native_paths, plan, act_stats):
     """Per-site `tile_native` (NEW): true when the weight exponent table and the activation / attention
     operand exponents are constant along K at 32-granularity (src/exporter/tile_native.py), with the reasons for every
@@ -1374,6 +1436,9 @@ def capture_fx(module, cases, directory, *, policy, provenance=None, strict=True
                     before = held
                 else:
                     program = torch.export.export(module, cases[0], strict=strict)
+            renamed = _name_storage_nodes(program, module)          # {} (graph untouched) by default
+            if renamed:
+                report["renamed_for_storage_decode"] = len(renamed)
             if _without(_inventory(program.named_buffers(), STORAGE_DTYPES[native_fp8] if native_fp8 else torch.uint8),
                         unused) != before:
                 raise FXVerificationError("capture changed code/exponent buffers")
