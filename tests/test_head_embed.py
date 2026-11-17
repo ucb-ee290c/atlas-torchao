@@ -151,7 +151,7 @@ def test_option_round_trip(tmp_path, opts):
             assert len([k for k in (f"{emb}.weight", f"{head}.weight") if k in tensors]) == 1
         else:                                     # one set of codes: the head's
             assert policy["sites"][emb]["tied_to"] == head
-            assert not [k for k in tensors if k.startswith(emb + ".")]
+            assert not [k for k in tensors if k.startswith(emb + ".") and ".weight_decode_" not in k]
             assert f"{head}.weight_codes" in tensors
     # decoder layers: the same codes as the default export unless the embedding feeds calibration
     if opts["tie"] != "embedding_from_lm_head":
@@ -209,6 +209,7 @@ def test_table_decodes_equal_bit_decodes():
     codes = torch.arange(256, dtype=torch.int32).to(torch.uint8).reshape(16, 16)
     exp = torch.arange(-8, 8, dtype=torch.int32).reshape(16, 1)
     emb = he.QuantEmbedding(16, 16, "fp8", torch.bfloat16, (codes, exp))
+    assert set(emb.tables()) == {"weight_decode_atlas_lut"}
     assert torch.equal(emb._fp8_rows(codes, exp), rn.dequantize(codes, exp))
     pair = he.e2m1_pair_table()
     assert torch.equal(pair[codes.long()].reshape(16, 32), he.e2m1_table()[he.unpack_codes(codes).long()])

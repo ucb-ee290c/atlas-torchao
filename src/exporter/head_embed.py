@@ -158,8 +158,11 @@ def e2m1_table(device=None) -> torch.Tensor:
 
 
 def e4m3_table(device=None) -> torch.Tensor:
-    """FP32 value of every E4M3 byte as torch.float8_e4m3fn decodes it (subnormals included; 0x7F / 0xFF NaN)."""
-    return torch.arange(256, dtype=torch.int32, device=device).to(torch.uint8).view(torch.float8_e4m3fn).float()
+    """FP32 value of every E4M3 byte as torch.float8_e4m3fn decodes it (subnormals included), except 0x7F / 0xFF
+    (NaN in torch), which are 0 here: the block-scale encoder never emits them (clamp to 448), and the table is stored
+    in the export, where a NaN serves no purpose."""
+    t = torch.arange(256, dtype=torch.int32, device=device).to(torch.uint8).view(torch.float8_e4m3fn).float()
+    return torch.nan_to_num(t, nan=0.0)
 
 
 def e2m1_pair_table(device=None) -> torch.Tensor:
@@ -240,16 +243,23 @@ def nvfp4_decode(packed, scale_bytes, tensor_scale, pair_lut=None, e4m3_lut=None
 # Modules
 # ---------------------------------------------------------------------------------------------
 
+# Decode tables, stored in the export with the module that decodes (a few KB): the backend's capsule route lifts a
+# region's constants as state and authenticates all state against the export tensors.
+TABLES = {"nvfp4": {"weight_decode_pair_lut": e2m1_pair_table, "weight_decode_e4m3_lut": e4m3_table},
+          "fp8": {"weight_decode_atlas_lut": atlas_e4m3_table}}
+
+
 class _Tables(nn.Module):
-    def _register_tables(self):
-        # graph constants (fx_export holds non-persistent, non-quantization buffers as constants)
-        self.register_buffer("e2m1_pair_lut", e2m1_pair_table(), persistent=False)
-        self.register_buffer("e4m3_lut", e4m3_table(), persistent=False)
-        self.register_buffer("e4m3_atlas_lut", atlas_e4m3_table(), persistent=False)
+    def _register_tables(self, fmt):
+        for name, make in TABLES[fmt].items():
+            self.register_buffer(name, make(), persistent=False)       # quant_export writes them
+
+    def tables(self) -> dict:
+        return {name: getattr(self, name) for name in TABLES[self.fmt]}
 
     def _fp8_rows(self, codes, exp):
         """atlas_e4m3_table[code] * 2^exp: ref_numerics.dequantize as one table gather and an exp2 (no bit ops)."""
-        return self.e4m3_atlas_lut[codes.long()] * torch.exp2(exp.float())
+        return self.weight_decode_atlas_lut[codes.long()] * torch.exp2(exp.float())
 
 
 class NVFP4Linear(_Tables):
@@ -271,16 +281,16 @@ class NVFP4Linear(_Tables):
         self.register_buffer("weight_codes", codes, persistent=False)
         self.register_buffer("weight_block_scales", scales, persistent=False)
         self.register_buffer("weight_tensor_scale", ts, persistent=False)
-        self._register_tables()
+        self._register_tables(self.fmt)
 
     def decoded_weight(self) -> torch.Tensor:
         return nvfp4_decode(self.weight_codes, self.weight_block_scales, self.weight_tensor_scale,
-                            self.e2m1_pair_lut, self.e4m3_lut).to(self.dtype)
+                            self.weight_decode_pair_lut, self.weight_decode_e4m3_lut).to(self.dtype)
 
     def rows(self, ids):
         """The decoded rows `ids` (a tied embedding's lookup)."""
         return nvfp4_decode(F.embedding(ids, self.weight_codes), F.embedding(ids, self.weight_block_scales),
-                            self.weight_tensor_scale, self.e2m1_pair_lut, self.e4m3_lut).to(self.dtype)
+                            self.weight_tensor_scale, self.weight_decode_pair_lut, self.weight_decode_e4m3_lut).to(self.dtype)
 
     def forward(self, x):
         return F.linear(x.to(self.dtype), self.decoded_weight())
@@ -316,7 +326,7 @@ class QuantEmbedding(_Tables):
                 self.register_buffer("weight_codes", codes, persistent=False)
                 self.register_buffer("weight_block_scales", scales, persistent=False)
                 self.register_buffer("weight_tensor_scale", ts, persistent=False)
-        self._register_tables()
+        self._register_tables(self.fmt)
 
     @classmethod
     def from_embedding(cls, emb: nn.Embedding, fmt):
@@ -343,7 +353,7 @@ class QuantEmbedding(_Tables):
             rows = self._fp8_rows(F.embedding(ids, src.weight_codes), exp)
         else:
             rows = nvfp4_decode(F.embedding(ids, src.weight_codes), F.embedding(ids, src.weight_block_scales),
-                                src.weight_tensor_scale, self.e2m1_pair_lut, self.e4m3_lut)
+                                src.weight_tensor_scale, self.weight_decode_pair_lut, self.weight_decode_e4m3_lut)
         return rows.to(self.dtype)
 
     def decoded_weight(self) -> torch.Tensor:
@@ -442,6 +452,13 @@ def quantize_head_reference(model) -> None:
 # Export / reload
 # ---------------------------------------------------------------------------------------------
 
+def _tables_out(n, m, site, tensors_out):
+    site["decode_tables"] = {}
+    for name, t in m.tables().items():
+        site["decode_tables"][name] = f"{n}.{name}"
+        tensors_out[f"{n}.{name}"] = t.detach().cpu().contiguous()
+
+
 def policy_sites(model, tensors_out: dict) -> dict:
     """{site: policy record} of the storage modules; fills `tensors_out` with their tensors."""
     sites = {}
@@ -463,6 +480,7 @@ def policy_sites(model, tensors_out: dict) -> dict:
                                        "description": "weight-only: the input stays in the layer dtype"},
                         "compute": "F.linear(x, decode(weight)) in the layer dtype; decode = e2m1(code) * "
                                    "e4m3(block scale) * tensor scale, exact in BF16"}
+            _tables_out(n, m, sites[n], tensors_out)
             continue
         site = {"kind": "embedding", "status": "quantized", "format": m.fmt,
                 "weight_shape": [m.num_embeddings, m.embedding_dim], "weight_dtype": str(m.dtype).replace("torch.", ""),
@@ -489,6 +507,7 @@ def policy_sites(model, tensors_out: dict) -> dict:
                 tensors_out[names["block_scales"]] = src.weight_block_scales.detach().cpu().contiguous()
                 tensors_out[names["tensor_scale"]] = src.weight_tensor_scale.detach().cpu().contiguous()
         sites[n] = site
+        _tables_out(n, m, site, tensors_out)
     return sites
 
 
@@ -518,6 +537,10 @@ def install_from_export(model, policy, tensors, device) -> dict:
                 ts = (tensors[w["codes"]].to(device), tensors[w["block_scales"]].to(device),
                       tensors[w["tensor_scale"]].to(device))
             new = QuantEmbedding(v, d, s["format"], dtype, ts, tied_to=tied)
+        for name, key in (s.get("decode_tables") or {}).items():
+            got, want = tensors[key].cpu().contiguous(), getattr(new, name).cpu().contiguous()
+            if got.dtype != want.dtype or not torch.equal(got.view(torch.uint8), want.view(torch.uint8)):   # bits: NaN entries
+                raise ValueError(f"{n}: exported decode table {key} differs from the format's")
         _set(model, n, new.to(device))
         done[n] = s["kind"]
     return done

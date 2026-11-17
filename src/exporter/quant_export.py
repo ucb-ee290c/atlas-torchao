@@ -41,7 +41,8 @@ FORMAT_VERSION = 1
 EXPORTABLE_BASES = ("reference", "reference_hw", "chip")
 PREFERRED_MODE = "ref_conv"
 QUANT_SUFFIXES = (".weight_codes", ".weight_scale_exp", ".weight_lo_codes", ".weight_lo_scale_exp",
-                  ".input_scale_exp", ".weight_block_scales", ".weight_tensor_scale")
+                  ".input_scale_exp", ".weight_block_scales", ".weight_tensor_scale", ".weight_decode_pair_lut",
+                  ".weight_decode_e4m3_lut", ".weight_decode_atlas_lut")
 
 # The operand format as the reference author's encoder implements it (ref_numerics.e4m3_vpack, a
 # port of pi0-quant fp8_e4m3.py:38-86 = FP8Pack.scala:57-95). Field names follow Merlin's
