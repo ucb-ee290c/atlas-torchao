@@ -94,7 +94,27 @@ option, which the test checks.
 
 - The embedding row gather and its decode.
 - The NVFP4 decode followed by `aten.linear`.
-- The decode tables, held as graph constants.
+
+Decoding uses table gathers only, with no bit operations:
+
+| Format | Decode |
+|---|---|
+| NVFP4 codes | One `[256, 2]` pair table per packed byte |
+| NVFP4 block scales | The E4M3 table |
+| FP8 rows | The Atlas E4M3 table (`ref_numerics.e4m3_unpack` of every byte), times `exp2(exp)` |
+
+Two backend constraints shape this decode:
+
+- The backend importer (model2MLIR `FXImporter`) leaves `aten.__and__`, `__rshift__`, `stack` on uint8 and the
+  `e4m3_unpack` bit operations opaque, and the Atlas normalizer refuses every opaque call outside the native-FP8
+  census.
+- The capsule route lifts a region's constants as state, and the `atlas_fp8` adapter authenticates all state
+  against the export tensors.
+
+For these reasons the decode tables (`<module>.weight_decode_pair_lut`, `.weight_decode_e4m3_lut`,
+`.weight_decode_atlas_lut`, a few KB) are stored in `model.safetensors` with the module that decodes. The site
+names them under `decode_tables`, and a reload checks them bit for bit. The E4M3 block-scale table maps 0x7F /
+0xFF, which the encoder never emits, to 0 instead of NaN.
 
 `graph_inspection.json` lists these modules under `quantized_storage_sites`. Each one must read its codes
 from a lifted buffer (a tied embedding reads the head's) and must hold no float weight. Their decode nodes are
