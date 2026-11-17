@@ -11,6 +11,7 @@
     without quantization; it stays off by default (see test_padded_diagonal_*)."""
 
 import json
+import math
 from types import SimpleNamespace
 
 import algos
@@ -246,6 +247,11 @@ def test_vision_position_ids_are_static_and_identical():
     assert fx_export.graph_shape_census(program.graph)["dynamic_nodes"] == []
     targets = {str(n.target) for n in program.graph.nodes if n.op == "call_function"}
     assert not targets & {"aten.index_put_.default", "aten.index_put.default", "aten.bucketize.Tensor", "aten.nonzero.default"}
+    assert "aten.embedding.default" in {str(n.target) for n in original.graph.nodes if n.op == "call_function"}
+    assert "aten.embedding.default" not in targets                         # the table itself, no lookup
+    # position_embedding(arange(n*n)) is the table: the same words as the parameter, row for row
+    table = module.embeddings.position_embedding.weight
+    assert torch.equal(module.embeddings.position_embedding(torch.arange(16)).view(torch.int16), table.view(torch.int16))
     with torch.no_grad():
         assert torch.equal(program.module()(x).view(torch.int16), eager.view(torch.int16))
     y = torch.randn(1, 3, 16, 32).to(torch.bfloat16)                       # not full size: the original path
@@ -398,3 +404,132 @@ def test_drop_dead_pure_nodes_removes_unread_work_and_constants(tmp_path):
     torch.export.save(program, tmp_path / "p.pt2")
     loaded = torch.export.load(tmp_path / "p.pt2")
     assert torch.equal(loaded.module()(*args), expected) and torch.equal(program.module()(*args), expected)
+
+
+# -- host text-token embeddings -------------------------------------------------------------------------------------------
+
+class _Tokens(torch.nn.Module):
+    """embed_prefix's language part: lerobot's embed_language_tokens, then its sqrt(hidden) scaling."""
+
+    def __init__(self, inner, host):
+        super().__init__()
+        self.inner, self.host = inner, host
+        self.tokens = fx_export._HostTokenEmbeddings(inner)
+        if host:
+            self.tokens.install()
+
+    def forward(self, x):
+        if self.host:
+            self.tokens.embeddings = x
+            x = torch.zeros(x.shape[:-1], dtype=torch.int64)
+        emb = self.inner.embed_language_tokens(x)
+        return emb * math.sqrt(emb.shape[-1])
+
+
+@pinned
+def test_host_text_embeddings_leave_no_token_lookup_and_are_identical():
+    pytest.importorskip("lerobot.policies.smolvla.smolvlm_with_expert")
+    policy, _ = _tiny_policy(quantize=False)
+    inner = policy.model.vlm_with_expert
+    tokens = torch.randint(0, 8, (1, 5), generator=torch.Generator().manual_seed(1))
+    old = _Tokens(inner, host=False).eval()
+    with torch.no_grad():
+        expected = old(tokens)
+        host = inner.embed_language_tokens(tokens)                       # lerobot's own lookup, on the host
+    old_program = torch.export.export(old, (tokens,), strict=True)
+    assert "aten.embedding.default" in [str(n.target) for n in old_program.graph.nodes]
+    new = _Tokens(inner, host=True).eval()
+    assert "embed_language_tokens" in inner.__dict__
+    program = torch.export.export(new, (host,), strict=True)
+    targets = [str(n.target) for n in program.graph.nodes if n.op == "call_function"]
+    assert "aten.embedding.default" not in targets and "aten.mul.Tensor" in targets      # scaling stays in the graph
+    with torch.no_grad():
+        assert torch.equal(program.module()(host).view(torch.int16), expected.view(torch.int16))
+        with pytest.raises(ValueError, match="do not match"):
+            new.tokens.embeddings = host
+            inner.embed_language_tokens(torch.zeros(1, 4, dtype=torch.int64))
+    new.tokens.restore()
+    assert "embed_language_tokens" not in inner.__dict__
+    inner.add_image_special_tokens = True
+    with pytest.raises(ValueError, match="special tokens"):
+        fx_export._HostTokenEmbeddings(inner).install()
+
+
+# -- host flow-timestep embedding -----------------------------------------------------------------------------------------
+
+class _Suffix(torch.nn.Module):
+    """embed_suffix's time path: action_in_proj, lerobot's create_sinusoidal_pos_embedding (looked up in
+    modeling_smolvla at call time, as embed_suffix does), its .type(dtype=action_emb.dtype), concatenation."""
+
+    def __init__(self, host, dim=16):
+        super().__init__()
+        self.proj = torch.nn.Linear(6, dim).to(torch.bfloat16)
+        self.dim, self.host = dim, host
+        self.time = fx_export._HostTimeEmbedding()
+        if host:
+            self.time.install()
+
+    def forward(self, actions, time, *emb):
+        import lerobot.policies.smolvla.modeling_smolvla as modeling
+
+        if self.host:
+            self.time.embedding = emb[0]
+        action_emb = self.proj(actions)
+        t = modeling.create_sinusoidal_pos_embedding(time, self.dim, 4e-3, 4.0, device=action_emb.device)
+        t = t.type(dtype=action_emb.dtype)
+        return torch.cat([action_emb, t[:, None, :].expand_as(action_emb)], dim=2)
+
+
+@pinned
+def test_host_time_embedding_leaves_no_float64_math_and_is_identical():
+    pytest.importorskip("lerobot.policies.smolvla.modeling_smolvla")
+    import lerobot.policies.smolvla.modeling_smolvla as modeling
+    from lerobot.policies.common.vla_utils import create_sinusoidal_pos_embedding
+
+    original = modeling.create_sinusoidal_pos_embedding
+    torch.manual_seed(4)
+    old = _Suffix(host=False).eval()
+    actions, time = torch.randn(2, 3, 6).to(torch.bfloat16), torch.tensor([0.25, 0.75])
+    with torch.no_grad():
+        expected = old(actions, time)
+        host = create_sinusoidal_pos_embedding(time, 16, 4e-3, 4.0, device=torch.device("cpu")).type(
+            dtype=torch.bfloat16)                                                         # lerobot's own
+    old_program = torch.export.export(old, (actions, time), strict=True)
+    assert {"aten.linspace.default", "aten.sin.default", "aten.cos.default"} <= {str(n.target) for n in old_program.graph.nodes}
+    new = _Suffix(host=True).eval()
+    new.proj.load_state_dict(old.proj.state_dict())
+    assert modeling.create_sinusoidal_pos_embedding is not original
+    program = torch.export.export(new, (actions, time, host), strict=True)
+    calls = [n for n in program.graph.nodes if n.op == "call_function"]
+    assert not [n for n in calls if str(n.target) in ("aten.linspace.default", "aten.pow.Scalar", "aten.pow.Tensor_Tensor",
+                                                       "aten.sin.default", "aten.cos.default")]
+    assert not [n for n in calls if getattr(n.meta.get("val"), "dtype", None) == torch.float64]
+    with torch.no_grad():
+        assert torch.equal(program.module()(actions, time, host).view(torch.int16), expected.view(torch.int16))
+        with pytest.raises(ValueError, match="does not match"):
+            new(actions, time[:1], host)
+    new.time.restore()
+    assert modeling.create_sinusoidal_pos_embedding is original
+
+
+# -- single-input cat ------------------------------------------------------------------------------------------------------
+
+class _OneCat(torch.nn.Module):
+    def forward(self, x, y):
+        a = torch.cat([x * 2], dim=1)                 # embed_suffix: torch.cat(embs, dim=1) over one tensor
+        b = torch.cat([a, y], dim=1)                  # a real concatenation stays
+        return torch.cat((b,), dim=0) + 1             # tuple form, other dim
+
+
+@pinned
+def test_fold_identity_nodes_replaces_single_input_cat(tmp_path):
+    args = (torch.randn(2, 3).to(torch.bfloat16), torch.randn(2, 4).to(torch.bfloat16))
+    program = torch.export.export(_OneCat(), args, strict=True)
+    cats = lambda p: [n for n in p.graph.nodes if n.op == "call_function" and n.target == torch.ops.aten.cat.default]  # noqa: E731
+    assert len(cats(program)) == 3
+    expected = program.module()(*args)
+    folded = fx_export.fold_identity_nodes(program)
+    assert len(folded) == 2 and [len(n.args[0]) for n in cats(program)] == [2]
+    torch.export.save(program, tmp_path / "p.pt2")
+    for p in (program, torch.export.load(tmp_path / "p.pt2")):
+        assert torch.equal(p.module()(*args).view(torch.int16), expected.view(torch.int16))
