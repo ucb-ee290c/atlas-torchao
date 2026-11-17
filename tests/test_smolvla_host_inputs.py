@@ -453,3 +453,60 @@ def test_host_text_embeddings_leave_no_token_lookup_and_are_identical():
     inner.add_image_special_tokens = True
     with pytest.raises(ValueError, match="special tokens"):
         fx_export._HostTokenEmbeddings(inner).install()
+
+
+# -- host flow-timestep embedding -----------------------------------------------------------------------------------------
+
+class _Suffix(torch.nn.Module):
+    """embed_suffix's time path: action_in_proj, lerobot's create_sinusoidal_pos_embedding (looked up in
+    modeling_smolvla at call time, as embed_suffix does), its .type(dtype=action_emb.dtype), concatenation."""
+
+    def __init__(self, host, dim=16):
+        super().__init__()
+        self.proj = torch.nn.Linear(6, dim).to(torch.bfloat16)
+        self.dim, self.host = dim, host
+        self.time = fx_export._HostTimeEmbedding()
+        if host:
+            self.time.install()
+
+    def forward(self, actions, time, *emb):
+        import lerobot.policies.smolvla.modeling_smolvla as modeling
+
+        if self.host:
+            self.time.embedding = emb[0]
+        action_emb = self.proj(actions)
+        t = modeling.create_sinusoidal_pos_embedding(time, self.dim, 4e-3, 4.0, device=action_emb.device)
+        t = t.type(dtype=action_emb.dtype)
+        return torch.cat([action_emb, t[:, None, :].expand_as(action_emb)], dim=2)
+
+
+@pinned
+def test_host_time_embedding_leaves_no_float64_math_and_is_identical():
+    pytest.importorskip("lerobot.policies.smolvla.modeling_smolvla")
+    import lerobot.policies.smolvla.modeling_smolvla as modeling
+    from lerobot.policies.common.vla_utils import create_sinusoidal_pos_embedding
+
+    original = modeling.create_sinusoidal_pos_embedding
+    torch.manual_seed(4)
+    old = _Suffix(host=False).eval()
+    actions, time = torch.randn(2, 3, 6).to(torch.bfloat16), torch.tensor([0.25, 0.75])
+    with torch.no_grad():
+        expected = old(actions, time)
+        host = create_sinusoidal_pos_embedding(time, 16, 4e-3, 4.0, device=torch.device("cpu")).type(
+            dtype=torch.bfloat16)                                                         # lerobot's own
+    old_program = torch.export.export(old, (actions, time), strict=True)
+    assert {"aten.linspace.default", "aten.sin.default", "aten.cos.default"} <= {str(n.target) for n in old_program.graph.nodes}
+    new = _Suffix(host=True).eval()
+    new.proj.load_state_dict(old.proj.state_dict())
+    assert modeling.create_sinusoidal_pos_embedding is not original
+    program = torch.export.export(new, (actions, time, host), strict=True)
+    calls = [n for n in program.graph.nodes if n.op == "call_function"]
+    assert not [n for n in calls if str(n.target) in ("aten.linspace.default", "aten.pow.Scalar", "aten.pow.Tensor_Tensor",
+                                                       "aten.sin.default", "aten.cos.default")]
+    assert not [n for n in calls if getattr(n.meta.get("val"), "dtype", None) == torch.float64]
+    with torch.no_grad():
+        assert torch.equal(program.module()(actions, time, host).view(torch.int16), expected.view(torch.int16))
+        with pytest.raises(ValueError, match="does not match"):
+            new(actions, time[:1], host)
+    new.time.restore()
+    assert modeling.create_sinusoidal_pos_embedding is original

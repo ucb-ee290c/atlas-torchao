@@ -576,6 +576,52 @@ class _HostTokenEmbeddings:
         return self.embeddings
 
 
+def smolvla_time_embedding(policy, actions, noise, time):
+    """Host value of the flow-timestep embedding embed_suffix computes: lerobot's own
+    create_sinusoidal_pos_embedding(time, expert_hidden_size, min_period, max_period) (float64 linspace, pow, sin,
+    cos) followed by embed_suffix's own .type(dtype=action_emb.dtype), with action_emb = action_in_proj(x_t) run
+    eagerly for its dtype (x_t as make_flow_matching_inputs builds it, the noise at t = 1). [B, expert_hidden]."""
+    from lerobot.policies.common.flow_matching import FlowConvention, make_flow_matching_inputs
+    from lerobot.policies.common.vla_utils import create_sinusoidal_pos_embedding
+
+    model = policy.model
+    with torch.no_grad():
+        x_t, _, _ = make_flow_matching_inputs(actions, noise, time, convention=FlowConvention.NOISE_AT_ONE)
+        action_emb = model.action_in_proj(x_t)
+        emb = create_sinusoidal_pos_embedding(time, model.vlm_with_expert.expert_hidden_size, model.config.min_period,
+                                              model.config.max_period, device=action_emb.device)
+        return emb.type(dtype=action_emb.dtype).contiguous()
+
+
+class _HostTimeEmbedding:
+    """modeling_smolvla.create_sinusoidal_pos_embedding taking its result from a host input (smolvla_time_embedding),
+    so the graph holds none of its float64 linspace / pow / sin / cos. The host value already has embed_suffix's
+    dtype, so embed_suffix's .type(dtype=...) of it is the identity. install() replaces the module function, restore()
+    puts it back; `embedding` is set by the boundary's forward and must have shape [len(time), dimension]."""
+
+    def __init__(self):
+        self.embedding, self._saved = None, None
+
+    def install(self):
+        import lerobot.policies.smolvla.modeling_smolvla as modeling
+
+        if self._saved is None:
+            self._saved = modeling.create_sinusoidal_pos_embedding
+            modeling.create_sinusoidal_pos_embedding = self.create_sinusoidal_pos_embedding
+
+    def restore(self):
+        import lerobot.policies.smolvla.modeling_smolvla as modeling
+
+        if self._saved is not None:
+            modeling.create_sinusoidal_pos_embedding, self._saved = self._saved, None
+
+    def create_sinusoidal_pos_embedding(self, time, dimension, min_period, max_period, device="cpu"):
+        if tuple(self.embedding.shape) != (time.shape[0], dimension) or time.ndim != 1:
+            raise ValueError(f"host time embedding {tuple(self.embedding.shape)} does not match time "
+                             f"{tuple(time.shape)} and dimension {dimension}")
+        return self.embedding
+
+
 _MASK_VIEWS = {torch.ops.aten.slice.Tensor, torch.ops.aten.unsqueeze.default, torch.ops.aten.expand.default,
                torch.ops.aten.view.default, torch.ops.aten.reshape.default, torch.ops.aten.alias.default}
 _SOFTMAX = {torch.ops.aten.softmax.int, torch.ops.aten._softmax.default}
@@ -1934,7 +1980,9 @@ class SmolVLAFlowLoss(torch.nn.Module):
     Inputs: n_images images, lang_tokens, state, actions, noise, time, attention_mask (BF16 additive [B, S, S]),
     position_ids (int64 [B, S]); with host_text_embeddings, lang_tokens is replaced by lerobot's
     embed_language_tokens(lang_tokens) computed on the host (BF16 [B, L, hidden]; _HostTokenEmbeddings), so the graph
-    holds no token embedding_lookup (embed_prefix still scales it in the graph); with host_rope, the six host RoPE tables (smolvla_rope_tables: joint, prefix, expert
+    holds no token embedding_lookup (embed_prefix still scales it in the graph); with host_time_embedding, a last input
+    holds the flow-timestep embedding computed on the host (smolvla_time_embedding, _HostTimeEmbedding; `time` stays an
+    input for x_t); with host_rope, the six host RoPE tables (smolvla_rope_tables: joint, prefix, expert
     cos / sin, float32) instead of the position ids, so no RoPE angle, pow, sin or cos is computed in the graph. The forward is VLAFlowMatching.forward with make_att_2d_masks and the cumsum
     replaced by the two inputs; the pad / block masks embed_prefix / embed_suffix return only feed those, so the
     language pad mask is not an input (embed_prefix gets an all-true one, which the graph never reads)."""
@@ -1944,22 +1992,27 @@ class SmolVLAFlowLoss(torch.nn.Module):
     bias_add = True
     forbidden_graph_targets = ("aten.cumsum.default",)
 
-    def __init__(self, policy, n_images=1, host_rope=False, host_text_embeddings=False):
+    def __init__(self, policy, n_images=1, host_rope=False, host_text_embeddings=False, host_time_embedding=False):
         super().__init__()
         self.policy = policy
         self.n_images = n_images
         self.host_rope = host_rope
         self.host_text_embeddings = host_text_embeddings
+        self.host_time_embedding = host_time_embedding
         self._rope = _HostRope()
         self._tokens = _HostTokenEmbeddings(policy.model.vlm_with_expert)
+        self._time = _HostTimeEmbedding()
         if host_rope:
             self._rope.install()
         if host_text_embeddings:
             self._tokens.install()
+        if host_time_embedding:
+            self._time.install()
 
     def restore(self):
         self._rope.restore()
         self._tokens.restore()
+        self._time.restore()
 
     def forward(self, *tensors):
         from lerobot.policies.common.flow_matching import FlowConvention, make_flow_matching_inputs
@@ -1967,6 +2020,8 @@ class SmolVLAFlowLoss(torch.nn.Module):
         model = self.policy.model
         images = list(tensors[:self.n_images])
         lang_tokens, state, actions, noise, time, attention_mask, *rest = tensors[self.n_images:]
+        if self.host_time_embedding:
+            self._time.embedding, rest = rest[-1], rest[:-1]
         position_ids = _text_inputs(self, attention_mask.shape[0], attention_mask.shape[-1], attention_mask.device, rest)
         if self.host_text_embeddings:
             # lang_tokens is the host embedding; embed_prefix gets an all-zero token tensor of its shape, whose values
@@ -2061,19 +2116,20 @@ def _position_inputs(policy, position_ids, prefix_len, host_rope):
 
 
 def smolvla_flow_inputs(policy, n_images, case, keep_self_for_padded=False, host_rope=False,
-                        host_text_embeddings=False):
+                        host_text_embeddings=False, host_time_embedding=False):
     """SmolVLAFlowLoss inputs for one smolvla_raw_cases tuple (images, lang_tokens, lang_masks, state, actions, noise,
     time): the same tensors without lang_masks, then the host attention mask and position ids (with host_rope: the
     host RoPE tables of those position ids). With host_text_embeddings, lang_tokens is replaced by lerobot's
-    embed_language_tokens(lang_tokens) on the host."""
+    embed_language_tokens(lang_tokens) on the host; with host_time_embedding, smolvla_time_embedding is appended."""
     prefix, _, pad, att = _smolvla_embedded(policy, n_images, case)
     mask, position_ids, _ = smolvla_attention_inputs(pad, att, keep_self_for_padded)
     images, (lang_tokens, _, state, actions, noise, time) = case[:n_images], case[n_images:]
     if host_text_embeddings:
         with torch.no_grad():
             lang_tokens = policy.model.vlm_with_expert.embed_language_tokens(lang_tokens).contiguous()
+    tail = (smolvla_time_embedding(policy, actions, noise, time),) if host_time_embedding else ()
     return (*images, lang_tokens, state, actions, noise, time, mask,
-            *_position_inputs(policy, position_ids, prefix.shape[1], host_rope))
+            *_position_inputs(policy, position_ids, prefix.shape[1], host_rope), *tail)
 
 
 def smolvla_text_cases(policy, n_images, seed, device, count=2, keep_self_for_padded=False, host_rope=False):
@@ -2108,9 +2164,10 @@ def smolvla_raw_cases(policy, n_images, seed, device, count=2, image_size=None):
 
 
 def smolvla_cases(policy, n_images, seed, device, count=2, image_size=None, keep_self_for_padded=False,
-                  host_rope=False, host_text_embeddings=False):
+                  host_rope=False, host_text_embeddings=False, host_time_embedding=False):
     """`count` fixed input tuples for SmolVLAFlowLoss: smolvla_raw_cases through smolvla_flow_inputs."""
-    return [smolvla_flow_inputs(policy, n_images, case, keep_self_for_padded, host_rope, host_text_embeddings)
+    return [smolvla_flow_inputs(policy, n_images, case, keep_self_for_padded, host_rope, host_text_embeddings,
+                                host_time_embedding)
             for case in smolvla_raw_cases(policy, n_images, seed, device, count, image_size)]
 
 
@@ -2143,6 +2200,10 @@ def main(argv=None):
     parser.add_argument("--host-text-embeddings", action="store_true",
                         help="--boundary smolvla_flow_loss: take lerobot's embed_language_tokens(lang_tokens), computed on "
                              "the host, instead of the token ids, so the graph holds no token embedding lookup")
+    parser.add_argument("--host-time-embedding", action="store_true",
+                        help="--boundary smolvla_flow_loss: take the flow-timestep embedding (lerobot's "
+                             "create_sinusoidal_pos_embedding, cast as embed_suffix casts it) computed on the host as a "
+                             "last input, so the graph holds none of its float64 math")
     parser.add_argument("--layers", type=int, default=2, help="text / expert layers with --boundary smolvla_text_layers")
     parser.add_argument("--layer", type=int, default=0, help="decoder layer index with --boundary causal_lm_layer")
     parser.add_argument("--n-images", type=int, default=1, help="cameras at the smolvla_flow_loss boundary")
@@ -2173,13 +2234,15 @@ def main(argv=None):
                 cases = smolvla_text_cases(lerobot_policy, args.n_images, args.seed, args.device, host_rope=args.host_rope)
                 boundary = SmolVLATextLayers(lerobot_policy, args.layers, host_rope=args.host_rope).eval()
             else:
-                if args.host_text_embeddings and args.boundary != "smolvla_flow_loss":
-                    parser.error("--host-text-embeddings applies to --boundary smolvla_flow_loss")
+                if (args.host_text_embeddings or args.host_time_embedding) and args.boundary != "smolvla_flow_loss":
+                    parser.error("--host-text-embeddings / --host-time-embedding apply to --boundary smolvla_flow_loss")
                 # the host token embeddings are computed before the boundary replaces embed_language_tokens
                 cases = smolvla_cases(lerobot_policy, args.n_images, args.seed, args.device, host_rope=args.host_rope,
-                                      host_text_embeddings=args.host_text_embeddings)
+                                      host_text_embeddings=args.host_text_embeddings,
+                                      host_time_embedding=args.host_time_embedding)
                 boundary = SmolVLAFlowLoss(lerobot_policy, args.n_images, host_rope=args.host_rope,
-                                           host_text_embeddings=args.host_text_embeddings).eval()
+                                           host_text_embeddings=args.host_text_embeddings,
+                                           host_time_embedding=args.host_time_embedding).eval()
             config_dict = __import__("dataclasses").asdict(lerobot_policy.config)
         else:
             model, _, _ = load_quantized.load_quantized(args.model, args.export_dir, args.device,
@@ -2212,7 +2275,8 @@ def main(argv=None):
                                         **({"layer": args.layer} if args.boundary == "causal_lm_layer" else {}),
                                         **({"layers": args.layers} if args.boundary == "smolvla_text_layers" else {}),
                                         **({"host_rope": True} if args.host_rope else {}),
-                                        **({"host_text_embeddings": True} if args.host_text_embeddings else {})})
+                                        **({"host_text_embeddings": True} if args.host_text_embeddings else {}),
+                                        **({"host_time_embedding": True} if args.host_time_embedding else {})})
     print(json.dumps(report, indent=2))
     return 0
 
