@@ -200,3 +200,15 @@ def test_tied_fp8_embedding_with_per_tensor_head_exponent():
     assert head.weight_scale_exp.numel() == 1
     want = he.fp8_decode(head.weight_codes, head.weight_scale_exp).to(torch.bfloat16)
     assert torch.equal(m.get_input_embeddings()(torch.arange(128)), want)
+
+
+def test_table_decodes_equal_bit_decodes():
+    """The modules decode by table gathers (no uint8 bit ops in a captured graph); same values as the bit-op forms."""
+    import reference.ref_numerics as rn
+
+    codes = torch.arange(256, dtype=torch.int32).to(torch.uint8).reshape(16, 16)
+    exp = torch.arange(-8, 8, dtype=torch.int32).reshape(16, 1)
+    emb = he.QuantEmbedding(16, 16, "fp8", torch.bfloat16, (codes, exp))
+    assert torch.equal(emb._fp8_rows(codes, exp), rn.dequantize(codes, exp))
+    pair = he.e2m1_pair_table()
+    assert torch.equal(pair[codes.long()].reshape(16, 32), he.e2m1_table()[he.unpack_codes(codes).long()])

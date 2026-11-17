@@ -162,6 +162,22 @@ def e4m3_table(device=None) -> torch.Tensor:
     return torch.arange(256, dtype=torch.int32, device=device).to(torch.uint8).view(torch.float8_e4m3fn).float()
 
 
+def e2m1_pair_table(device=None) -> torch.Tensor:
+    """[256, 2] FP32: the two E2M1 values of a packed byte (low nibble first). Decoding a packed byte by one table
+    gather keeps the graph free of uint8 shift / and / stack, which the backend importer leaves opaque."""
+    b = torch.arange(256, dtype=torch.int64, device=device)
+    t = e2m1_table(device)
+    return torch.stack([t[b & 15], t[b >> 4]], -1)
+
+
+def atlas_e4m3_table(device=None) -> torch.Tensor:
+    """[256] FP32: ref_numerics.e4m3_unpack of every byte (the Atlas decoding: exponent-0 codes and 0x7F / 0xFF are
+    zero). `table[code] * 2^exp` equals ref_numerics.dequantize(code, exp) bit for bit."""
+    import reference.ref_numerics as rn
+
+    return rn.e4m3_unpack(torch.arange(256, dtype=torch.int32, device=device).to(torch.uint8))
+
+
 def e2m1_rne(v: torch.Tensor) -> torch.Tensor:
     """E2M1 codes (uint8 0..15) of v (|v| <= 6) rounded to nearest, ties to the even code; sign bit 8 only for a
     negative value, -0 included (torchao f32_to_f4_unpacked; tests compare)."""
@@ -210,11 +226,12 @@ def nvfp4_quantize(w: torch.Tensor):
     return pack_codes(codes), bs.view(torch.uint8), ts
 
 
-def nvfp4_decode(packed, scale_bytes, tensor_scale, e2m1_lut=None, e4m3_lut=None) -> torch.Tensor:
-    """FP32 values [..., K] of packed rows [..., K/2] with their block-scale bytes [..., K/16] (exact)."""
-    e2m1_lut = e2m1_table(packed.device) if e2m1_lut is None else e2m1_lut
+def nvfp4_decode(packed, scale_bytes, tensor_scale, pair_lut=None, e4m3_lut=None) -> torch.Tensor:
+    """FP32 values [..., K] of packed rows [..., K/2] with their block-scale bytes [..., K/16] (exact). Table gathers
+    only (e2m1_pair_table, e4m3_table): no bit operations in a captured graph."""
+    pair_lut = e2m1_pair_table(packed.device) if pair_lut is None else pair_lut
     e4m3_lut = e4m3_table(packed.device) if e4m3_lut is None else e4m3_lut
-    vals = e2m1_lut[unpack_codes(packed).long()]
+    vals = pair_lut[packed.long()].reshape(*packed.shape[:-1], packed.shape[-1] * 2)
     scales = e4m3_lut[scale_bytes.long()] * tensor_scale
     return (vals.reshape(*scales.shape, NVFP4_BLOCK) * scales.unsqueeze(-1)).reshape(vals.shape)
 
@@ -226,8 +243,13 @@ def nvfp4_decode(packed, scale_bytes, tensor_scale, e2m1_lut=None, e4m3_lut=None
 class _Tables(nn.Module):
     def _register_tables(self):
         # graph constants (fx_export holds non-persistent, non-quantization buffers as constants)
-        self.register_buffer("e2m1_lut", e2m1_table(), persistent=False)
+        self.register_buffer("e2m1_pair_lut", e2m1_pair_table(), persistent=False)
         self.register_buffer("e4m3_lut", e4m3_table(), persistent=False)
+        self.register_buffer("e4m3_atlas_lut", atlas_e4m3_table(), persistent=False)
+
+    def _fp8_rows(self, codes, exp):
+        """atlas_e4m3_table[code] * 2^exp: ref_numerics.dequantize as one table gather and an exp2 (no bit ops)."""
+        return self.e4m3_atlas_lut[codes.long()] * torch.exp2(exp.float())
 
 
 class NVFP4Linear(_Tables):
@@ -253,12 +275,12 @@ class NVFP4Linear(_Tables):
 
     def decoded_weight(self) -> torch.Tensor:
         return nvfp4_decode(self.weight_codes, self.weight_block_scales, self.weight_tensor_scale,
-                            self.e2m1_lut, self.e4m3_lut).to(self.dtype)
+                            self.e2m1_pair_lut, self.e4m3_lut).to(self.dtype)
 
     def rows(self, ids):
         """The decoded rows `ids` (a tied embedding's lookup)."""
         return nvfp4_decode(F.embedding(ids, self.weight_codes), F.embedding(ids, self.weight_block_scales),
-                            self.weight_tensor_scale, self.e2m1_lut, self.e4m3_lut).to(self.dtype)
+                            self.weight_tensor_scale, self.e2m1_pair_lut, self.e4m3_lut).to(self.dtype)
 
     def forward(self, x):
         return F.linear(x.to(self.dtype), self.decoded_weight())
@@ -294,8 +316,7 @@ class QuantEmbedding(_Tables):
                 self.register_buffer("weight_codes", codes, persistent=False)
                 self.register_buffer("weight_block_scales", scales, persistent=False)
                 self.register_buffer("weight_tensor_scale", ts, persistent=False)
-        if fmt == "nvfp4":
-            self._register_tables()
+        self._register_tables()
 
     @classmethod
     def from_embedding(cls, emb: nn.Embedding, fmt):
@@ -319,10 +340,10 @@ class QuantEmbedding(_Tables):
         if self.fmt == "fp8":
             exp = src.weight_scale_exp            # [V, 1] per row; a tied head may hold one per-tensor exponent
             exp = F.embedding(ids, exp) if exp.dim() == 2 and exp.shape[0] == self.num_embeddings else exp
-            rows = fp8_decode(F.embedding(ids, src.weight_codes), exp)
+            rows = self._fp8_rows(F.embedding(ids, src.weight_codes), exp)
         else:
             rows = nvfp4_decode(F.embedding(ids, src.weight_codes), F.embedding(ids, src.weight_block_scales),
-                                src.weight_tensor_scale, self.e2m1_lut, self.e4m3_lut)
+                                src.weight_tensor_scale, self.e2m1_pair_lut, self.e4m3_lut)
         return rows.to(self.dtype)
 
     def decoded_weight(self) -> torch.Tensor:
