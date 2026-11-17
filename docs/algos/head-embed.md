@@ -67,7 +67,6 @@ repeated over each block of 32 rows.
   This is NEW; torchao 0.18 uses `amax / (448 * 6)`. With a power-of-two tensor scale, every decoded value
   `e2m1 * e4m3 * 2^k` is exact in BF16, since `e2m1 * e4m3` has at most 6 significant bits.
 - The largest block scale then lies in (224, 448] instead of being exactly 448.
-- MXFP4 is not offered.
 
 **NVFP4 head:** weight-only. The activation stays BF16, and the head computes
 `F.linear(x, decode(codes))` in BF16, the same BF16 Linear as the unquantized head on an exactly decoded

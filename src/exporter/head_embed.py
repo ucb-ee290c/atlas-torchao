@@ -34,7 +34,7 @@ Formats:
                           e2m1 * e4m3 * 2^k is exact in BF16 (e2m1 * e4m3 needs at most 6 significant
                           bits). Block scale = e4m3(clamp(block_amax / 6 / tensor_scale, 2^-6, 448)) (RNE),
                           codes = e2m1_rne(clamp(x / (block_scale * tensor_scale), -6, 6)), as torchao
-                          0.18 nvfp4_quantize apart from the tensor scale. MXFP4 is not offered.
+                          0.18 nvfp4_quantize apart from the tensor scale.
 
 Order (src/eval.py): `prepare` (tie, BF16) -> algos.quantize with `skip_for(...)` -> `finish`
 (QuantEmbedding / NVFP4Linear installed). The embedding is therefore quantized after calibration: the
