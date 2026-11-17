@@ -198,6 +198,10 @@ def apply_export(model, tensors, policy, device, mode=None, options=None):
     tile_native.verify_export(policy, tensors)      # fail loudly: panel-labeled exponents, reserved codes
     quant = {n for n, s in sites.items() if s["status"] == "quantized" and s["kind"] in ("linear", "conv2d")}
     qkeys = {f"{n}.weight" for n in quant}
+    import exporter.head_embed as head_embed
+
+    # quantized embedding / NVFP4 head (head_embed): their modules come from the export before the state check
+    storage = head_embed.install_from_export(model, policy, tensors, device)
     aliases = policy.get("aliases", {})
     state_keys = set(model.state_dict().keys())
     named = {k for k in tensors if not k.endswith(tuple(__import__("exporter.quant_export", fromlist=['_']).QUANT_SUFFIXES))}
@@ -254,6 +258,9 @@ def apply_export(model, tensors, policy, device, mode=None, options=None):
                 m.weight_lo_scale_exp = tensors[r["lo_scale_exp"]].to(device)
                 if getattr(m, "fm", None) is not None:
                     m.weight_lo_norm = __import__("reference.ref_numerics", fromlist=['_']).e4m3_unpack(lo)
+    if storage:
+        head_embed.bind_ties(model)                  # a tied embedding reads the (now quantized) head's buffers
+        rep["head_embed_sites"] = storage
     rep["loaded_from_export"] = True
     rep["algo"] = {"name": "export_policy", "applied": True, "bf16_opt_out": bf16,
                    "bf16_opt_out_exact": exact_bf16,

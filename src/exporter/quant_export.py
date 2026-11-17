@@ -41,7 +41,7 @@ FORMAT_VERSION = 1
 EXPORTABLE_BASES = ("reference", "reference_hw", "chip")
 PREFERRED_MODE = "ref_conv"
 QUANT_SUFFIXES = (".weight_codes", ".weight_scale_exp", ".weight_lo_codes", ".weight_lo_scale_exp",
-                  ".input_scale_exp")
+                  ".input_scale_exp", ".weight_block_scales", ".weight_tensor_scale")
 
 # The operand format as the reference author's encoder implements it (ref_numerics.e4m3_vpack, a
 # port of pi0-quant fp8_e4m3.py:38-86 = FP8Pack.scala:57-95). Field names follow Merlin's
@@ -466,6 +466,9 @@ def build_policy(model, mode, report, algo, options, skip, bf16_opt_out, opt_out
                     "reason": opt_out_reasons.get(n, "algorithm BF16 opt-out"),
                     "weight": {"tensor": f"{n}.weight", "dtype": str(mod.weight.dtype).replace("torch.", "")
                                if mod is not None and getattr(mod, "weight", None) is not None else None}}
+    import exporter.head_embed as head_embed
+
+    sites.update(head_embed.policy_sites(model, tensors_out))     # quantized embedding / NVFP4 head (none by default)
     for n, mod in model.named_modules():
         if n and n not in sites and type(mod) in (nn.Linear, nn.Conv2d) and any(s and s in n for s in skip):
             sites[n] = {"kind": type(mod).__name__, "status": "skipped",
@@ -666,7 +669,7 @@ def _opt_out_reasons(algo, bf16) -> dict:
 def export(model: nn.Module, export_dir, *, mode: str, report: dict, algo, algo_spec: str, options=None,
            skip=(), model_record: dict | None = None, calib_batches=None, calib_record=None,
            device=None, extra_provenance: dict | None = None, normalization: dict | None = None,
-           allow_uncalibrated_fallback: bool = False) -> dict:
+           allow_uncalibrated_fallback: bool = False, head_embed: dict | None = None) -> dict:
     """Write model.safetensors, policy.json and manifest.json for `model`, quantized under `mode`
     by algos.quantize (whose return value is `report`). Returns the manifest.
 
@@ -677,7 +680,10 @@ def export(model: nn.Module, export_dir, *, mode: str, report: dict, algo, algo_
 
     allow_uncalibrated_fallback: declare (policy.json uncalibrated_fallback.declared) that Linear sites of a
     static recipe without calibration data may stay on the dynamic reference rule; without it the export is
-    still written but warns, and tools/verify_bundle.py fails the static check."""
+    still written but warns, and tools/verify_bundle.py fails the static check.
+
+    head_embed (NEW; src/exporter/head_embed.py export_record): the --tie / --lm-head / --embedding options and
+    what they changed, written to both files. None (the default options) writes neither key."""
     from safetensors.torch import save_file
 
     import quant_modes
@@ -729,6 +735,8 @@ def export(model: nn.Module, export_dir, *, mode: str, report: dict, algo, algo_
     sf = out / "model.safetensors"
     save_file(tensors, str(sf), metadata=meta)
     policy["aliases"] = aliases
+    if head_embed is not None:
+        policy["head_embed"] = jsonable(head_embed)
     if normalization is not None:
         policy["normalization"] = jsonable(normalization)
     policy["tensors"] = {"count": len(tensors), "quantized_layers": len(qmods),
@@ -765,13 +773,15 @@ def export(model: nn.Module, export_dir, *, mode: str, report: dict, algo, algo_
                    "algorithm_record": jsonable(algo_rec)},
         "calibration": calib,
         **({"normalization": jsonable(normalization)} if normalization is not None else {}),
+        **({"head_embed": jsonable(head_embed)} if head_embed is not None else {}),
         "provenance": {**git_state(), "versions": versions(), "host": platform.node(),
                        "device": str(device) if device is not None else None,
                        "gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else None,
                        "argv": list(sys.argv), **(jsonable(extra_provenance) or {})},
         "sites": site_list,
         "counts": {s: sum(1 for x in site_list if x["status"] == s) for s in ("quantized", "host", "skipped")},
-        "new_decisions": NEW_DECISIONS + list((getattr(algo, "recipe", None) or {}).get("new_decisions", [])),
+        "new_decisions": NEW_DECISIONS + list((getattr(algo, "recipe", None) or {}).get("new_decisions", []))
+        + (__import__("exporter.head_embed", fromlist=["_"]).NEW_DECISIONS if head_embed is not None else []),
         "pending_hardware_rulings": PENDING_RULINGS,
         "m2m_manifest_v2_aligned": "partial",
         "m2m_manifest_v2_matching_fields": M2M_V2_MATCHING,

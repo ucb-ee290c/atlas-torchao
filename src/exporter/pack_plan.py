@@ -142,12 +142,16 @@ def plan_record(exp: int, producer: dict | None = None, *, target="nearest", lo:
 # Policy side: which sites are static, where records live
 # ---------------------------------------------------------------------------------------------
 
+# quantized-storage sites (exporter.head_embed): a lookup or a weight-only decode, no FP8 activation operand
+STORAGE_KINDS = ("embedding", "nvfp4_linear")
+
+
 def static_sites(policy: dict) -> dict:
     """{key: {"exp", "kind", "site", "operand"}} for every static activation: Linear / Conv2d `site` name, attention
     `site:operand`. Same keys as quant_export's static_act (the compiler_pack_scale_admission report)."""
     out = {}
     for name, s in policy.get("sites", {}).items():
-        if s.get("status") != "quantized":
+        if s.get("status") != "quantized" or s.get("kind") in STORAGE_KINDS:
             continue
         if s.get("kind") == "attention":
             for op, r in (s.get("operands") or {}).items():
@@ -164,7 +168,7 @@ def dynamic_sites(policy: dict) -> dict:
     """Spec item 6: activations whose exponent is data dependent, so no `scale_code` immediate can express them."""
     out = {}
     for name, s in policy.get("sites", {}).items():
-        if s.get("status") != "quantized":
+        if s.get("status") != "quantized" or s.get("kind") in STORAGE_KINDS:
             continue
         if s.get("kind") == "attention":
             for op, r in (s.get("operands") or {}).items():
