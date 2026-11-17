@@ -510,3 +510,26 @@ def test_host_time_embedding_leaves_no_float64_math_and_is_identical():
             new(actions, time[:1], host)
     new.time.restore()
     assert modeling.create_sinusoidal_pos_embedding is original
+
+
+# -- single-input cat ------------------------------------------------------------------------------------------------------
+
+class _OneCat(torch.nn.Module):
+    def forward(self, x, y):
+        a = torch.cat([x * 2], dim=1)                 # embed_suffix: torch.cat(embs, dim=1) over one tensor
+        b = torch.cat([a, y], dim=1)                  # a real concatenation stays
+        return torch.cat((b,), dim=0) + 1             # tuple form, other dim
+
+
+@pinned
+def test_fold_identity_nodes_replaces_single_input_cat(tmp_path):
+    args = (torch.randn(2, 3).to(torch.bfloat16), torch.randn(2, 4).to(torch.bfloat16))
+    program = torch.export.export(_OneCat(), args, strict=True)
+    cats = lambda p: [n for n in p.graph.nodes if n.op == "call_function" and n.target == torch.ops.aten.cat.default]  # noqa: E731
+    assert len(cats(program)) == 3
+    expected = program.module()(*args)
+    folded = fx_export.fold_identity_nodes(program)
+    assert len(folded) == 2 and [len(n.args[0]) for n in cats(program)] == [2]
+    torch.export.save(program, tmp_path / "p.pt2")
+    for p in (program, torch.export.load(tmp_path / "p.pt2")):
+        assert torch.equal(p.module()(*args).view(torch.int16), expected.view(torch.int16))

@@ -671,6 +671,32 @@ def softmax_mask_forms(graph):
     return rows
 
 
+def fold_identity_nodes(program):
+    """Replace capture-side identities by their input in a captured program; returns the replaced node names.
+    Currently aten.cat over a single tensor (lerobot's embed_suffix concatenates a one-element list): it returns a copy
+    with the input's values, shape and dtype, so every user can read the input itself. The pinned backend lowers it
+    to an `identity` it has no application route for. Only call_function nodes whose input is a tensor of the same
+    dtype and shape are replaced. Run before drop_dead_pure_nodes (boundaries with drop_dead_nodes)."""
+    replaced = []
+    for node in list(program.graph.nodes):
+        if node.op != "call_function" or node.target != torch.ops.aten.cat.default:
+            continue
+        tensors = node.args[0]
+        if not (isinstance(tensors, (list, tuple)) and len(tensors) == 1 and isinstance(tensors[0], torch.fx.Node)):
+            continue
+        source, out = tensors[0], node.meta.get("val")
+        val = source.meta.get("val")
+        if (not isinstance(val, torch.Tensor) or not isinstance(out, torch.Tensor) or val.dtype != out.dtype
+                or tuple(val.shape) != tuple(out.shape)):
+            continue
+        node.replace_all_uses_with(source)
+        program.graph.erase_node(node)
+        replaced.append(node.name)
+    if replaced:
+        program.graph_module.recompile()
+    return replaced
+
+
 def drop_dead_pure_nodes(program):
     """Remove computations nothing reads from a captured program; returns the removed node names. Repeatedly:
       - call_function nodes with no users and no side effect (Node.is_impure() False);
@@ -1813,6 +1839,7 @@ def capture_fx(module, cases, directory, *, policy, provenance=None, strict=True
                         unused) != before:
                 raise FXVerificationError("capture changed code/exponent buffers")
             if getattr(module, "drop_dead_nodes", False):
+                report["identity_nodes_folded"] = fold_identity_nodes(program)
                 report["dead_pure_nodes_removed"] = drop_dead_pure_nodes(program)
             graph_report = inspect_graph(program, module, policy, plan if native_fp8 else None,
                                          native_fp8 or "uint8", unused=unused, act_stats=act_stats, calls=calls,
