@@ -187,3 +187,16 @@ def test_native_capture(tmp_path, opts):
         assert storage["model.embed_tokens"]["code_buffer"] == "model.lm_head.weight_codes"
     if opts["lm_head"] == "fp8":
         assert "model.lm_head" in report["native_fp8_detail"]["sites"]
+
+
+def test_tied_fp8_embedding_with_per_tensor_head_exponent():
+    """A tied FP8 head quantized without a recipe (reference rule: one per-tensor exponent) still serves lookups."""
+    m = tiny_llama(1)
+    opts = {"tie": "lm_head_from_embedding", "lm_head": "fp8", "embedding": "fp8"}
+    rec = he.prepare(m, opts)
+    he.quantize_head_reference(m)
+    he.finish(m, opts, rec)
+    head = m.get_output_embeddings()
+    assert head.weight_scale_exp.numel() == 1
+    want = he.fp8_decode(head.weight_codes, head.weight_scale_exp).to(torch.bfloat16)
+    assert torch.equal(m.get_input_embeddings()(torch.arange(128)), want)

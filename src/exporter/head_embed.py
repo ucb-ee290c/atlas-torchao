@@ -317,7 +317,9 @@ class QuantEmbedding(_Tables):
     def forward(self, ids):
         src = self.source()
         if self.fmt == "fp8":
-            rows = fp8_decode(F.embedding(ids, src.weight_codes), F.embedding(ids, src.weight_scale_exp))
+            exp = src.weight_scale_exp            # [V, 1] per row; a tied head may hold one per-tensor exponent
+            exp = F.embedding(ids, exp) if exp.dim() == 2 and exp.shape[0] == self.num_embeddings else exp
+            rows = fp8_decode(F.embedding(ids, src.weight_codes), exp)
         else:
             rows = nvfp4_decode(F.embedding(ids, src.weight_codes), F.embedding(ids, src.weight_block_scales),
                                 src.weight_tensor_scale, self.e2m1_lut, self.e4m3_lut)
