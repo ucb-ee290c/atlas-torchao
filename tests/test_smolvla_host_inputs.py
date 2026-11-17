@@ -11,6 +11,7 @@
     without quantization; it stays off by default (see test_padded_diagonal_*)."""
 
 import json
+import math
 from types import SimpleNamespace
 
 import algos
@@ -246,6 +247,11 @@ def test_vision_position_ids_are_static_and_identical():
     assert fx_export.graph_shape_census(program.graph)["dynamic_nodes"] == []
     targets = {str(n.target) for n in program.graph.nodes if n.op == "call_function"}
     assert not targets & {"aten.index_put_.default", "aten.index_put.default", "aten.bucketize.Tensor", "aten.nonzero.default"}
+    assert "aten.embedding.default" in {str(n.target) for n in original.graph.nodes if n.op == "call_function"}
+    assert "aten.embedding.default" not in targets                         # the table itself, no lookup
+    # position_embedding(arange(n*n)) is the table: the same words as the parameter, row for row
+    table = module.embeddings.position_embedding.weight
+    assert torch.equal(module.embeddings.position_embedding(torch.arange(16)).view(torch.int16), table.view(torch.int16))
     with torch.no_grad():
         assert torch.equal(program.module()(x).view(torch.int16), eager.view(torch.int16))
     y = torch.randn(1, 3, 16, 32).to(torch.bfloat16)                       # not full size: the original path
@@ -398,3 +404,52 @@ def test_drop_dead_pure_nodes_removes_unread_work_and_constants(tmp_path):
     torch.export.save(program, tmp_path / "p.pt2")
     loaded = torch.export.load(tmp_path / "p.pt2")
     assert torch.equal(loaded.module()(*args), expected) and torch.equal(program.module()(*args), expected)
+
+
+# -- host text-token embeddings -------------------------------------------------------------------------------------------
+
+class _Tokens(torch.nn.Module):
+    """embed_prefix's language part: lerobot's embed_language_tokens, then its sqrt(hidden) scaling."""
+
+    def __init__(self, inner, host):
+        super().__init__()
+        self.inner, self.host = inner, host
+        self.tokens = fx_export._HostTokenEmbeddings(inner)
+        if host:
+            self.tokens.install()
+
+    def forward(self, x):
+        if self.host:
+            self.tokens.embeddings = x
+            x = torch.zeros(x.shape[:-1], dtype=torch.int64)
+        emb = self.inner.embed_language_tokens(x)
+        return emb * math.sqrt(emb.shape[-1])
+
+
+@pinned
+def test_host_text_embeddings_leave_no_token_lookup_and_are_identical():
+    pytest.importorskip("lerobot.policies.smolvla.smolvlm_with_expert")
+    policy, _ = _tiny_policy(quantize=False)
+    inner = policy.model.vlm_with_expert
+    tokens = torch.randint(0, 8, (1, 5), generator=torch.Generator().manual_seed(1))
+    old = _Tokens(inner, host=False).eval()
+    with torch.no_grad():
+        expected = old(tokens)
+        host = inner.embed_language_tokens(tokens)                       # lerobot's own lookup, on the host
+    old_program = torch.export.export(old, (tokens,), strict=True)
+    assert "aten.embedding.default" in [str(n.target) for n in old_program.graph.nodes]
+    new = _Tokens(inner, host=True).eval()
+    assert "embed_language_tokens" in inner.__dict__
+    program = torch.export.export(new, (host,), strict=True)
+    targets = [str(n.target) for n in program.graph.nodes if n.op == "call_function"]
+    assert "aten.embedding.default" not in targets and "aten.mul.Tensor" in targets      # scaling stays in the graph
+    with torch.no_grad():
+        assert torch.equal(program.module()(host).view(torch.int16), expected.view(torch.int16))
+        with pytest.raises(ValueError, match="do not match"):
+            new.tokens.embeddings = host
+            inner.embed_language_tokens(torch.zeros(1, 4, dtype=torch.int64))
+    new.tokens.restore()
+    assert "embed_language_tokens" not in inner.__dict__
+    inner.add_image_special_tokens = True
+    with pytest.raises(ValueError, match="special tokens"):
+        fx_export._HostTokenEmbeddings(inner).install()

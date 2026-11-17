@@ -411,11 +411,12 @@ def _static_vision_position_ids(module):
     num_patches_per_side patches per side the ids are 0 .. n*n - 1 in row-major order.
 
     Checked, not assumed: before the capture each such module's own forward is run eagerly on a full-size image with
-    an all-true mask and its ids must equal arange(n*n). The capture-time forward then computes
-    patch_embedding(x).flatten(2).transpose(1, 2) + position_embedding(arange(n*n)[None].expand(B, -1)), the same
-    operations on the same ids, and on every concrete (eager) call it asserts the patch mask it was given is all
-    true. Any other input size, or a mask of another shape, runs the original forward (and the capture's
-    static-shape check then fails closed). Restored afterwards. Yields the module paths converted."""
+    an all-true mask and its ids must equal arange(n*n). position_embedding(arange(n*n)) then gathers every row of the
+    table in order, i.e. it is the table itself, so the capture-time forward computes
+    patch_embedding(x).flatten(2).transpose(1, 2) + position_embedding.weight[None] (the same words, added with
+    broadcast over the batch; no embedding_lookup node), and on every concrete (eager) call it asserts the patch mask
+    it was given is all true. Any other input size, or a mask of another shape, runs the original forward (and the
+    capture's static-shape check then fails closed). Restored afterwards. Yields the module paths converted."""
     import types
 
     patched = []
@@ -440,8 +441,9 @@ def _static_vision_position_ids(module):
                     if not bool(patch_attention_mask.all()):
                         raise FXVerificationError(f"{_path}: the patch attention mask is not all true")
                 embeddings = self.patch_embedding(pixel_values).flatten(2).transpose(1, 2)
-                position_ids = torch.arange(side * side, device=pixel_values.device)[None].expand(batch, -1)
-                return embeddings + self.position_embedding(position_ids)
+                # position_embedding(arange(n*n)) gathers every row of the table in order: it is the table itself
+                # ([1, n*n, D], broadcast over the batch), so no embedding lookup is captured
+                return embeddings + self.position_embedding.weight[None]
 
             patched.append((mod, mod.__dict__.get("forward"), path))
             mod.forward = types.MethodType(forward, mod)
@@ -542,6 +544,36 @@ class _HostRope:
         res[..., :d_half] = x1 * cos - x2 * sin
         res[..., d_half:] = x2 * cos + x1 * sin
         return res.to(dtype)
+
+
+class _HostTokenEmbeddings:
+    """SmolVLMWithExpertModel.embed_language_tokens taking its result from a host input: lerobot's own
+    embed_language_tokens (the text model's input-embedding lookup) is run on the host (smolvla_flow_inputs) and the
+    boundary hands the result in, so the graph holds no token embedding_lookup. embed_prefix itself is unchanged and
+    still applies its sqrt(hidden) scaling in the graph. install() sets an instance attribute on the
+    SmolVLMWithExpertModel, restore() removes it; `embeddings` is set by the boundary's forward and must match the
+    token shape it is called with. Refused when the policy adds image special tokens (their lookups go through the
+    same function)."""
+
+    def __init__(self, inner):
+        self.inner, self.embeddings, self._installed = inner, None, False
+
+    def install(self):
+        if getattr(self.inner, "add_image_special_tokens", False):
+            raise ValueError("host text embeddings: image special tokens also use embed_language_tokens")
+        if not self._installed:
+            self.inner.embed_language_tokens = self.embed_language_tokens
+            self._installed = True
+
+    def restore(self):
+        if self._installed:
+            del self.inner.embed_language_tokens
+            self._installed = False
+
+    def embed_language_tokens(self, tokens):
+        if tuple(tokens.shape) != tuple(self.embeddings.shape[:-1]):
+            raise ValueError(f"host text embeddings {tuple(self.embeddings.shape)} do not match tokens {tuple(tokens.shape)}")
+        return self.embeddings
 
 
 _MASK_VIEWS = {torch.ops.aten.slice.Tensor, torch.ops.aten.unsqueeze.default, torch.ops.aten.expand.default,
@@ -1900,7 +1932,9 @@ class SmolVLAFlowLoss(torch.nn.Module):
     KV cache) is a different boundary.
 
     Inputs: n_images images, lang_tokens, state, actions, noise, time, attention_mask (BF16 additive [B, S, S]),
-    position_ids (int64 [B, S]); with host_rope, the six host RoPE tables (smolvla_rope_tables: joint, prefix, expert
+    position_ids (int64 [B, S]); with host_text_embeddings, lang_tokens is replaced by lerobot's
+    embed_language_tokens(lang_tokens) computed on the host (BF16 [B, L, hidden]; _HostTokenEmbeddings), so the graph
+    holds no token embedding_lookup (embed_prefix still scales it in the graph); with host_rope, the six host RoPE tables (smolvla_rope_tables: joint, prefix, expert
     cos / sin, float32) instead of the position ids, so no RoPE angle, pow, sin or cos is computed in the graph. The forward is VLAFlowMatching.forward with make_att_2d_masks and the cumsum
     replaced by the two inputs; the pad / block masks embed_prefix / embed_suffix return only feed those, so the
     language pad mask is not an input (embed_prefix gets an all-true one, which the graph never reads)."""
@@ -1910,17 +1944,22 @@ class SmolVLAFlowLoss(torch.nn.Module):
     bias_add = True
     forbidden_graph_targets = ("aten.cumsum.default",)
 
-    def __init__(self, policy, n_images=1, host_rope=False):
+    def __init__(self, policy, n_images=1, host_rope=False, host_text_embeddings=False):
         super().__init__()
         self.policy = policy
         self.n_images = n_images
         self.host_rope = host_rope
+        self.host_text_embeddings = host_text_embeddings
         self._rope = _HostRope()
+        self._tokens = _HostTokenEmbeddings(policy.model.vlm_with_expert)
         if host_rope:
             self._rope.install()
+        if host_text_embeddings:
+            self._tokens.install()
 
     def restore(self):
         self._rope.restore()
+        self._tokens.restore()
 
     def forward(self, *tensors):
         from lerobot.policies.common.flow_matching import FlowConvention, make_flow_matching_inputs
@@ -1929,6 +1968,11 @@ class SmolVLAFlowLoss(torch.nn.Module):
         images = list(tensors[:self.n_images])
         lang_tokens, state, actions, noise, time, attention_mask, *rest = tensors[self.n_images:]
         position_ids = _text_inputs(self, attention_mask.shape[0], attention_mask.shape[-1], attention_mask.device, rest)
+        if self.host_text_embeddings:
+            # lang_tokens is the host embedding; embed_prefix gets an all-zero token tensor of its shape, whose values
+            # nothing reads (the patched embed_language_tokens returns the host embedding)
+            self._tokens.embeddings = lang_tokens
+            lang_tokens = torch.zeros(lang_tokens.shape[:-1], dtype=torch.int64, device=lang_tokens.device)
         masks = [torch.ones(image.shape[0], dtype=torch.bool, device=image.device) for image in images]
         x_t, u_t, _ = make_flow_matching_inputs(actions, noise, time, convention=FlowConvention.NOISE_AT_ONE)
         prefix_embs, _, _ = model.embed_prefix(images, masks, lang_tokens, torch.ones_like(lang_tokens, dtype=torch.bool),
@@ -2016,13 +2060,18 @@ def _position_inputs(policy, position_ids, prefix_len, host_rope):
     return tuple(t.contiguous() for name in ROPE_TABLES for t in tables[name])
 
 
-def smolvla_flow_inputs(policy, n_images, case, keep_self_for_padded=False, host_rope=False):
+def smolvla_flow_inputs(policy, n_images, case, keep_self_for_padded=False, host_rope=False,
+                        host_text_embeddings=False):
     """SmolVLAFlowLoss inputs for one smolvla_raw_cases tuple (images, lang_tokens, lang_masks, state, actions, noise,
     time): the same tensors without lang_masks, then the host attention mask and position ids (with host_rope: the
-    host RoPE tables of those position ids)."""
+    host RoPE tables of those position ids). With host_text_embeddings, lang_tokens is replaced by lerobot's
+    embed_language_tokens(lang_tokens) on the host."""
     prefix, _, pad, att = _smolvla_embedded(policy, n_images, case)
     mask, position_ids, _ = smolvla_attention_inputs(pad, att, keep_self_for_padded)
     images, (lang_tokens, _, state, actions, noise, time) = case[:n_images], case[n_images:]
+    if host_text_embeddings:
+        with torch.no_grad():
+            lang_tokens = policy.model.vlm_with_expert.embed_language_tokens(lang_tokens).contiguous()
     return (*images, lang_tokens, state, actions, noise, time, mask,
             *_position_inputs(policy, position_ids, prefix.shape[1], host_rope))
 
@@ -2059,9 +2108,9 @@ def smolvla_raw_cases(policy, n_images, seed, device, count=2, image_size=None):
 
 
 def smolvla_cases(policy, n_images, seed, device, count=2, image_size=None, keep_self_for_padded=False,
-                  host_rope=False):
+                  host_rope=False, host_text_embeddings=False):
     """`count` fixed input tuples for SmolVLAFlowLoss: smolvla_raw_cases through smolvla_flow_inputs."""
-    return [smolvla_flow_inputs(policy, n_images, case, keep_self_for_padded, host_rope)
+    return [smolvla_flow_inputs(policy, n_images, case, keep_self_for_padded, host_rope, host_text_embeddings)
             for case in smolvla_raw_cases(policy, n_images, seed, device, count, image_size)]
 
 
@@ -2091,6 +2140,9 @@ def main(argv=None):
     parser.add_argument("--host-rope", action="store_true",
                         help="SmolVLA boundaries: take the host RoPE cos / sin tables (smolvla_rope_tables) instead of "
                              "the position ids, so the graph computes no RoPE angle")
+    parser.add_argument("--host-text-embeddings", action="store_true",
+                        help="--boundary smolvla_flow_loss: take lerobot's embed_language_tokens(lang_tokens), computed on "
+                             "the host, instead of the token ids, so the graph holds no token embedding lookup")
     parser.add_argument("--layers", type=int, default=2, help="text / expert layers with --boundary smolvla_text_layers")
     parser.add_argument("--layer", type=int, default=0, help="decoder layer index with --boundary causal_lm_layer")
     parser.add_argument("--n-images", type=int, default=1, help="cameras at the smolvla_flow_loss boundary")
@@ -2121,8 +2173,13 @@ def main(argv=None):
                 cases = smolvla_text_cases(lerobot_policy, args.n_images, args.seed, args.device, host_rope=args.host_rope)
                 boundary = SmolVLATextLayers(lerobot_policy, args.layers, host_rope=args.host_rope).eval()
             else:
-                boundary = SmolVLAFlowLoss(lerobot_policy, args.n_images, host_rope=args.host_rope).eval()
-                cases = smolvla_cases(lerobot_policy, args.n_images, args.seed, args.device, host_rope=args.host_rope)
+                if args.host_text_embeddings and args.boundary != "smolvla_flow_loss":
+                    parser.error("--host-text-embeddings applies to --boundary smolvla_flow_loss")
+                # the host token embeddings are computed before the boundary replaces embed_language_tokens
+                cases = smolvla_cases(lerobot_policy, args.n_images, args.seed, args.device, host_rope=args.host_rope,
+                                      host_text_embeddings=args.host_text_embeddings)
+                boundary = SmolVLAFlowLoss(lerobot_policy, args.n_images, host_rope=args.host_rope,
+                                           host_text_embeddings=args.host_text_embeddings).eval()
             config_dict = __import__("dataclasses").asdict(lerobot_policy.config)
         else:
             model, _, _ = load_quantized.load_quantized(args.model, args.export_dir, args.device,
@@ -2154,7 +2211,8 @@ def main(argv=None):
                                         "seed": args.seed, "seqlen": args.seqlen,
                                         **({"layer": args.layer} if args.boundary == "causal_lm_layer" else {}),
                                         **({"layers": args.layers} if args.boundary == "smolvla_text_layers" else {}),
-                                        **({"host_rope": True} if args.host_rope else {})})
+                                        **({"host_rope": True} if args.host_rope else {}),
+                                        **({"host_text_embeddings": True} if args.host_text_embeddings else {})})
     print(json.dumps(report, indent=2))
     return 0
 
