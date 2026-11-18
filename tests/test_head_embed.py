@@ -194,13 +194,13 @@ CAPTURE_CASES = [(torch.arange(8, dtype=torch.long).reshape(1, 8),),
                  (torch.arange(8, 16, dtype=torch.long).reshape(1, 8),)]
 
 
-def _capture(tmp_path, opts):
+def _capture(tmp_path, opts, fresh_process=False):
     """(native-FP8 capture report, saved program) of the option's export, reloaded."""
     _, d = _export(tmp_path, opts)
     m = _reload(d)
     policy = json.loads((d / "policy.json").read_text())
     report = fx_export.capture_fx(fx_export.CausalLogits(m).eval(), CAPTURE_CASES, tmp_path / "fx", policy=policy,
-                                  strict=True, fresh_process=False, native_fp8="uint8")
+                                  strict=True, fresh_process=fresh_process, native_fp8="uint8")
     return report, torch.export.load(tmp_path / "fx" / "model.pt2")
 
 
@@ -251,6 +251,21 @@ def test_capture_keeps_default_node_names(tmp_path, opts, default_capture):
         decode = [n.name for n in program.graph.nodes
                   if n.op == "call_function" and fx_export._scope(n) == "model.model.embed_tokens"]
         assert decode and all(name.startswith("model_model_embed_tokens_") for name in decode)
+
+
+@pytest.mark.parametrize("opts", [{"tie": "none", "lm_head": "fp8", "embedding": "fp8"},
+                                  {"tie": "none", "lm_head": "bf16", "embedding": "fp8"}], ids=he.label)
+def test_verify_bundle_with_fp8_embedding(tmp_path, opts):
+    """verify_bundle.py reads an FP8 embedding site (no activation rule) and does not count its code / exponent
+    buffers as Linear sites."""
+    from test_tile_flow_defects import _script
+
+    _capture(tmp_path, opts, fresh_process=True)          # verify_bundle reads the fresh-process record
+    res = _script("verify_bundle").run(tmp_path / "export", tmp_path / "fx", tmp_path / "verify_bundle.json")
+    check = res["checks"]["graph_weight_buffers_uint8_int32"]
+    assert check["ok"], check
+    assert check["detail"]["quantized_storage_buffers"] == ["model.model.embed_tokens.weight_codes",
+                                                            "model.model.embed_tokens.weight_scale_exp"]
 
 
 def test_tied_fp8_embedding_with_per_tensor_head_exponent():
