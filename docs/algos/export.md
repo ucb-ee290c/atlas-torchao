@@ -165,9 +165,12 @@ of 320 and up: MXU0 rounds the BF16 partial K times, MXU1 K / 32 times. So the d
 `allowed_mxu`. The export measured safe on TinyLlama and SmolVLA keeps Linear and Conv2d on MXU1 and lets attention
 use both units:
 
-    --allowed-mxu mxu1,mxu0 --site-allowed-mxu kind:linear=mxu1 --site-allowed-mxu kind:conv2d=mxu1
+    --allowed-mxu mxu1,mxu0 --site-allowed-mxu kind:linear=mxu1                                     # no quantized Conv2d
+    --allowed-mxu mxu1,mxu0 --site-allowed-mxu kind:linear=mxu1 --site-allowed-mxu kind:conv2d=mxu1   # e.g. SmolVLA
 
-Attention is 4.5% of TinyLlama's MACs (512-token windows) and 14% of SmolVLA's.
+That holds for the lengths measured: p.v with up to 512 keys (TinyLlama) and about 1024 (SmolVLA). MXU0's error
+grows with K for attention too, so longer contexts need their own check. Attention is 0.045 of TinyLlama's MACs
+(512-token windows) and 0.14 of SmolVLA's. DiT's attention was not measured on its own.
 
 ### `manifest.json` (`atlas_torchao.export_manifest.v1`, NEW)
 
