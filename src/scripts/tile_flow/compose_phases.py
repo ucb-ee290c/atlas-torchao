@@ -199,8 +199,7 @@ def compose_causal(a):
     lm, kv_spec, loop = manifest["causal_lm"], manifest["kv_cache"], manifest["loop"]
     n_steps = a.decode_steps if a.decode_steps is not None else loop["decode_steps"]
     prompts = load_file(str(pb / "host_cases.safetensors"))["prompts"]
-    if a.prompts is not None:
-        prompts = prompts[:a.prompts]
+    indices = list(range(prompts.shape[0]))[:a.prompts] if a.prompt_indices is None else a.prompt_indices
     # seqlen: the context the loop needs (build_causal_lm adds linear RoPE scaling only beyond the model's own context)
     model, _, _ = load_quantized.load_quantized(lm["id"], pb / "export", "cpu", mode="ref_conv", seqlen=kv_spec["capacity"])
     geometry = fx_export.causal_geometry(model, kv_spec["capacity"], manifest["graphs"]["prefill"]["prefill_length"])
@@ -226,6 +225,7 @@ def compose_causal(a):
         if embed is not None:
             res["host_embeddings_equal_embed_tokens"] = _bytes_equal(embed(prompts), model.model.embed_tokens(prompts))
             res["ok"] &= res["host_embeddings_equal_embed_tokens"]
+        res["prompt_indices"] = indices
         # (1) recorded fixtures, replayed in this process, from rebuilt host inputs
         for name, b, program in (("prefill", pb, prefill), ("decode_step", sb, step)):
             fixtures = load_file(str(b / "fx" / "fixtures.safetensors"))
@@ -249,7 +249,7 @@ def compose_causal(a):
                 res["fixtures"].append(row)
                 res["ok"] &= all(v for k, v in row.items() if isinstance(v, bool))
         # (2) host loop over the saved graphs vs generate, per prompt
-        for i in range(prompts.shape[0]):
+        for i in indices:
             prompt = prompts[i:i + 1]
             key = hashlib.sha256(prompt.numpy().tobytes()).hexdigest()[:16] + f"_{n_steps}"
             t0 = time.time()
@@ -273,7 +273,7 @@ def compose_causal(a):
                    "tokens": tokens[0].tolist(),
                    "kv_matches_manifest": len(cache) == kv_spec["tensors"] and all(
                        list(t.shape) == kv_spec["per_tensor_shape"] and t.dtype == torch.bfloat16 for t in cache)}
-            if i == 0:          # (3) purity of the step on the last cache state of this loop
+            if i == indices[0]:          # (3) purity of the step on the last cache state of this loop
                 args = fx_export.causal_step_inputs(tokens[:, -1:], geometry.prefill_length + tokens.shape[1] - 1,
                                                     geometry.capacity, rope, cache, embed)
                 before = [tensor_record(t) for t in args]
@@ -305,6 +305,7 @@ def main(argv=None):
     ap.add_argument("--tokenizer-path", default="/scratch2/lorenhung/models/big_vision/paligemma_tokenizer.model")
     ap.add_argument("--decode-steps", type=int, default=None, help="causal_lm: decode steps (default: the manifest's)")
     ap.add_argument("--prompts", type=int, default=None, help="causal_lm: only the first N prompts of host_cases")
+    ap.add_argument("--prompt-indices", type=int, nargs="+", default=None, help="causal_lm: only these prompts of host_cases")
     ap.add_argument("--reference-cache", help="causal_lm: safetensors file caching generate's tokens / logits per prompt")
     a = ap.parse_args(argv)
     if a.model == "pi0":
