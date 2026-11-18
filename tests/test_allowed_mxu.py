@@ -140,3 +140,23 @@ def test_fields_survive_the_fx_policy_copy(tmp_path):
     fx = pack_plan.with_plan(pol)
     assert fx["accumulate"] == pol["accumulate"]
     assert fx["sites"][site]["allowed_mxu"] == ["mxu1"]
+
+
+def test_kind_override(tmp_path):
+    """kind:linear narrows every quantized Linear; an exact site entry wins over its kind."""
+    site = "model.layers.0.mlp.down_proj"
+    _, _, pol = _export(tmp_path, "kind", allowed_mxu=["mxu1", "mxu0"],
+                        site_allowed_mxu={site: ["mxu1", "mxu0"], "kind:linear": ["mxu1"]})
+    for n, s in pol["sites"].items():
+        if s["status"] != "quantized":
+            assert "allowed_mxu" not in s
+        elif n == site:
+            assert s["allowed_mxu"] == ["mxu1", "mxu0"]
+        elif s["kind"] == "linear":
+            assert s["allowed_mxu"] == ["mxu1"]
+        else:                                   # attention: the global list applies
+            assert "allowed_mxu" not in s
+    with pytest.raises(ValueError, match="unknown site kind"):
+        _export(tmp_path, "badkind", allowed_mxu=["mxu1", "mxu0"], site_allowed_mxu={"kind:matmul": ["mxu1"]})
+    with pytest.raises(ValueError, match="no quantized conv2d"):
+        _export(tmp_path, "noconv", allowed_mxu=["mxu1", "mxu0"], site_allowed_mxu={"kind:conv2d": ["mxu1"]})

@@ -157,8 +157,9 @@ def add_args(ap) -> None:
                         "with the K order and each unit's rounding. Default: not written (policy.json unchanged, "
                         "mxu1 assumed). Quality of each unit: docs/algos/export.md#allowed-mxu-units")
     g.add_argument("--site-allowed-mxu", action="append", default=None, metavar="SITE=UNIT[,UNIT]",
-                   help="with --allowed-mxu: narrow the list for one quantized site (exact fqn), e.g. "
-                        "model.layers.0.mlp.down_proj=mxu1; repeatable")
+                   help="with --allowed-mxu: narrow the list for one quantized site (exact fqn, e.g. "
+                        "model.layers.0.mlp.down_proj=mxu1) or for every quantized site of a kind (kind:linear, "
+                        "kind:conv2d, kind:attention; an exact site wins over its kind); repeatable")
     g.add_argument("--pack-fold", action="store_true",
                    help="after the export, fold the static activation pack exponents into the compiler's admitted E8M0 range "
                         "122..128 where the producer already multiplies by a constant (RMSNorm gamma, up_proj weight exponent, "
@@ -481,23 +482,41 @@ def allowed_mxu_block(units: list) -> dict:
             "units": {u: dict(MXU_UNITS[u]) for u in units}}
 
 
+SITE_KINDS = ("linear", "conv2d", "attention")
+
+
 def apply_allowed_mxu(policy: dict, units, site_units=None) -> dict:
-    """Add the allowed-MXU fields to `policy` in place; nothing changes when `units` is None."""
+    """Add the allowed-MXU fields to `policy` in place; nothing changes when `units` is None.
+
+    site_units keys are exact quantized site names, or `kind:linear|conv2d|attention` for every quantized
+    site of that kind; an exact name wins over its kind."""
     if units is None:
         if site_units:
             raise ValueError("--site-allowed-mxu needs --allowed-mxu")
         return policy
     units = parse_allowed_mxu(units)
     policy["accumulate"].update(allowed_mxu_block(units))
-    for site, su in (site_units or {}).items():
-        s = policy["sites"].get(site)
-        if s is None or s.get("status") != "quantized":
-            raise ValueError(f"--site-allowed-mxu: {site!r} is not a quantized site of this export")
+    quantized = {n: s for n, s in policy["sites"].items() if s.get("status") == "quantized"}
+    resolved = {}
+    for key, su in sorted((site_units or {}).items(), key=lambda kv: not kv[0].startswith("kind:")):
         su = parse_allowed_mxu(su)
         extra = [u for u in su if u not in units]
         if extra:
-            raise ValueError(f"--site-allowed-mxu: {site}: {extra} not in --allowed-mxu {units}")
-        s["allowed_mxu"] = su
+            raise ValueError(f"--site-allowed-mxu: {key}: {extra} not in --allowed-mxu {units}")
+        if key.startswith("kind:"):
+            kind = key[len("kind:"):]
+            if kind not in SITE_KINDS:
+                raise ValueError(f"--site-allowed-mxu: unknown site kind {kind!r}; choose from {SITE_KINDS}")
+            names = [n for n, s in quantized.items() if s.get("kind") == kind]
+            if not names:
+                raise ValueError(f"--site-allowed-mxu: this export has no quantized {kind} site")
+            resolved.update(dict.fromkeys(names, su))
+        elif key in quantized:
+            resolved[key] = su
+        else:
+            raise ValueError(f"--site-allowed-mxu: {key!r} is not a quantized site of this export")
+    for n, su in resolved.items():
+        quantized[n]["allowed_mxu"] = su
     return policy
 
 
