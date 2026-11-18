@@ -12,7 +12,9 @@ Two functional models, both bit-exact ports of the reference sources at pi0-quan
                            (npu_model/configs/rtl_math.py ipt_row) and its independent reference
                            (rotary-host/reference/atlas_ref/arithmetic.py _inner_chunk). Same as
                            "numba" except a tile total with fewer than 8 significant bits, see
-                           _aligned_to_bf16_once.
+                           _aligned_to_bf16_once. npu-model 19caa5c ("fix(rtl_math): normalize IPT
+                           sums that cancel below eight bits", from silicon / RTL vectors) moved
+                           npu-model to the "numba" behaviour; "model47" reproduces the old pin.
 
 Call contract (src/mxu/accum_backends.py; pi0_inout/functional_models.py:7-12):
 

@@ -12,13 +12,14 @@ norms, softmax, adds, RoPE, casts, ...) exactly as captured. Outputs:
     <out>/fixtures_hw.json                 unit semantics, replaced and remaining ops, differing words, sha256
 
 Contraction semantics: those of the Atlas backend's independent reference (rotary-host/reference/atlas_ref,
-contractions.py `contraction_nt` / `qlinear`, arithmetic.py `matmul_codes` / `readout_bf16`), bit for bit:
+contractions.py `contraction_nt` / `qlinear`, arithmetic.py `matmul_codes` / `readout_bf16`), bit for bit,
+except one MXU1 case (below):
 
     acc  = matmul_codes(A codes, B codes)        raw BF16 accumulator over the E4M3 code values, K ascending in
                                                  32-wide instructions, each continuing from the previous BF16
                                                  partial, a short last instruction zero-padded:
                                                    mxu1  one exact anchor-tree sum per 32 lanes, rounded to BF16
-                                                         (accum_torch.ipt_linear_bits, variant "model47")
+                                                         (accum_torch.ipt_linear_bits, variant "numba")
                                                    mxu0  one E4M3ProdAddBF16 per MAC, rounded every step
                                                          (accum_torch.sa_linear_bits)
     out  = BF16_RNE(acc * BF16(2^(ex_row + ew_col)))   readout: the power-of-two exponents, after accumulation
@@ -27,12 +28,21 @@ contractions.py `contraction_nt` / `qlinear`, arithmetic.py `matmul_codes` / `re
 then widened to the node's logical dtype (BF16 qlinear; float32 for qk/pv and float32-out qlinear). The torch
 bodies apply the exponents before the contraction and add the bias with RNE; neither difference survives here.
 
+MXU1 short totals: a 32-lane total that cancels to fewer than 8 significant bits is normalized (variant "numba",
+as npu-model 19caa5c "fix(rtl_math): normalize IPT sums that cancel below eight bits", from silicon / RTL
+vectors). atlas_ref and npu-model at its pin 47b8599 leave it unnormalized (variant "model47",
+--ipt-variant model47 reproduces them). The cross-check classifies every MXU1 mismatch against atlas_ref: it is
+"explained" when the model47 variant on the same operands reproduces atlas_ref's word.
+
 Every replay first runs the graph unchanged (the torch bodies) and requires byte-identical outputs to
 fixtures.safetensors, so the harness itself is checked on every case. Graph nodes run with one torch thread
 (the capture setting); the integer accumulation uses --threads (integer sums are order independent).
 
+--units runs a subset of units; results already in <out>/fixtures_hw.json for the other units are kept, each
+unit's entry recording the generator commit that produced it.
+
 --crosscheck ATLAS_REF_ROOT (the directory holding atlas_ref/) re-computes contraction outputs with atlas_ref's
-own NumPy engine from the operands captured at each call and requires equal words: a random row x column x
+own NumPy engine from the operands captured at each call and compares words: a random row x column x
 batch subset of every call, plus all columns of a row block for a stratified sample of calls (first and last
 call of each op kind, the first float32-out qlinear and the first call with K % 32 != 0).
 
@@ -67,7 +77,8 @@ import mxu.accum_torch as accum  # noqa: E402
 SCHEMA = "atlas_torchao.fixtures_hw.v1"
 UNITS = ("mxu1", "mxu0")
 K_TILE = 32
-IPT_VARIANT = "model47"
+IPT_VARIANT = "numba"
+IPT_VARIANTS = ("numba", "model47")
 QLINEAR = torch.ops.atlas.qlinear.default
 QCONV2D = torch.ops.atlas.qconv2d.default
 QK = torch.ops.atlas.qk_matmul.default
@@ -82,11 +93,12 @@ UNIT_SEMANTICS = {
                     "aligned to one anchor (max exponent + 7 headroom) as 32-bit integers, summed exactly, and "
                     "rounded once to BF16 (RNE); the BF16 result is the partial carried into the next "
                     "instruction",
-        "implementation": "accum_torch.ipt_linear_bits(variant='model47', vec_len=32, b=None, scale_exp=0)",
-        "model47_note": "a tile total with fewer than 8 significant bits keeps its low 7 bits as the mantissa "
-                        "field without left normalization, as npu-model 47b8599 rtl_math.py ipt_row and "
-                        "atlas_ref arithmetic.py _inner_chunk do; accum_torch's 'numba' variant (the reference "
-                        "author's IPT model) normalizes it",
+        "implementation": "accum_torch.ipt_linear_bits(variant=<ipt_variant>, vec_len=32, b=None, scale_exp=0)",
+        "short_total_note": "variant 'numba' (default): a tile total with fewer than 8 significant bits is "
+                            "normalized, as npu-model 19caa5c ('fix(rtl_math): normalize IPT sums that cancel "
+                            "below eight bits', silicon / RTL vectors) does. Variant 'model47': left "
+                            "unnormalized, as npu-model 47b8599 rtl_math.py ipt_row and atlas_ref arithmetic.py "
+                            "_inner_chunk (pinned to 47b8599) do. The two differ only in that case.",
     },
     "mxu0": {
         "name": "MXU0, systolic array",
@@ -286,14 +298,24 @@ class CrossCheck:
         want = res.output_bf16.astype(np.int64)
         got = OUT[bi_t][:, ri_t][:, :, ci_t].numpy().astype(np.int64) & 0xFFFF
         mism = int((want != got).sum())
+        explained = 0
+        if mism and self.unit == "mxu1":
+            # atlas_ref is pinned to npu-model 47b8599: does its short-total rule account for every mismatch?
+            alt = contraction_nt(torch.from_numpy(a_s), torch.from_numpy(ax_s), torch.from_numpy(b_s),
+                                 torch.from_numpy(bx_s), "mxu1",
+                                 None if bias is None else bias[torch.from_numpy(ci)], False,
+                                 "model47").numpy().astype(np.int64)
+            bad = want != got
+            explained = int((alt[bad] == want[bad]).sum())
         row = {"node": node.name, "op": CONTRACTIONS[node.target], "call": call_index,
                "mode": "row_block_all_columns" if full_sample else "random_subset",
                "batch_shape": list(batch), "M": M, "N": N, "K": K,
                "batches_checked": len(bi), "rows_checked": len(ri), "cols_checked": len(ci),
                "words": int(want.size), "mismatched_words": mism,
+               "mismatches_explained_by_47b8599_short_total": explained,
                "seconds": round(time.time() - t, 3)}
         self.rows.append(row)
-        if mism:
+        if mism != explained:
             print(json.dumps({"crosscheck_mismatch": row}), flush=True)
         return row
 
@@ -306,11 +328,11 @@ class Replay(torch.fx.Interpreter):
     """Runs the saved graph; contraction nodes use the hardware accumulation when unit is set."""
 
     def __init__(self, gm, unit=None, threads=1, compile=True, crosscheck=None, sample=(),
-                 numba_compare=False):
+                 variant_compare=False, ipt_variant=IPT_VARIANT):
         super().__init__(gm)
         self.unit, self.threads, self.compile = unit, threads, compile
         self.crosscheck, self.sample = crosscheck, set(sample)
-        self.numba_compare = numba_compare
+        self.variant_compare, self.ipt_variant = variant_compare, ipt_variant
         self.calls = Counter()
         self.other = Counter()
         self.call_index = 0
@@ -326,9 +348,11 @@ class Replay(torch.fx.Interpreter):
                 t = time.time()
                 torch.set_num_threads(self.threads)
                 try:
-                    value, operands, bits = hw_node(n.target, args, kwargs, self.unit, self.compile)
-                    if self.numba_compare and self.unit == "mxu1":
-                        _, _, nb = hw_node(n.target, args, kwargs, self.unit, self.compile, "numba")
+                    value, operands, bits = hw_node(n.target, args, kwargs, self.unit, self.compile,
+                                                    self.ipt_variant)
+                    if self.variant_compare and self.unit == "mxu1":
+                        other = next(v for v in IPT_VARIANTS if v != self.ipt_variant)
+                        _, _, nb = hw_node(n.target, args, kwargs, self.unit, self.compile, other)
                         d = int((nb != bits).sum())
                         if d:
                             self.numba_diff_words += d
@@ -398,8 +422,10 @@ def main(argv=None):
     ap.add_argument("--no-compile", action="store_true", help="eager accum_torch (slow; same words)")
     ap.add_argument("--crosscheck", default=None, help="directory holding atlas_ref/ (NumPy engine)")
     ap.add_argument("--crosscheck-budget", type=int, default=1 << 27, help="MACs per row-block check")
-    ap.add_argument("--numba-compare", action="store_true",
-                    help="also run accum_torch's 'numba' IPT variant on each MXU1 call and count words that differ")
+    ap.add_argument("--ipt-variant", default=IPT_VARIANT, choices=IPT_VARIANTS,
+                    help="MXU1 short-total rule: numba (npu-model 19caa5c, default) or model47 (atlas_ref's pin)")
+    ap.add_argument("--variant-compare", action="store_true",
+                    help="also run the other IPT variant on each MXU1 call (same operands) and count differing words")
     ap.add_argument("--skip-baseline", action="store_true", help="skip the unchanged-graph replay check")
     args = ap.parse_args(argv)
 
@@ -453,7 +479,10 @@ def main(argv=None):
         "units": {u: UNIT_SEMANTICS[u] for u in args.units},
         "contraction_epilogue": EPILOGUE,
         "reference_semantics": "Atlas backend independent reference atlas_ref (contractions.py contraction_nt / "
-                               "qlinear, arithmetic.py matmul_codes / readout_bf16 / _add_bf16), bit for bit",
+                               "qlinear, arithmetic.py matmul_codes / readout_bf16 / _add_bf16), bit for bit, "
+                               "except MXU1 tile totals that cancel below 8 significant bits: normalized here "
+                               "(npu-model 19caa5c, silicon / RTL), unnormalized in atlas_ref (pinned to "
+                               "npu-model 47b8599); see units.mxu1.short_total_note",
         "scope": "exact for the FP8 contractions only. Every other node (quantize_act, RMSNorm, softmax, residual "
                  "and other adds, RoPE, SiLU/GELU, masks, casts, host-side ops) is the unchanged torch graph "
                  "arithmetic, so these fixtures are not the Atlas whole-program output; the compiler's exact "
@@ -468,7 +497,7 @@ def main(argv=None):
             "accum_torch": {"path": "src/mxu/accum_torch.py",
                             "sha256": _sha256(SRC / "mxu" / "accum_torch.py"),
                             "last_commit": _git("log", "-1", "--format=%H", "--", "src/mxu/accum_torch.py"),
-                            "ipt_variant": IPT_VARIANT, "compiled": not args.no_compile},
+                            "ipt_variant": args.ipt_variant, "compiled": not args.no_compile},
             "atlas_fx_ops": {"path": "src/exporter/atlas_fx_ops.py",
                              "sha256": _sha256(SRC / "exporter" / "atlas_fx_ops.py")},
             "torch": torch.__version__,
@@ -486,9 +515,9 @@ def main(argv=None):
         "files": {},
     }
 
-    def run_case(case, unit, crosscheck=None, numba_compare=False):
+    def run_case(case, unit, crosscheck=None, variant_compare=False):
         interp = Replay(gm, unit, args.threads, not args.no_compile, crosscheck, sample if case == 0 else (),
-                        numba_compare)
+                        variant_compare, args.ipt_variant)
         inputs = [fixtures[k] for k in case_rec(case)["inputs"]]
         t = time.time()
         with torch.no_grad():
@@ -530,7 +559,7 @@ def main(argv=None):
         cc = CrossCheck(args.crosscheck, unit, args.crosscheck_budget) if args.crosscheck else None
         numba_words, numba_calls = 0, []
         for case in range(len(parity["cases"])):
-            interp, outs, secs = run_case(case, unit, cc, args.numba_compare)
+            interp, outs, secs = run_case(case, unit, cc, args.variant_compare)
             if record["replaced_ops"] is None:
                 record["replaced_ops"] = {"targets": sorted(CONTRACTIONS.values()),
                                           "calls_per_case": dict(sorted(interp.calls.items())),
@@ -557,10 +586,12 @@ def main(argv=None):
         tot = sum(r["differing"] for r in res["differing_words"].values())
         words = sum(r["words"] for r in res["differing_words"].values())
         res["differing_words_total"] = {"differing": tot, "words": words, "fraction": round(tot / max(1, words), 6)}
-        if args.numba_compare and unit == "mxu1":
-            res["mxu1_model47_vs_numba"] = {
-                "note": "words of MXU1 contraction outputs (same operands) that change if the short-total "
-                        "conversion is normalized as in accum_torch's 'numba' variant",
+        if args.variant_compare and unit == "mxu1":
+            other = next(v for v in IPT_VARIANTS if v != args.ipt_variant)
+            res["mxu1_short_total_sensitivity"] = {
+                "note": f"words of MXU1 contraction outputs that change if variant {other!r} replaces "
+                        f"{args.ipt_variant!r} on the same operands (tile totals that cancel below 8 bits)",
+                "variant": args.ipt_variant, "other_variant": other,
                 "differing_words": numba_words, "calls": numba_calls}
         if cc is not None:
             res["crosscheck"] = {"reference": "atlas_ref.contractions.contraction_nt, NumPy engine",
@@ -572,6 +603,12 @@ def main(argv=None):
                                  "calls_row_block_all_columns": sum(r["mode"] != "random_subset" for r in cc.rows),
                                  "words": sum(r["words"] for r in cc.rows),
                                  "mismatched_words": sum(r["mismatched_words"] for r in cc.rows),
+                                 "mismatches_explained_by_47b8599_short_total":
+                                     sum(r["mismatches_explained_by_47b8599_short_total"] for r in cc.rows),
+                                 "mismatches_unexplained": sum(r["mismatched_words"]
+                                                               - r["mismatches_explained_by_47b8599_short_total"]
+                                                               for r in cc.rows),
+                                 "mismatched_calls": [r for r in cc.rows if r["mismatched_words"]],
                                  "row_block_calls": [r for r in cc.rows if r["mode"] != "random_subset"]}
             print(json.dumps({"unit": unit, "crosscheck": {k: v for k, v in res["crosscheck"].items()
                                                            if k != "row_block_calls"}}), flush=True)
@@ -579,6 +616,7 @@ def main(argv=None):
         meta = dict(src_meta)
         meta["atlas_fixtures_hw"] = json.dumps(
             {"contractions": "Atlas hardware accumulation", "mxu_unit": unit, "k_order": "ascending",
+             "mxu1_short_total": (args.ipt_variant if unit == "mxu1" else None),
              "k_instruction_width": K_TILE, "short_k_instruction": "zero-padded",
              "other_ops": "unchanged torch graph arithmetic", "details": "fixtures_hw.json"},
             sort_keys=True, separators=(",", ":"))
@@ -588,7 +626,23 @@ def main(argv=None):
         tmp = path.with_suffix(".tmp")
         save_file({k: new[k] for k in fixtures}, str(tmp), metadata=meta)
         os.replace(tmp, path)
+        res["generator"] = record["generator"]
+        res["ipt_variant"] = args.ipt_variant if unit == "mxu1" else None
         record["results"][unit] = res
+    prev_path = out / "fixtures_hw.json"
+    if prev_path.is_file():
+        prev = json.loads(prev_path.read_text())
+        if prev["source_files"]["fixtures.safetensors"]["sha256"] != record["source_files"]["fixtures.safetensors"]["sha256"]:
+            raise SystemExit("existing fixtures_hw.json belongs to other source fixtures")
+        for u, r in prev.get("results", {}).items():
+            if u not in record["results"]:
+                r.setdefault("generator", prev["generator"])
+                record["results"][u] = r
+                record["units"][u] = prev["units"][u]
+        if record["baseline_replay"] is None:
+            record["baseline_replay"] = prev.get("baseline_replay")
+    record["units"] = {u: record["units"][u] for u in UNITS if u in record["units"]}
+    record["results"] = {u: record["results"][u] for u in UNITS if u in record["results"]}
     record["files"] = {p.name: {"sha256": _sha256(p), "bytes": p.stat().st_size}
                        for p in sorted(out.glob("fixtures_hw_*.safetensors"))}
     (out / "fixtures_hw.json").write_text(json.dumps(record, indent=2) + "\n")

@@ -1,5 +1,9 @@
 """src/scripts/tile_flow/hw_fixtures.py contractions against the Atlas backend's atlas_ref, bit for bit.
 
+atlas_ref is pinned to npu-model 47b8599, whose MXU1 leaves a tile total under 8 significant bits unnormalized;
+hw_fixtures' default MXU1 normalizes it (npu-model 19caa5c, silicon / RTL), so the bit-for-bit comparison uses
+variant "model47" and the short-total case checks both.
+
 atlas_ref (rotary-host/reference/atlas_ref) lives outside this repo: set ATLAS_REF_ROOT to the directory that
 holds atlas_ref/ (the tests skip otherwise). The model47 edge case below needs no reference tree.
 """
@@ -69,7 +73,7 @@ def test_contraction_matches_atlas_ref(unit, compile):
                 bias_np = bias.view(torch.int16).numpy().view(np.uint16) if use_bias else None
                 want = ref.contraction_nt(a, ax, b, bx, unit=unit, bias_bf16=bias_np).output_bf16
                 got = hw.contraction_nt(torch.from_numpy(a), torch.from_numpy(ax), torch.from_numpy(b),
-                                        torch.from_numpy(bx), unit, bias if use_bias else None, compile)
+                                        torch.from_numpy(bx), unit, bias if use_bias else None, compile, "model47")
                 np.testing.assert_array_equal(got.numpy().astype(np.uint16), want)
                 checked += want.size
     # short tile totals (fewer than 8 significant bits), in the first tile and carried into a second one
@@ -81,10 +85,16 @@ def test_contraction_matches_atlas_ref(unit, compile):
     for k in (3, 40):
         want = ref.contraction_nt(a[:, :k], np.zeros((3, 1), np.int64), b[:, :k], np.zeros((2, 1), np.int64),
                                   unit=unit).output_bf16
-        got = hw.contraction_nt(torch.from_numpy(a[:, :k].copy()), torch.zeros(3, 1, dtype=torch.int64),
-                                torch.from_numpy(b[:, :k].copy()), torch.zeros(2, 1, dtype=torch.int64),
-                                unit, None, compile)
-        np.testing.assert_array_equal(got.numpy().astype(np.uint16), want)
+        args = (torch.from_numpy(a[:, :k].copy()), torch.zeros(3, 1, dtype=torch.int64),
+                torch.from_numpy(b[:, :k].copy()), torch.zeros(2, 1, dtype=torch.int64), unit, None, compile)
+        np.testing.assert_array_equal(hw.contraction_nt(*args, "model47").numpy().astype(np.uint16), want)
+        # default: short totals normalized (npu-model 19caa5c); atlas_ref (pin 47b8599) differs only there
+        got = hw.contraction_nt(*args).numpy().astype(np.uint16)
+        if unit == "mxu1":
+            if k == 3:
+                assert int(got[0, 0]) == 0x3D80 and int(want[0, 0]) == 0x3DC0
+        else:
+            np.testing.assert_array_equal(got, want)
     # batched, broadcast lead dims, per-head exponents (the attention operands)
     a = _codes(rng, (2, 4, 7, 40), True)
     b = _codes(rng, (2, 1, 5, 40), True)
@@ -92,6 +102,6 @@ def test_contraction_matches_atlas_ref(unit, compile):
     bx = rng.integers(-10, 0, size=(2, 1, 1, 1)).astype(np.int64)
     want = ref.contraction_nt(a, ax, b, bx, unit=unit).output_bf16
     got = hw.contraction_nt(torch.from_numpy(a), torch.from_numpy(ax), torch.from_numpy(b),
-                            torch.from_numpy(bx), unit, None, compile)
+                            torch.from_numpy(bx), unit, None, compile, "model47")
     np.testing.assert_array_equal(got.numpy().astype(np.uint16), want)
     assert checked > 0
