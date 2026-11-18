@@ -32,6 +32,9 @@ import exporter.pack_plan as pack_plan
 CONTRACT = ("aten.linear", "aten.matmul", "aten.mm", "aten.bmm", "aten.addmm", "aten.baddbmm", "aten.einsum",
             "aten.conv", "aten._convolution", "aten.dot", "aten.mv", "aten.scaled_dot_product", "aten._scaled_dot")
 WEIGHTED = ("aten.linear", "aten.conv", "aten._convolution")          # args[1] is a weight parameter
+# quantized-storage sites (exporter.head_embed: --embedding fp8 / nvfp4, --lm-head nvfp4): codes decoded by table gathers,
+# no activation rule; fx_export checks them (graph_inspection.json quantized_storage_sites)
+STORAGE_KINDS = ("embedding", "nvfp4_linear")
 # explicit allow-list of plain (non-atlas) contractions accepted when no policy site covers them
 ALLOWED_PLAIN_OPS = {"aten.scaled_dot_product_attention": "plain BF16 scaled_dot_product_attention in a block "
                                                           "without a policy attention site (unquantized attention)"}
@@ -350,7 +353,7 @@ def run(export, fx, out, allow_fallback=False, allow_unquantized_attention=True,
     def _unused_fallback(names):
         return {n for n in names if n in unused_derived and unused_agree}
     for n, s in policy["sites"].items():
-        if s.get("status") != "quantized":
+        if s.get("status") != "quantized" or s["kind"] in STORAGE_KINDS:
             continue
         if s["kind"] == "attention":
             for op, r in s["operands"].items():
