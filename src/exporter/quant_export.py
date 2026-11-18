@@ -151,6 +151,14 @@ def add_args(ap) -> None:
                    help="declare in policy.json that Linear / Conv2d sites of a static recipe without "
                         "calibration data (e.g. an unused lm_head) may keep the dynamic per-tensor rule; "
                         "undeclared sites make verify_bundle.py fail 'static recipe is fully static'")
+    g.add_argument("--allowed-mxu", default=None, metavar="UNIT[,UNIT]",
+                   help="NEW, opt-in: write accumulate.allowed_mxu into policy.json, the MXU units the compiler may run "
+                        "the FP8 contractions on (mxu1 = inner-product tree, mxu0 = systolic array; order = preference), "
+                        "with the K order and each unit's rounding. Default: not written (policy.json unchanged, "
+                        "mxu1 assumed). Quality of each unit: docs/algos/export.md#allowed-mxu-units")
+    g.add_argument("--site-allowed-mxu", action="append", default=None, metavar="SITE=UNIT[,UNIT]",
+                   help="with --allowed-mxu: narrow the list for one quantized site (exact fqn), e.g. "
+                        "model.layers.0.mlp.down_proj=mxu1; repeatable")
     g.add_argument("--pack-fold", action="store_true",
                    help="after the export, fold the static activation pack exponents into the compiler's admitted E8M0 range "
                         "122..128 where the producer already multiplies by a constant (RMSNorm gamma, up_proj weight exponent, "
@@ -170,7 +178,19 @@ def check_args(ap, args) -> str | None:
         ap.error("--export-only needs --export-dir")
     if getattr(args, "from_export", None) and getattr(args, "export_dir", None):
         ap.error("--from-export and --export-dir exclude each other")
+    try:
+        kw = allowed_mxu_kwargs(args)
+    except ValueError as e:
+        ap.error(str(e))
+    units, site_units = kw["allowed_mxu"], kw["site_allowed_mxu"]
+    if site_units and units is None:
+        ap.error("--site-allowed-mxu needs --allowed-mxu")
+    for site, su in site_units.items():
+        if units is not None and not set(su) <= set(units):
+            ap.error(f"--site-allowed-mxu {site}: {su} is not a subset of --allowed-mxu {units}")
     if not getattr(args, "export_dir", None):
+        if units is not None:
+            ap.error("--allowed-mxu needs --export-dir")
         return None
     mode = pick_mode(args.modes)
     if mode is None:
@@ -380,9 +400,115 @@ def _accumulation(ladder):
             "readout": "bf16"}
 
 
+# ---------------------------------------------------------------------------------------------
+# Allowed MXU units (NEW, opt-in: --allowed-mxu; docs/algos/export.md#allowed-mxu-units)
+# ---------------------------------------------------------------------------------------------
+
+# The backend's unit names, with the accumulation model of each (src/mxu/accum_torch.py; `mxu_model`
+# is the --mxu name) and its rounding. Both units take the same E4M3 codes and return a raw BF16
+# accumulator word; they differ only in where they round.
+MXU_UNITS = {
+    "mxu0": {"mxu_model": "sa",
+             "structure": "systolic array",
+             "rounding": "rounds to BF16 after every MAC: each E4M3 x E4M3 product (exact, E5M7) is added "
+                         "to the BF16 partial with one RNE rounding (E4M3ProdAddBF16), so the result "
+                         "depends on the order of every k",
+             "port": "src/mxu/accum_torch.py sa_linear"},
+    "mxu1": {"mxu_model": "ipt",
+             "structure": "inner-product tree",
+             "rounding": "exact sum of a K tile's 32 products and the incoming BF16 partial in a 32-bit "
+                         "aligned integer, then one RNE rounding to BF16 per tile; the result depends on "
+                         "how K is cut into tiles, not on the order inside a tile",
+             "port": "src/mxu/accum_torch.py ipt_linear (ipt_numba)"},
+}
+K_ORDER = {
+    "order": "ascending",
+    "tile": 32,
+    "description": "K is consumed in ascending index of the stored operand layout (the column order of "
+                   "<fqn>.weight_codes, after any export-time permutation such as k_order; attention "
+                   "q.k^T: head_dim; p.v: key position; conv2d: the im2col column). K is cut into "
+                   "instructions of 32 consecutive k; the first starts from +0 and each later one "
+                   "continues from the previous instruction's BF16 partial; a short final instruction "
+                   "is zero-padded (a zero product leaves the partial unchanged on both units)",
+}
+
+
+def parse_allowed_mxu(spec) -> list | None:
+    """'mxu1,mxu0' -> ['mxu1', 'mxu0']; None -> None. Raises ValueError on an empty list or an
+    unknown or repeated unit."""
+    if spec is None:
+        return None
+    units = [u.strip() for u in (spec if isinstance(spec, (list, tuple)) else str(spec).split(","))]
+    units = [u for u in units if u]
+    if not units:
+        raise ValueError("allowed MXU list is empty; give at least one of mxu1, mxu0")
+    bad = [u for u in units if u not in MXU_UNITS]
+    if bad:
+        raise ValueError(f"unknown MXU unit(s) {bad}; choose from {sorted(MXU_UNITS)}")
+    if len(set(units)) != len(units):
+        raise ValueError(f"MXU unit listed twice in {units}")
+    return units
+
+
+def parse_site_allowed_mxu(items) -> dict:
+    """['SITE=mxu1', 'SITE2=mxu1,mxu0'] -> {SITE: ['mxu1'], SITE2: ['mxu1', 'mxu0']}."""
+    out = {}
+    for it in items or ():
+        site, sep, units = str(it).partition("=")
+        if not sep or not site:
+            raise ValueError(f"--site-allowed-mxu: expected SITE=UNIT[,UNIT], got {it!r}")
+        if site in out:
+            raise ValueError(f"--site-allowed-mxu: site {site!r} given twice")
+        out[site] = parse_allowed_mxu(units)
+    return out
+
+
+def allowed_mxu_kwargs(args) -> dict:
+    """export() keyword arguments from --allowed-mxu / --site-allowed-mxu (None and {} when absent)."""
+    return {"allowed_mxu": parse_allowed_mxu(getattr(args, "allowed_mxu", None)),
+            "site_allowed_mxu": parse_site_allowed_mxu(getattr(args, "site_allowed_mxu", None))}
+
+
+def allowed_mxu_block(units: list) -> dict:
+    """The keys --allowed-mxu adds to policy.json `accumulate`."""
+    return {"allowed_mxu": list(units),
+            "allowed_mxu_semantics": "the FP8 contractions of every quantized site (Linear, Conv2d im2col, "
+                                     "attention q.k^T and p.v) may run on any unit listed here; the order "
+                                     "is a preference, not a requirement. A site entry with its own "
+                                     "allowed_mxu narrows the list for that site. Without this field the "
+                                     "export assumes mxu1 only (assumed_on_chip)",
+            "k_order": dict(K_ORDER),
+            "units": {u: dict(MXU_UNITS[u]) for u in units}}
+
+
+def apply_allowed_mxu(policy: dict, units, site_units=None) -> dict:
+    """Add the allowed-MXU fields to `policy` in place; nothing changes when `units` is None."""
+    if units is None:
+        if site_units:
+            raise ValueError("--site-allowed-mxu needs --allowed-mxu")
+        return policy
+    units = parse_allowed_mxu(units)
+    policy["accumulate"].update(allowed_mxu_block(units))
+    for site, su in (site_units or {}).items():
+        s = policy["sites"].get(site)
+        if s is None or s.get("status") != "quantized":
+            raise ValueError(f"--site-allowed-mxu: {site!r} is not a quantized site of this export")
+        su = parse_allowed_mxu(su)
+        extra = [u for u in su if u not in units]
+        if extra:
+            raise ValueError(f"--site-allowed-mxu: {site}: {extra} not in --allowed-mxu {units}")
+        s["allowed_mxu"] = su
+    return policy
+
+
 def build_policy(model, mode, report, algo, options, skip, bf16_opt_out, opt_out_reasons,
-                 tensors_out: dict, allow_uncalibrated_fallback: bool = False) -> dict:
-    """The policy dict; fills `tensors_out` with the codes / exponent tensors it names."""
+                 tensors_out: dict, allow_uncalibrated_fallback: bool = False, *,
+                 allowed_mxu=None, site_allowed_mxu=None) -> dict:
+    """The policy dict; fills `tensors_out` with the codes / exponent tensors it names.
+
+    allowed_mxu (NEW, opt-in): the MXU units the compiler may run the contractions on, e.g.
+    ['mxu1', 'mxu0']; None (the default) writes the policy exactly as before. site_allowed_mxu:
+    {site: [units]} narrows the list for single quantized sites."""
     import quant_modes
 
     check_exportable(algo)
@@ -515,6 +641,7 @@ def build_policy(model, mode, report, algo, options, skip, bf16_opt_out, opt_out
         "compiler_pack_scale_admission": tile_native.pack_admission_report(static_act, weight_ranges),
         "pending_hardware_rulings": PENDING_RULINGS,
     }
+    apply_allowed_mxu(policy, allowed_mxu, site_allowed_mxu)
     # REPORTING ONLY (docs/algos/tile-aware.md#pack-plan): per static activation site the pack code, in-range flag, fold k and cost.
     # The producer class needs the FX graph (capture_fx fills it into fx/policy.json); here it is 'unknown' except attention p.
     pack_plan.attach(policy, pack_plan.build_plan(policy))
@@ -666,7 +793,7 @@ def _opt_out_reasons(algo, bf16) -> dict:
 def export(model: nn.Module, export_dir, *, mode: str, report: dict, algo, algo_spec: str, options=None,
            skip=(), model_record: dict | None = None, calib_batches=None, calib_record=None,
            device=None, extra_provenance: dict | None = None, normalization: dict | None = None,
-           allow_uncalibrated_fallback: bool = False) -> dict:
+           allow_uncalibrated_fallback: bool = False, allowed_mxu=None, site_allowed_mxu=None) -> dict:
     """Write model.safetensors, policy.json and manifest.json for `model`, quantized under `mode`
     by algos.quantize (whose return value is `report`). Returns the manifest.
 
@@ -677,7 +804,11 @@ def export(model: nn.Module, export_dir, *, mode: str, report: dict, algo, algo_
 
     allow_uncalibrated_fallback: declare (policy.json uncalibrated_fallback.declared) that Linear sites of a
     static recipe without calibration data may stay on the dynamic reference rule; without it the export is
-    still written but warns, and tools/verify_bundle.py fails the static check."""
+    still written but warns, and tools/verify_bundle.py fails the static check.
+
+    allowed_mxu / site_allowed_mxu (NEW, opt-in; --allowed-mxu, --site-allowed-mxu): the MXU units the
+    compiler may use (policy.json accumulate.allowed_mxu, sites[...].allowed_mxu); None leaves policy.json
+    byte-identical to an export without them."""
     from safetensors.torch import save_file
 
     import quant_modes
@@ -696,7 +827,8 @@ def export(model: nn.Module, export_dir, *, mode: str, report: dict, algo, algo_
         reasons[n] = exact_reasons.get(n, "algorithm exact BF16 opt-out (bf16_exact)")
     quant = {}
     policy = build_policy(model, mode, report, algo, options, list(skip or ()), bf16, reasons, quant,
-                          allow_uncalibrated_fallback=allow_uncalibrated_fallback)
+                          allow_uncalibrated_fallback=allow_uncalibrated_fallback,
+                          allowed_mxu=allowed_mxu, site_allowed_mxu=site_allowed_mxu)
     fb = policy["uncalibrated_fallback"]
     if fb["count"]:
         status = "declared" if fb["declared"] else "NOT declared; pass --allow-uncalibrated-fallback to declare"

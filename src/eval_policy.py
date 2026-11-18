@@ -472,6 +472,7 @@ def main():
                 calib_record=calib_cache[0][1] if calib_cache else None,
                 normalization=policy_norm.export_record(norm),
                 allow_uncalibrated_fallback=getattr(args, "allow_uncalibrated_fallback", False),
+                **quant_export.allowed_mxu_kwargs(args),
                 extra_provenance={"lerobot_dataset": args.dataset, "n_test_episodes": args.n_test_episodes,
                                   "eval_seed": args.seed})
             result["export"] = {"dir": args.export_dir, "mode": mode, "files": man["files"]}
