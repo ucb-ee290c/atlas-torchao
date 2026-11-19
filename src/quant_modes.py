@@ -12,6 +12,11 @@
   reference_hw  as reference, with the matmul through an MXU accumulation model: --mxu ipt
                 (default, the reference author's choice) or sa, implementation --mxu-impl
                 ref_cpu (the reference CPU models) or torch (src/mxu/accum_torch.py)
+  native_fp8    NEW: ref_conv's operand casts (identical codes and exponents), every quantized matmul on
+                the FP8 tensor cores: torch._scaled_mm on the codes, float32 out, x 2^(sx+sw), one cast to
+                the layer dtype, bias after (src/reference/native_fp8.py; needs CUDA, capability >= 8.9).
+                Off the ladder. Next to ref_conv in one run, it re-uses ref_conv's quantized model
+                (share_native), so both evaluate the same codes
   torchao       stock TorchAO Float8DynamicActivationFloat8WeightConfig, per-tensor
                 (native FP8 matmul; needs compute capability >= 8.9, Ada Lovelace, Hopper or newer GPUs)
 
@@ -85,6 +90,9 @@ PROFILES = {
                 "x 2^(sx+sw), BF16 bias after", "pi0-quant quant_linear.py:145-172; "
                 "functional_models.py:79-108", ops=OPS, step=6,
                 adds="Atlas MXU accumulation (--mxu, cross-checked)"),
+        Profile("native_fp8", "ref_conv casts (same codes / exponents), matmuls on FP8 tensor cores "
+                "(torch._scaled_mm, float32 out, x 2^(sx+sw), BF16 bias after)", "NEW (src/reference/native_fp8.py)",
+                impl="reference", ops=OPS, fixed=(("fp8_matmul", "native"),)),
         Profile("torchao", "Float8DynamicActivationFloat8WeightConfig, per-tensor", "torchao 0.18"),
         Profile("chip", "reference_hw + every other op on the Atlas VPU / scalar core, or listed as "
                 "host fallback; RoPE / timestep tables host constants by default (src/chip/chip_profile.py)",
@@ -116,6 +124,11 @@ def canonical(mode: str) -> str:
 
 def require_mode_supported(mode: str, device: str) -> None:
     """Raise RuntimeError with a clear message if `mode` cannot run on `device`."""
+    if canonical(mode) == "native_fp8":
+        from reference.native_fp8 import check_device
+
+        check_device(device)
+        return
     if canonical(mode) != "torchao":
         return
     try:
@@ -220,6 +233,16 @@ def finalize_report(rep):
     summary and marks the result invalid if any checked bit differed (or nothing was checked)."""
     if not isinstance(rep, dict):
         return rep
+    nf = rep.get("native_fp8")
+    if nf is not None and hasattr(nf, "summary"):
+        counter = getattr(nf, "site_counter", None)
+        rep["native_fp8"] = nf = nf.summary(counter.calls if counter is not None else None)
+        if not nf["ok"]:
+            rep["valid"] = False
+            rep.setdefault("invalid_reasons", []).append("native_fp8 kernel gate: " + "; ".join(nf["problems"]))
+            print("WARNING: native_fp8 kernel gate failed; result marked invalid:", nf["problems"], flush=True)
+        else:
+            rep.setdefault("valid", True)
     cc = rep.get("crosscheck")
     if cc is not None and hasattr(cc, "summary"):
         rep["crosscheck"] = cc = cc.summary()
@@ -311,7 +334,11 @@ def ladder_record(mode: str, rep: dict, options=None) -> dict:
     if "conv2d" in ops:
         classes["conv2d"] = _count(rep, "conv2d")
     chip_mxu = opts.get("chip_mxu") or "model"
-    if base == "reference" or (base == "chip" and chip_mxu == "framework"):
+    if opts.get("fp8_matmul") == "native":
+        from reference.native_fp8 import KERNEL
+
+        acc = "native fp8: " + KERNEL
+    elif base == "reference" or (base == "chip" and chip_mxu == "framework"):
         acc = "framework" if base == "reference" else "framework (FP8 operands, float32 matmul, one BF16 rounding)"
     else:
         po = profile_options(opts)
@@ -401,6 +428,12 @@ def _quantize_profile(model: nn.Module, name: str, skip=(), options=None) -> dic
 
         opts = profile_options(options or {})
         factory = fm0 = None
+        native = None
+        if name == "reference" and (options or {}).get("fp8_matmul") == "native":
+            from reference.native_fp8 import NativeFP8
+
+            native = NativeFP8()                     # NEW native_fp8: stateless kernel, one instance per model
+            factory = lambda: native  # noqa: E731
         if name == "reference_hw":
             from mxu.accum_backends import describe, get_accumulator
 
@@ -432,5 +465,60 @@ def _quantize_profile(model: nn.Module, name: str, skip=(), options=None) -> dic
         if name == "reference_hw" and hasattr(fm0, "summary"):
             rep["crosscheck"] = fm0                  # replaced by its summary in finalize_report
         rep["reference_sources"] = ref_loader.provenance()
+        rep["weight_codes_sha256"] = weight_codes_digest(model)
+        if native is not None:
+            from reference.native_fp8 import SiteCallCounter
+
+            native.site_counter = SiteCallCounter(model)
+            rep["native_fp8"] = native               # replaced by its kernel-gate summary in finalize_report
         return rep
     return _quantize_torchao_style(model, name, skip)
+
+
+def weight_codes_digest(model: nn.Module) -> str:
+    """sha256 over (name, codes, exponents) of every reference-profile Linear / Conv2d, in module order: equal
+    digests mean two modes evaluate the same weight codes and exponents (NEW, native_fp8 vs ref_conv)."""
+    import hashlib
+
+    h = hashlib.sha256()
+    for n, m in model.named_modules():
+        codes = getattr(m, "weight_codes", None)
+        if not isinstance(codes, torch.Tensor) or not hasattr(m, "weight_scale_exp"):
+            continue
+        h.update(n.encode())
+        for t in (codes, m.weight_scale_exp):
+            t = t.detach()
+            t = t.view(torch.uint8) if t.dtype == torch.float8_e4m3fn else t
+            h.update(str((t.dtype, tuple(t.shape))).encode())
+            h.update(t.contiguous().cpu().numpy().tobytes())
+    return h.hexdigest()
+
+
+SHARED_NATIVE_FROM = "ref_conv"
+
+
+def share_native(model: nn.Module, rep: dict, options=None) -> dict:
+    """NEW: switch a model that `quantize(model, "ref_conv", ...)` prepared to native_fp8 in place (the same
+    modules, codes, exponents and calibration; only the matmul changes) and return the native_fp8 report.
+    The algorithm state the modules hold (static exponents, online transforms) is used as is, so call this
+    right after the ref_conv evaluation, before any other quantize call resets the algorithm."""
+    from reference.native_fp8 import NativeFP8, SiteCallCounter, to_native
+
+    native = NativeFP8()
+    switched = to_native(model, native)
+    native.site_counter = SiteCallCounter(model)
+    drop = ("ladder", "crosscheck", "native_fp8", "valid", "invalid_reasons", "algo")
+    new = {k: v for k, v in (rep or {}).items() if k not in drop}
+    new["profile"] = {**new.get("profile", {}), "name": "reference", "fp8_matmul": "native"}
+    new["weight_codes_sha256"] = weight_codes_digest(model)
+    new["shared_quantization"] = {"from_mode": SHARED_NATIVE_FROM, "switched": switched,
+                                  "weight_codes_sha256_equal": new["weight_codes_sha256"] == (rep or {}).get("weight_codes_sha256")}
+    new["native_fp8"] = native
+    new["ladder"] = ladder_record("native_fp8", new, resolved_options("native_fp8", options))
+    return new
+
+
+def can_share_native(modes, i) -> bool:
+    """modes[i] is native_fp8 and the mode evaluated just before it is ref_conv (or its alias)."""
+    return (0 < i < len(modes) and canonical(modes[i]) == "native_fp8"
+            and canonical(modes[i - 1]) == SHARED_NATIVE_FROM)
