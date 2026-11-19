@@ -15,7 +15,6 @@ usage (PYTHONPATH=<worktree>/src, atlas-pi0 env):
 import argparse
 import hashlib
 import json
-import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -153,8 +152,7 @@ def main(argv=None):
     lm_path = Path(a.loop_manifest)
     out.mkdir(parents=True, exist_ok=True)
     (out / "loop_manifest.json").write_bytes(lm_path.read_bytes())
-    if not (out / "export").exists():
-        os.symlink(export_dir.resolve(), out / "export")
+    fx_export.link_export(export_dir, out / "export")      # real files: the backend refuses symlinked export paths
     here = Path(__file__).resolve()
     lm = json.loads(lm_path.read_text())
     report = fx_export.capture_fx(

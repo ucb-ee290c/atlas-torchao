@@ -149,9 +149,9 @@ def test_linear_capture_is_one_node_with_exact_buffers(tmp_path, linear_replay, 
     nodes = [n for n in program.graph.nodes if n.op == "call_function"]
     targets = [str(n.target) for n in nodes]
     assert targets.count("atlas.qlinear.default") == 1 and targets.count("atlas.quantize_act.default") == 1
-    # the only aten ops left are the input dtype guard/cast; no exp2/mul/convert/linear/frexp decode
-    assert sorted(t for t in targets if t.startswith("aten.")) == ["aten._assert_tensor_metadata.default",
-                                                                  "aten.to.dtype"]
+    # no aten ops left: the input already has the weight dtype, so no identity cast either; no
+    # exp2/mul/convert/linear/frexp decode
+    assert [t for t in targets if t.startswith("aten.")] == []
     buffers = dict(program.named_buffers())
     assert buffers["0.weight_codes"].dtype == fx_export.STORAGE_DTYPES[storage]
     assert torch.equal(buffers["0.weight_codes"].view(torch.uint8), codes)

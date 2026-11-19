@@ -11,11 +11,11 @@ composition (encode, then step on its output) can be compared byte for byte with
 usage (PYTHONPATH=<worktree>/src, atlas-lerobot env):
   policy_fx_capture_phases.py dit encode|step --export-dir EXPORT --single-step-bundle BUNDLE --loop-manifest LM --out DIR
 DIR gets fx/ (the bundle), loop_manifest.json (a copy, same sha256 as LM, recorded in fx_manifest.json provenance) and an
-`export` symlink to EXPORT so verify_bundle.py / make_bundle_manifest.py can read it."""
+`export` directory holding EXPORT's files as hard links (fx_export.link_export; the Atlas backend's
+adapter refuses symlinked export paths) so verify_bundle.py / make_bundle_manifest.py and the backend can read it."""
 import argparse
 import hashlib
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -111,9 +111,7 @@ def main(argv=None):
     lm_path = Path(a.loop_manifest)
     out.mkdir(parents=True, exist_ok=True)
     (out / "loop_manifest.json").write_bytes(lm_path.read_bytes())
-    link = out / "export"
-    if not link.exists():
-        os.symlink(export_dir.resolve(), link)
+    fx_export.link_export(export_dir, out / "export")      # real files: the backend refuses symlinked export paths
     here = Path(__file__).resolve()
     lm = json.loads(lm_path.read_text())
     import dataclasses
