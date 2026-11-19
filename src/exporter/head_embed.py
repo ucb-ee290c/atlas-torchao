@@ -250,6 +250,8 @@ TABLES = {"nvfp4": {"weight_decode_pair_lut": e2m1_pair_table, "weight_decode_e4
 
 
 class _Tables(nn.Module):
+    quantized_storage = True       # not a contraction site: quant_modes.weight_codes_digest leaves it out
+
     def _register_tables(self, fmt):
         for name, make in TABLES[fmt].items():
             self.register_buffer(name, make(), persistent=False)       # quant_export writes them
