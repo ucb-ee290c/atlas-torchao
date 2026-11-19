@@ -102,10 +102,20 @@ def main():
     add_profile_args(ap)
     add_subset_compare_arg(ap)
     algos.add_args(ap, calib_sources=("wikitext2_train",))
+    import exporter.head_embed as head_embed
     import exporter.quant_export as quant_export
 
     quant_export.add_args(ap)
+    head_embed.add_args(ap)
     args = ap.parse_args()
+    try:
+        he_opts = head_embed.options(args)
+    except ValueError as e:
+        ap.error(str(e))
+    he_default = head_embed.is_default(he_opts)
+    if args.from_export and not he_default:
+        ap.error("--tie / --lm-head / --embedding apply when quantizing; an export (--from-export) carries its own")
+    skip = head_embed.skip_for(he_opts)          # ["lm_head"] unless --lm-head fp8
     try:
         algo = algos.make(args.algo)
     except (ValueError, ImportError) as e:
@@ -131,6 +141,8 @@ def main():
               "gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else None,
               "protocol": args.protocol, "ppl": {}, "layers": {}, "ladder": {}, "algo": {},
               "subset_compare": {"enabled": bool(added) or None, "added_modes": added}}
+    if not he_default:
+        result["head_embed"] = {"options": he_opts, "label": head_embed.label(he_opts), "modes": {}}
     if args.export_only:
         result["windows"] = 0
     elif args.protocol == "mxq":
@@ -186,18 +198,32 @@ def main():
         else:
             model = load_llama(args.model, seqlen=args.seqlen, device=args.device)  # fresh weights per mode
         kept = None
+        he_rec = None
+        if not he_default and not args.from_export and not shared:
+            he_rec = head_embed.prepare(model, he_opts)           # the tie, before calibration
         if mode != "bf16" and not args.from_export and not shared:
-            result["layers"][mode] = algos.quantize(model, mode, skip=["lm_head"], options=args,
+            result["layers"][mode] = algos.quantize(model, mode, skip=skip, options=args,
                                                     algo=algo, calib=calib)
+        if he_rec is not None:
+            if mode == "bf16" and he_opts["lm_head"] == "fp8":
+                head_embed.quantize_head_reference(model)        # no recipe in bf16: the reference rule
+            he_rec = head_embed.finish(model, he_opts, he_rec)
+            result["head_embed"]["modes"][mode] = he_rec
+        elif shared and not he_default and not args.from_export:
+            # the kept ref_conv model already holds the tie and the storage modules (a second finish would re-wrap
+            # them); its fp8 head is a RefQuantLinear, switched to the FP8 kernels by share_native like every Linear
+            he_rec = {**result["head_embed"]["modes"][ref_mode], "shared_from_mode": ref_mode}
+            result["head_embed"]["modes"][mode] = he_rec
         if mode == export_mode and "export" not in result:
             man = quant_export.export(
                 model, args.export_dir, mode=mode, report=result["layers"][mode], algo=algo,
-                algo_spec=args.algo, options=args, skip=["lm_head"], device=args.device,
+                algo_spec=args.algo, options=args, skip=skip, device=args.device,
                 model_record={"kind": "causal_lm", "cli": "src/eval.py", "id": args.model, "seqlen": args.seqlen,
                               "checkpoint": quant_export.checkpoint_record(args.model)},
                 calib_batches=calib_cache[0][0] if calib_cache else None,
                 calib_record=calib_cache[0][1] if calib_cache else None,
                 allow_uncalibrated_fallback=getattr(args, "allow_uncalibrated_fallback", False),
+                head_embed=None if he_default else head_embed.export_record(he_opts, he_rec),
                 **quant_export.allowed_mxu_kwargs(args))
             result["export"] = {"dir": args.export_dir, "mode": mode, "files": man["files"]}
             if args.export_only:

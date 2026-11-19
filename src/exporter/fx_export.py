@@ -1118,13 +1118,15 @@ def _check_act(label, act, rule, storage, depends_on_input):
 
 
 def _inspect_native_site(path, layer, site, rule, nodes, lifted, depends_on_input, storage, calls=1, lowering=None,
-                         bias_add=False):
+                         bias_add=False, shared_scopes=frozenset()):
     """One Linear (or Conv2d) call = one atlas.qlinear (atlas.qconv2d) node fed directly by the lifted code and
     exponent buffers and by its own atlas.quantize_act node whose input depends on the user input; nothing
     else decodes or contracts in its scope (a Conv2d keeps its visible im2col). A module the boundary calls
     `calls` times (the eager replay's count, 1 by default) has exactly `calls` such nodes, each with its own
     quantize_act, all sharing the one code / exponent buffer pair. A Conv2d captured as patch rows (lowering
-    PATCH_ROWS, conv_patch_rows) is an atlas.qlinear on its reshaped / permuted input, with no im2col."""
+    PATCH_ROWS, conv_patch_rows) is an atlas.qlinear on its reshaped / permuted input, with no im2col.
+    `shared_scopes`: module paths of tied quantized embeddings (exporter.head_embed), which may also read the
+    buffers (a row lookup, no contraction)."""
     import exporter.atlas_fx_ops as atlas_fx_ops
 
     conv = type(layer).__name__ == "RefQuantConv2d"
@@ -1140,7 +1142,8 @@ def _inspect_native_site(path, layer, site, rule, nodes, lifted, depends_on_inpu
         raise FXVerificationError(f"{layer.layer_name}: graph consumes the float placeholder")
     mine = [n for n in nodes if n.op == "call_function" and n.target == op
             and n.args[2] is code and n.args[3] is exp]
-    if len(mine) != calls or set(code.users) != set(mine) or set(exp.users) != set(mine):
+    shared = {n for n in set(code.users) | set(exp.users) if _scope(n) in shared_scopes}
+    if len(mine) != calls or set(code.users) - shared != set(mine) or set(exp.users) - shared != set(mine):
         what = "exactly one" if calls == 1 else f"exactly {calls} (the eager replay's call count),"
         raise FXVerificationError(f"{layer.layer_name}: expected {what} {op} consuming "
                                   f"the code and exponent buffers directly, found {len(mine)}")
@@ -1368,6 +1371,95 @@ def _emulated_report(nodes, module, native_paths):
     return {"emulated_modules": emulated, "other_nodes_outside_quantized_modules": other}
 
 
+def _storage_report(program, nodes, module, policy, lifted):
+    """Quantized-storage modules (exporter.head_embed: QuantEmbedding, NVFP4Linear; none by default): each must read
+    its codes from a lifted buffer (a tied embedding: the head's), hold no float weight, and is listed with its
+    node count. Their decode nodes (e4m3 / e2m1 decode, exp2) are storage decoding, not an emulated matmul."""
+    import exporter.head_embed as head_embed
+
+    prefix = _prefix_of(module, policy)
+    rows = []
+    for path, layer in module.named_modules():
+        if not isinstance(layer, (head_embed.QuantEmbedding, head_embed.NVFP4Linear)):
+            continue
+        owner = path if getattr(layer, "tied_to", None) is None else prefix + layer.tied_to
+        code = lifted.get(owner + ".weight_codes")
+        scope = [n for n in nodes if n.op == "call_function" and _scope(n) == path]
+        if scope and (code is None or not code.users):
+            raise FXVerificationError(f"{path}: quantized storage does not read its lifted codes {owner}.weight_codes")
+        weight = program.state_dict.get(path + ".weight")
+        if weight is not None and not weight.is_meta:
+            raise FXVerificationError(f"{path}: quantized storage module holds a float weight")
+        site = path[len(prefix):] if prefix and path.startswith(prefix) else path
+        rows.append({"site": site, "module": path, "kind": "embedding" if isinstance(layer, head_embed.QuantEmbedding)
+                     else "nvfp4_linear", "format": layer.fmt, "code_buffer": owner + ".weight_codes",
+                     "tied_to": getattr(layer, "tied_to", None), "in_graph": bool(scope), "node_count": len(scope),
+                     "contractions": [n.name for n in scope if n.target in CONTRACTIONS]})
+    return rows
+
+
+def _split_name(name):
+    """(base, suffix) of an FX node name as torch.fx's namespace forms it: `to_4` -> ("to", 4), `to` -> ("to", 0)."""
+    base, sep, num = name.rpartition("_")
+    return (base, int(num)) if sep and base and num.isdigit() else (name, 0)
+
+
+def _name_storage_nodes(program, module):
+    """Own names for the storage-decode nodes (exporter.head_embed; none by default, then the graph is untouched).
+
+    torch.export numbers call_function nodes per op name in creation order (`to`, `to_1`, ...), so the decode
+    nodes of a quantized embedding, which run first, shift every later node of the same op: layer 0's rotary
+    cos / sin casts become `to_7` / `to_8` instead of the default's `to_4` / `to_5`, and backend tools that
+    identify boundaries by node name see a different graph. This renames each non-contraction node in a storage
+    module's scope to `<module path>_<op name>[_k]` and lowers the suffix of every other node by the number of
+    storage nodes of its op name numbered before it, which gives the names the default capture has. Names only:
+    the targets, arguments and order of the nodes are unchanged. Returns {old: new} of the renamed nodes."""
+    import exporter.head_embed as head_embed
+
+    paths = {path: path.replace(".", "_") for path, layer in module.named_modules()
+             if isinstance(layer, (head_embed.QuantEmbedding, head_embed.NVFP4Linear))}
+    if not paths:
+        return {}
+    graph = program.graph
+    nodes = [n for n in graph.nodes if n.op == "call_function"]
+    storage = {n for n in nodes if _scope(n) in paths and n.target not in CONTRACTIONS}
+    removed = collections.defaultdict(list)                  # op name -> suffixes of its storage nodes
+    for node in storage:
+        base, num = _split_name(node.name)
+        removed[base].append(num)
+    renames, own = {}, collections.Counter()
+    for node in nodes:
+        base, num = _split_name(node.name)
+        if node in storage:
+            stem = f"{paths[_scope(node)]}_{base}"
+            new = stem if not own[stem] else f"{stem}_{own[stem]}"
+            own[stem] += 1
+        else:
+            num -= sum(1 for k in removed.get(base, ()) if k < num)
+            new = f"{base}_{num}" if num else base
+        if new != node.name:
+            renames[node.name] = new
+    if not renames:
+        return {}
+    names = [renames.get(n.name, n.name) for n in graph.nodes]
+    if len(set(names)) != len(names):
+        raise FXVerificationError("storage-node renaming would give two nodes one name")
+    for node in nodes:
+        node.name = renames.get(node.name, node.name)
+    signature = program.graph_signature
+    for spec in list(signature.input_specs) + list(signature.output_specs):
+        if getattr(spec.arg, "name", None) in renames:
+            spec.arg.name = renames[spec.arg.name]
+    for entry in program.module_call_graph:
+        if entry.signature is not None:
+            for arg in list(entry.signature.inputs) + list(entry.signature.outputs):
+                if getattr(arg, "name", None) in renames:
+                    arg.name = renames[arg.name]
+    program.graph_module.recompile()
+    program.validate()
+    return renames
+
+
 def _tile_native_report(module, policy, native_paths, plan, act_stats):
     """Per-site `tile_native` (NEW): true when the weight exponent table and the activation / attention
     operand exponents are constant along K at 32-granularity (src/exporter/tile_native.py), with the reasons for every
@@ -1477,6 +1569,8 @@ def inspect_graph(program, module, policy, plan=None, storage="uint8", unused=()
         outside = sorted(name for name in selected if not name.startswith(tuple(scope)))
         selected = {name: site for name, site in selected.items() if name not in outside}
     actual, rows, unused_rows = set(), [], []
+    storage_rows = _storage_report(program, nodes, module, policy, lifted)      # none by default
+    tied_scopes = frozenset(row["module"] for row in storage_rows if row["tied_to"])
     for path, layer in module.named_modules():
         if type(layer).__name__ not in ("RefQuantLinear", "RefQuantConv2d"):
             continue
@@ -1498,7 +1592,8 @@ def inspect_graph(program, module, policy, plan=None, storage="uint8", unused=()
         if path in native_paths:
             rows.append(_inspect_native_site(path, layer, selected[site], native_paths[path], nodes, lifted,
                                              depends_on_input, storage, expected_calls,
-                                             (plan.get("conv2d_lowering") or {}).get(path), plan.get("bias_add", False)))
+                                             (plan.get("conv2d_lowering") or {}).get(path), plan.get("bias_add", False),
+                                             shared_scopes=tied_scopes))
             continue
         if layer.fm is not None or getattr(layer, "residual", None):
             raise FXVerificationError(f"{site}: initial FX path requires framework accumulation and no residual passes")
@@ -1575,6 +1670,9 @@ def inspect_graph(program, module, policy, plan=None, storage="uint8", unused=()
               "unused_parameters": unused_params,
               "unused_quantized_weight_storage": "meta placeholders; no serialized float weight payload",
               "scope": "reference-emulation FX; not native-FP8 MLIR or hardware compatibility"}
+    if storage_rows:
+        report["quantized_storage_sites"] = storage_rows
+    storage_paths = {row["module"] for row in storage_rows}
     report["tile_native"] = _tile_native_report(module, policy, native_paths, plan, act_stats)
     report["compiler_pack_scale_admission"] = _admission_report(policy, act_stats)
     _, pack_records, pack_summary = _pack_plan(program, policy)
@@ -1598,7 +1696,8 @@ def inspect_graph(program, module, policy, plan=None, storage="uint8", unused=()
             # nothing is left to emulate, so no contraction may be fed by a decode (exp2 / frexp) anywhere
             for node in contractions:
                 decoders = [n for n in _ancestors(node, stop_at_contractions=True, value_only=True)
-                            if n.target in (torch.ops.aten.exp2.default, torch.ops.aten.frexp.Tensor)]
+                            if n.target in (torch.ops.aten.exp2.default, torch.ops.aten.frexp.Tensor)
+                            and _scope(n) not in storage_paths]
                 if decoders:
                     raise FXVerificationError(f"{node.name} ({_scope(node)}): a contraction is still fed by "
                                               f"{decoders[0].name}, a decode op, with no emulated module listed")
@@ -1842,6 +1941,9 @@ def capture_fx(module, cases, directory, *, policy, provenance=None, strict=True
                     before = held
                 else:
                     program = torch.export.export(module, cases[0], strict=strict)
+            renamed = _name_storage_nodes(program, module)          # {} (graph untouched) by default
+            if renamed:
+                report["renamed_for_storage_decode"] = len(renamed)
             if _without(_inventory(program.named_buffers(), STORAGE_DTYPES[native_fp8] if native_fp8 else torch.uint8),
                         unused) != before:
                 raise FXVerificationError("capture changed code/exponent buffers")

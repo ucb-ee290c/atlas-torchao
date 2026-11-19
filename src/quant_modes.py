@@ -477,13 +477,16 @@ def _quantize_profile(model: nn.Module, name: str, skip=(), options=None) -> dic
 
 def weight_codes_digest(model: nn.Module) -> str:
     """sha256 over (name, codes, exponents) of every reference-profile Linear / Conv2d, in module order: equal
-    digests mean two modes evaluate the same weight codes and exponents (NEW, native_fp8 vs ref_conv)."""
+    digests mean two modes evaluate the same weight codes and exponents (NEW, native_fp8 vs ref_conv).
+    Quantized-storage modules (exporter.head_embed, installed after quantize) are not contraction sites and
+    are left out, so a native_fp8 that shares a ref_conv model digests the same modules."""
     import hashlib
 
     h = hashlib.sha256()
     for n, m in model.named_modules():
         codes = getattr(m, "weight_codes", None)
-        if not isinstance(codes, torch.Tensor) or not hasattr(m, "weight_scale_exp"):
+        if not isinstance(codes, torch.Tensor) or not hasattr(m, "weight_scale_exp") \
+                or getattr(m, "quantized_storage", False):
             continue
         h.update(n.encode())
         for t in (codes, m.weight_scale_exp):

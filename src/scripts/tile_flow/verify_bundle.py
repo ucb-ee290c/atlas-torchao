@@ -357,6 +357,8 @@ def run(export, fx, out, allow_fallback=False, allow_unquantized_attention=True,
     for n, s in policy["sites"].items():
         if s.get("status") != "quantized":
             continue
+        if s["kind"] == "embedding":         # quantized storage (exporter.head_embed): a row lookup, no activation rule
+            continue
         if s["kind"] == "attention":
             for op, r in s["operands"].items():
                 census[("attention." + op, r.get("mode"), r.get("reduce") or r.get("source"), r.get("rule"))] += 1
@@ -478,11 +480,17 @@ def run(export, fx, out, allow_fallback=False, allow_unquantized_attention=True,
     # buffers retained as uint8 / int32 in the loaded program
     badbuf = [k for k in bufs if k.endswith("weight_codes") and bufs[k].dtype != torch.uint8] + \
              [k for k in bufs if k.endswith("weight_scale_exp") and bufs[k].dtype != torch.int32]
-    nb = sum(1 for k in bufs if k.endswith("weight_codes"))
+    # an FP8 embedding (exporter.head_embed, quantized storage) also holds weight_codes / weight_scale_exp buffers; they
+    # are dtype-checked above but are not Linear / Conv2d sites, so they are not counted against them
+    storage_names = {v for s in policy["sites"].values() if s.get("status") == "quantized" and s.get("kind") == "embedding"
+                     and not s.get("tied_to") for k, v in s["weight"].items() if k in ("codes", "scale_exp")}
+    storage_bufs = {k for k in bufs if any(k == nm or k.endswith("." + nm) for nm in storage_names)}
+    nb = sum(1 for k in bufs if k.endswith("weight_codes") and k not in storage_bufs)
     buffer_sites_ok = {n for n in sites if n in code_stems} == {n for n in sites if n in exp_stems} == set(used) \
-        and nb == n_q == sum(1 for k in bufs if k.endswith("weight_scale_exp"))
+        and nb == n_q == sum(1 for k in bufs if k.endswith("weight_scale_exp") and k not in storage_bufs)
     check("graph_weight_buffers_uint8_int32", not badbuf and buffer_sites_ok,
-          {"weight_code_buffers": nb, "expected": n_q, "bad": badbuf[:3], "policy_sites_without_buffers": unused_derived[:3]})
+          {"weight_code_buffers": nb, "expected": n_q, "bad": badbuf[:3], "policy_sites_without_buffers": unused_derived[:3],
+           **({"quantized_storage_buffers": sorted(storage_bufs)} if storage_bufs else {})})
     fl = [k for k in dict(prog.named_parameters()) if k.endswith(".weight") and any(c in sites for c in (k[:-7], k[:-7].split(".", 1)[-1]))]
     fresh = json.loads((fx / "fresh_process_verification.json").read_text())
     placeholder_of = {sp.target: sp.arg.name for sp in prog.graph_signature.input_specs
