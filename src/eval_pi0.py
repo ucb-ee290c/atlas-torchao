@@ -636,6 +636,7 @@ def main(argv=None):
                               "checkpoint": prov.get("checkpoint")},
                 calib_batches=[fr["obs"] for fr in calib_cache[0][0]] if calib_cache else None,
                 calib_record=calib_cache[0][1] if calib_cache else None,
+                allow_uncalibrated_fallback=getattr(args, "allow_uncalibrated_fallback", False),
                 extra_provenance={"openpi": prov.get("openpi"), "obs": args.obs,
                                   "norm_stats": prov.get("norm_stats"), "tokenizer": prov.get("tokenizer")}))
         policy = (pi0_model.make_policy(rt, model, args.device, args.config, args.norm_stats_dir,

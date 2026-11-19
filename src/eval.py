@@ -187,10 +187,17 @@ def main():
                 model_record={"kind": "causal_lm", "cli": "src/eval.py", "id": args.model, "seqlen": args.seqlen,
                               "checkpoint": quant_export.checkpoint_record(args.model)},
                 calib_batches=calib_cache[0][0] if calib_cache else None,
-                calib_record=calib_cache[0][1] if calib_cache else None)
+                calib_record=calib_cache[0][1] if calib_cache else None,
+                allow_uncalibrated_fallback=getattr(args, "allow_uncalibrated_fallback", False))
             result["export"] = {"dir": args.export_dir, "mode": mode, "files": man["files"]}
             if args.export_only:
                 break
+        if getattr(args, "act_two_term", "off") != "off":
+            import chip.hw_two_term as hw_two_term
+
+            rec = hw_two_term.apply(model, mode, args.act_two_term)
+            if rec is not None:
+                result.setdefault("hw_two_term", {})[mode] = rec
         result["algo"][mode] = algos.entry_record(result["layers"].get(mode), mode, args.algo)
         result["ladder"][mode] = (result["layers"][mode]["ladder"] if mode != "bf16"
                                   else ladder_record("bf16", {}, args))

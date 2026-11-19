@@ -1,7 +1,8 @@
 # `gptq_awq`: GPTQ and AWQ weights under the Atlas E4M3 cast
 
 `--algo gptq_awq[:method=gptq|awq|awq_gptq,actorder=true,damp=0.01,block=128,grid=20]`
-(`src/algos/gptq_awq.py`, tests in `tests/test_algo_gptq_awq.py`).
+(`src/algos/gptq_awq.py`, tests in `tests/test_algo_gptq_awq.py`). Opt-in `producer_aware=true` (default off) adds the producer's
+panel-grid quantization error to the AWQ search loss: [producer-aware AWQ](tile-aware.md#producer-aware-awq).
 
 Only Linear weights change. Every activation, every attention operand and every Conv2d weight keeps
 the reference rule. Nothing changes at run time: the same E4M3 codes and the same per-tensor E8M0
@@ -194,3 +195,19 @@ The `algo` entry adds:
 - `prepare.awq_folded` and `prepare.awq_unscaled`, each with α or the reason.
 - `calibration.result`: Hessian counts, shared inputs, verified and refused fold groups.
 - `granularity.weight`: `linear:per_tensor` for every layer.
+
+## Hardware-aware calibration (NEW, opt-in, off by default)
+
+Three new keys of the `gptq_awq:` spec. Defaults (`awq_loss=weight,calib=bf16,target=bf16`) are bit-for-bit
+the algorithm above; the named recipes `atlas_v1_*` do not use them and expand as before.
+
+| key | values | what it does |
+|---|---|---|
+| `awq_loss` | `weight` (default), `cast` | `cast`: calibration also keeps up to 512 random tokens x K of each fold group's shared input (CPU). `awq_search_cast` scores every alpha by the layer output error through the real casts, `sum_Linears ||W x - dq(Q_w(W s)) dq(Q_a(x/s))||^2` in float32, with Q_w the weight cast at the exponent re-derived on `W s` (or the stacked chooser's), Q_a the per-token `nc` activation cast (`algos.granularity.scale_exp`, flush below 2^-6 of the token max, clip at 448, RNE). Grid and the s normalization are unchanged. The alpha each loss picks is recorded per group in `prepare.alpha_picks` and the record (`hw_aware`). |
+| `calib` | `bf16` (default), `chip` | `chip`: after the AWQ fold, a second calibration pass on the folded model computes `x_hat = dq(Q_a(x))` at every Linear input and `H_hat = sum x_hat x_hat^T`; GPTQ uses `H_hat` (already in the folded space, so no `1/s` rescale). |
+| `target` | `bf16` (default), `fp` | needs `calib=chip`. Also accumulates `C = sum x x_hat^T` and replaces `W` by `W' = W C (H_hat + damp*mean(diag) I)^-1` before the GPTQ loop (minimizes `||W x - W_q x_hat||`); the pinned exponent s0 is derived from `W'`. Costs a second K x K float32 matrix per Hessian owner. |
+
+All statistics are computed from the model's own calibration data; fold guards are unchanged (a refused group stays
+unscaled and is recorded). Example: `gptq_awq:method=awq_gptq,actorder=true,awq_loss=cast,calib=chip,target=fp`.
+Stage wall-clock (`calibration`, `awq`, `chip_pass`, `gptq`) is in `record()["hw_aware"]["timing_s"]`.
+Tests: `tests/test_algo_hw_calib.py`. CPU screen: `results/hw-aware/`.

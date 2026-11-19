@@ -471,7 +471,9 @@ def test_dit_patch_embedding_exception_stays_a_visible_bf16_conv(tmp_path):
 
     torch.manual_seed(21)
     module = TinyDiT()
-    algo = algos.make("atlas_v1+keep_bf16:rule=input_conv")
+    # v1.1: `atlas_v1` is an alias of atlas_v1_awq and carries no exception; the input-convolution exception
+    # that v1.0 `atlas_v1` had is the opt-in member keep_bf16 (docs/algos/keep-bf16.md)
+    algo = algos.make("atlas_v1_awq+keep_bf16:rule=input_conv")
     report = algos.quantize(module, "ref_conv", options=dict(FAST), algo=algo, calib=dit_calib())
     policy = quant_export.build_policy(module, "ref_conv", report, algo, dict(FAST), [],
                                        report["algo"]["bf16_opt_out"], {}, {})

@@ -33,6 +33,7 @@ import torch.nn as nn
 import chip.chip_coverage as cc
 import chip.chip_numerics as chip_numerics
 import chip.chip_ops as chip_ops
+import chip.hw_scale as hw_scale
 import reference.ref_numerics as rn
 
 ENTRY_POINTS = ("forward", "predict_action_chunk", "select_action", "_generate_actions",
@@ -54,6 +55,54 @@ def count_algo_cast(n: int, dynamic: bool) -> None:
                                 + ("; amax at run time" if dynamic else "; scale fixed ahead of time"))
 
 
+class _ChainCoverage(cc.Coverage):
+    """Coverage that also carries the NEW dynamic-scale chain totals (count_dynamic_scale_chain)."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.chain: dict = {}
+
+    def report(self) -> dict:
+        rep = super().report()
+        if self.chain:
+            rep["dynamic_scale_chain_NEW"] = {
+                mode: {key: (dict(v) if isinstance(v, dict) else v) for key, v in tot.items()}
+                for mode, tot in self.chain.items()}
+            rep["dynamic_scale_chain_NEW_note"] = hw_scale.COST_ASSUMPTIONS
+        return rep
+
+
+def count_dynamic_scale_chain(rows: int, k: int, mode: str, rule: str = "nc") -> None:
+    """NEW, additive to count_algo_cast (whose vpack + vredmax.row + vredmin.row counts stay as they were):
+    the real on-chip chain that derives a dynamic scale (hw_scale.dynamic_scale_cost): vector amax,
+    vstore, scalar RV32I exponent sequence, sb, seld, and for mode 'token' the pre-vpack 2^-s factor
+    path. mode 'block' = one scale per 32-token block over the full K (granularity a=block); 'token' =
+    one per token. Rows: VPU `dyn_scale_chain` and scalar `dyn_scale_chain_scalar` (instructions);
+    serialized cycles go in the report's `dynamic_scale_chain_NEW` section (no overlap claimed)."""
+    if not _RUNNING:
+        return
+    cov = _RUNNING[-1].cov
+    c = hw_scale.dynamic_scale_cost(rows, k, mode, rule)
+    cov.add("VPU", "dyn_scale_chain", sum(c["vpu"].values()), c["vpu"],
+            reason=f"NEW: real dynamic-scale chain, mode={mode} (vredmax/vredmin, combine, vstore"
+                   + (", pre-vpack vmul" if mode == "token" else "") + "); H2 closed by hw_scale",
+            new={"choice": "vredmax.row/vredmin.row -> vstore -> scalar lhu + RV32I exponent -> sb -> seld",
+                 "analogue": "RTL has no exponent-extract instruction (handoff/HW_AWARE_AUDIT.md section 2)",
+                 "reason": "honest cost of dynamic scales; additive to the 3-instruction amax+vpack count"})
+    sc = {"rv32i": c["scalar"]["rv32i"], "seld": c["seld"]}
+    cov.add("scalar", "dyn_scale_chain_scalar", sum(sc.values()), sc,
+            reason="NEW: scalar-core RV32I instructions (lhu, exponent sequence, sb) and seld of the chain")
+    tot = cov.chain.setdefault(mode, {"scales_blocks": 0, "vpu": {}, "rv32i": 0, "seld": 0,
+                                      "instructions": 0, "serialized_cycles": 0})
+    tot["scales_blocks"] += c["blocks"]
+    for key, v in c["vpu"].items():
+        tot["vpu"][key] = tot["vpu"].get(key, 0) + v
+    tot["rv32i"] += c["scalar"]["rv32i"]
+    tot["seld"] += c["seld"]
+    tot["instructions"] += c["instructions"]
+    tot["serialized_cycles"] += c["cycles"]
+
+
 def count_algo_vpu(op: str, instrs: dict, reason: str, new: dict | None = None) -> None:
     """Extra VPU instructions an algorithm's numerics need on the chip (src/algos), e.g. the
     per-token pre-vpack vmul of the granularity track. Counted on its own VPU row `op`; `new`
@@ -61,6 +110,37 @@ def count_algo_vpu(op: str, instrs: dict, reason: str, new: dict | None = None) 
     if not _RUNNING or not instrs:
         return
     _RUNNING[-1].cov.add("VPU", op, sum(instrs.values()), instrs, reason=reason, new=new)
+
+
+TILE = 32                           # MXU tile edge: one pop scale per 32 x 32 output tile
+# Consumer of a matmul's output tile (NEW, assumption): "fp8" = the pop feeds an FP8 consumer (the
+# 2^(sx+sw) rescale is folded into vmatpop.fp8, 0 extra instructions); "bf16" = a BF16 pop has no scale
+# slot, so one vmul.bf16 by a tile constant per output tile. The emulation cannot see the consumer, so
+# the conservative "bf16" is counted unless a caller sets this.
+TILE_OUTPUT_CONSUMER = "bf16"
+
+
+def count_tile_output_rescale(m: int, n: int, consumer: str | None = None) -> None:
+    """Tile-aware granularity (w=panel with a=block / static / tensor; NEW): the output rescale
+    2^(sx[block] + sw[panel]) is constant over a 32 x 32 output tile, so it is NOT a per-element
+    vmul (the per-token / per-channel accounting of count_algo_vpu "granularity_rescale", kept
+    unchanged for those granularities). With an FP8 consumer it is folded into vmatpop.fp8 and costs
+    nothing; with a BF16 consumer (a BF16 pop has no scale slot) it is one vmul.bf16 by a tile
+    constant per output tile. No pre-vpack per-element vmul is counted either: the vpack reads the
+    block's scale register. m x n is the output shape of the matmul."""
+    consumer = consumer or TILE_OUTPUT_CONSUMER
+    if consumer not in ("fp8", "bf16"):
+        raise ValueError(f"consumer {consumer!r}; choose fp8 or bf16")
+    tiles = -(-int(m) // TILE) * -(-int(n) // TILE)
+    count_algo_vpu(
+        "tile_output_rescale", {"vmul.bf16": tiles} if consumer == "bf16" else {},
+        reason=f"tile-aware pop scale 2^(sx[block] + sw[panel]) per 32 x 32 output tile: consumer {consumer}: "
+               + ("one vmul.bf16 by a tile constant per output tile" if consumer == "bf16"
+                  else "folded into vmatpop.fp8, no extra instruction"),
+        new={"choice": "tile-constant vmul.bf16 on BF16 pop outputs; folded into vmatpop.fp8 for FP8 consumers",
+             "analogue": "quant_linear.py:169-170 rescale 2^(sx+sw), constant per tile instead of per element",
+             "reason": "w=panel with block / static activations (src/algos/granularity.py); the consumer "
+                       "of each pop is not visible to the emulation (assumption, docs/algos/tile-aware.md)"})
 
 
 def add_args(ap) -> None:
@@ -267,7 +347,7 @@ def quantize_chip(model: nn.Module, skip=(), options=None) -> dict:
     rep = quant_modes.quantize(model, "reference_hw" if mxu_kind == "model" else "reference", skip, options)
     opts = quant_modes.profile_options(options or {})
     rope = _opt(options, "chip_rope", "host") or "host"
-    cov = cc.Coverage(type(model).__name__)
+    cov = _ChainCoverage(type(model).__name__)
     vadd_mode = _opt(options, "chip_vadd", "trunc") or "trunc"
     # explicit (never the environment): the CLI flags define the chip profile
     vadd = chip_numerics.VaddPolicy(vadd_mode, _opt(options, "chip_vadd_sites", "residual") or "residual")

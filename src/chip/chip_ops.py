@@ -180,6 +180,9 @@ class ChipVPU:
         b32 = bf16_bits_to_f32(self._bits(b))
         s = a32 + b32 if op == "add" else a32 - b32                 # one FP32 RNE add
         bits = (s.contiguous().view(torch.int32) >> 16) & 0xFFFF     # raw upper half, no 2nd rounding
+        # a NaN result is the canonical +qNaN 0x7FC0 (hardfloat fNFromRecFN, then the (31,16) slice,
+        # AddSubSumVec.scala:39-40), not the input NaN's sign and payload (found by the Verilator run)
+        bits = torch.where(torch.isnan(s), torch.full_like(bits, 0x7FC0), bits)
         return self._out(bits, a)
 
     def add(self, a, b):

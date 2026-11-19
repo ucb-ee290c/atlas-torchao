@@ -24,6 +24,13 @@ FROZEN = {
     "atlas_v1_awq": "gptq_awq:method=awq_gptq,actorder=true+granularity:w=channel,a=token,rule=nc",
     "atlas_v1_static": "smoothquant:alpha=0.5,po2=true,gain=true,static=true,partial=true"
                        "+gptq_awq:method=gptq,actorder=true",
+    # tile-aware recipes (NEW; docs/algos/tile-aware.md, tests/test_algo_tile.py)
+    "atlas_v1_awq_tile": "gptq_awq:method=awq_gptq,actorder=true"
+                         "+granularity:w=panel,a=block,rows=32,rule=nc,attn=head",
+    "atlas_v1_tile": "gptq_awq:method=awq_gptq,actorder=true"
+                     "+granularity:w=panel,a=block,rows=32,rule=nc,attn=head+keep_bf16:rule=input_conv",
+    "atlas_v1_awq_tile_static": "gptq_awq:method=awq_gptq,actorder=true"
+                                "+granularity:w=panel,a=defer,attn=defer,rows=32,rule=nc+static_calib",
 }
 CHIP = {"chip_vadd": "rn", "chip_vadd_sites": "residual"}
 

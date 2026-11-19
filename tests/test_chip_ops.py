@@ -140,3 +140,13 @@ def test_nan_inputs_follow_the_reference_conversion(vrf, vpu):
     x = co.bf16_bits_to_f32(torch.tensor([0x7FC0, 0xFFC0, 0x7F81, 0xFF81], dtype=torch.int32))
     for op in ("rcp", "exp", "tanh", "sqrt"):
         assert same(getattr(vpu, op)(x), getattr(vrf, op)(x))
+
+
+def test_vadd_vsub_emit_the_canonical_nan(vpu):
+    """The RTL returns +qNaN 0x7FC0 for any NaN out of vadd/vsub (hardfloat, then the upper-16-bit
+    slice), whatever the input NaN's sign or payload (found by the Verilator run)."""
+    nan_in = co.bf16_bits_to_f32(torch.tensor([0xFFE1, 0x7FC1, 0x7F81], dtype=torch.int32))
+    one = torch.ones(3)
+    inf = torch.full((3,), float("inf"))
+    for out in (vpu.add(nan_in, one), vpu.sub(nan_in, one), vpu.add(inf, -inf), vpu.sub(inf, inf)):
+        assert (co.f32_to_bf16_bits(out)[:3] == 0x7FC0).all()

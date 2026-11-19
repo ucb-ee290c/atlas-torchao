@@ -15,7 +15,7 @@ Modes:
   atlas       AtlasQConfig: Atlas FP8 E4M3 rules, power-of-two per-tensor scales
   atlas_hw    as atlas, with activations through the hardware cast (subnormals flushed)
   torchao     stock TorchAO Float8DynamicActivationFloat8WeightConfig, per-tensor
-              (native FP8; needs compute capability >= 8.9, e.g. L40 / H100)
+              (native FP8; needs compute capability >= 8.9, Ada Lovelace, Hopper or newer GPUs)
 
 Normalization (src/loaders/policy_norm.py): --norm-stats checkpoint (default) uses the processors as saved;
 --norm-stats dataset (NEW) overrides their stats with the evaluated dataset's, as a lerobot fine-tune
@@ -471,11 +471,17 @@ def main():
                 calib_batches=calib_cache[0][0] if calib_cache else None,
                 calib_record=calib_cache[0][1] if calib_cache else None,
                 normalization=policy_norm.export_record(norm),
+                allow_uncalibrated_fallback=getattr(args, "allow_uncalibrated_fallback", False),
                 extra_provenance={"lerobot_dataset": args.dataset, "n_test_episodes": args.n_test_episodes,
                                   "eval_seed": args.seed})
             result["export"] = {"dir": args.export_dir, "mode": mode, "files": man["files"]}
             if args.export_only:
                 break
+        tt_rec = None
+        if getattr(args, "act_two_term", "off") != "off":
+            import chip.hw_two_term as hw_two_term
+
+            tt_rec = hw_two_term.apply(policy, mode, args.act_two_term)
         algo_rec = algos.entry_record(layers, mode, args.algo)
         eq = layers["ladder"].get("equivalent_to") if layers is not None else None
         if eq in result["modes"]:
@@ -502,6 +508,7 @@ def main():
         preds, gts, pads, times = run_mode(policy, ds, idx, preprocess, postprocess,
                                            args.seed, args.device, before_frame=before)
         entry = {"normalization": norm["status"], "layers": finalize_report(layers),
+                 **({"hw_two_term": tt_rec} if tt_rec else {}),
                  "ladder": layers["ladder"] if layers is not None else ladder_record("bf16", {}, args),
                  "algo": algo_rec,
                  "added_by_subset_compare": mode in added,

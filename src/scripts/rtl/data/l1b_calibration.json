@@ -1,0 +1,14 @@
+{
+ "note": "AtlasMxuScriptTest.scala reproduced npu-model's fixtures byte for byte (cmp) from a JSON script; sha256 of the fixtures it matched",
+ "ipt_traces_sha256": "6834dcc1399ca1c8bc71f3c4ce88899ac2dd7da4b439616df66eaeec93b0262a",
+ "sa_traces_sha256": "62252fd1312d7e31013b6c4a310be0e5f567eee8055218d376a06731aca60573",
+ "reproduced_ipt_sha256": "6834dcc1399ca1c8bc71f3c4ce88899ac2dd7da4b439616df66eaeec93b0262a",
+ "reproduced_sa_sha256": "62252fd1312d7e31013b6c4a310be0e5f567eee8055218d376a06731aca60573",
+ "ipt_identical": true,
+ "sa_identical": true,
+ "rtl_commit": "ucb-bar/atlas-npu @ eee27e2",
+ "bytes": {
+  "ipt": 97261,
+  "sa": 97261
+ }
+}

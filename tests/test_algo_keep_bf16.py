@@ -49,7 +49,8 @@ def test_parameters_are_explicit():
 
 
 def test_off_by_default():
-    assert all("keep_bf16" not in r["spec"] for r in algos.RECIPES.values())
+    # off unless named: the only recipe that names it is the tile-aware atlas_v1_tile (docs/algos/tile-aware.md)
+    assert [n for n, r in algos.RECIPES.items() if "keep_bf16" in r["spec"]] == ["atlas_v1_tile"]
     assert algos.make("none") is None
 
 
