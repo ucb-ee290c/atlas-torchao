@@ -58,7 +58,9 @@ the tests also checks the policy. It is meant to become the m2m adapter's policy
 - **`scale`**: the E8M0-style exponent encoding, the reference rule `floor(log2(amax/256))` and the
   NEW `nc` rule `ceil(log2(amax/448))`.
 - **`accumulate`**: MXU, the IPT model assumed by default (`--mxu ipt`), BF16 readout, and the
-  accumulation the exported mode used.
+  accumulation the exported mode used. With `--allowed-mxu` it also lists the MXU units the compiler
+  may use, the K order and each unit's rounding ([Allowed MXU units](#allowed-mxu-units)); without the
+  flag the block is unchanged.
 - **`sites`**: one entry per site, keyed by fqn.
   - **Linear / Conv2d**: `weight` (tensor names, granularity, block) and `weight_dtype`, the layer
     dtype the output is cast to. Also `activation`, which is one of:
@@ -94,6 +96,81 @@ the tests also checks the policy. It is meant to become the m2m adapter's policy
   Nothing is clamped.
 - **`pending_hardware_rulings`**: the open rulings listed below.
 - **`normalization`** (LeRobot policies, NEW): as in `manifest.json`.
+
+### Allowed MXU units
+
+Atlas has two MXU variants. Both take the same E4M3 codes and return a BF16 accumulator word; they
+differ only in where they round:
+
+| unit | structure | `--mxu` model | rounding |
+|---|---|---|---|
+| `mxu0` | systolic array | `sa` (`accum_torch.sa_linear`) | after every MAC: each exact E4M3 x E4M3 product is added to the BF16 partial with one RNE rounding, so the result depends on the order of every k |
+| `mxu1` | inner-product tree | `ipt` (`accum_torch.ipt_linear`, ipt_numba) | once per 32-wide K tile: the 32 products and the incoming BF16 partial are summed exactly in a 32-bit aligned integer, then rounded to BF16 (RNE); the result depends on how K is cut into tiles, not on the order inside a tile |
+
+By default an export assumes `mxu1` only (`assumed_on_chip`) and writes nothing else. The opt-in
+export flags (all three CLIs: `eval.py`, `eval_policy.py`, `eval_pi0.py`)
+
+    --allowed-mxu mxu1,mxu0                                   # units the compiler may use, in preference order
+    --site-allowed-mxu model.layers.0.mlp.down_proj=mxu1      # optional, repeatable: narrow one quantized site
+    --site-allowed-mxu kind:linear=mxu1                       # ... or every quantized site of a kind
+
+add to `accumulate`:
+
+- `allowed_mxu`: the list, e.g. `["mxu1", "mxu0"]`. The FP8 contractions of every quantized site
+  (Linear, Conv2d im2col, attention q.k^T and p.v) may run on any listed unit. The order is a
+  preference, not a requirement.
+- `allowed_mxu_semantics`: that sentence, in the file.
+- `k_order`: `order: ascending`, `tile: 32` and its description. K is consumed in ascending index of
+  the stored operand layout: the column order of `<fqn>.weight_codes`, after any export-time
+  permutation such as [`k_order`](tile-aware.md#k-order). For attention q.k^T, K is the head dim;
+  for p.v, the key position; for a Conv2d, the im2col column. K is cut into instructions of 32
+  consecutive k. The first starts from +0, and each later one continues from the previous
+  instruction's BF16 partial. A short final instruction is zero-padded; a zero product leaves the
+  partial unchanged on both units.
+- `units`: per listed unit, the table row above.
+
+A site given with `--site-allowed-mxu` gets its own `allowed_mxu` (a subset of the global list).
+`kind:linear`, `kind:conv2d` and `kind:attention` select every quantized site of that kind; an exact
+site name wins over its kind. The export refuses an unknown unit, a repeated unit, a name that is
+not a quantized site of the export, an unknown kind or a kind with no quantized site, a site list
+outside the global list, and `--site-allowed-mxu` without `--allowed-mxu`. The loader
+and the FX capture ignore the fields (the capture copies them into `fx/policy.json`). The emulation
+of either unit is `reference_hw --mxu ipt|sa`.
+
+The ports agree bit for bit with the backend's own arithmetic library
+(`atlas_ref.arithmetic.matmul_codes(unit="mxu0" | "mxu1")`) on random and real operands, including
+K not a multiple of 32 (`tests/test_mxu_atlas_ref.py`, with `ATLAS_REF_DIR` set), with one known
+difference. When a MXU1 tile's integer total has fewer than 8 significant bits (heavy cancellation),
+atlas_ref (merlin 5503777, `MODEL_PIN` npu-model 47b8599d) leaves the BF16 significand unnormalized.
+npu-model fixed the same behaviour after that pin, in 19caa5c ("normalize IPT sums that cancel below
+eight bits", vectors observed on silicon and in RTL simulation). The port normalizes, and gives the
+silicon words on those vectors (`test_mxu1_cancellation_matches_silicon_vectors`) and the exact value
+of the total (`test_mxu1_small_total_is_exact`).
+
+**Quality of each unit** (`reference_hw --mxu ipt` = MXU1, `--mxu sa` = MXU0, `atlas_v1_awq_tile_static`
+exports, BF16 / MXU1 / MXU0 on the same windows or frames and on one Blackwell (sm_120) box per model;
+absolute differences; 2026-11-18):
+
+| model | metric | MXU1 - BF16 | MXU0 - BF16 | MXU0 - MXU1 | BF16 seed band (same frames) |
+|---|---|---|---|---|---|
+| TinyLlama | WikiText-2 ppl, 16 x 512 | +0.133 | +0.637 | +0.504 | none (deterministic) |
+| SmolVLA LIBERO | action MSE, 64 frames | +0.00160 | +0.00572 | +0.00412 | width 0.00043 |
+| Multi-Task DiT | action MSE, 24 frames | +0.0086 | +0.0076 | -0.0010 | width 0.018 |
+
+MXU0 for every contraction is not acceptable for TinyLlama or SmolVLA. On DiT the eval is too noisy to tell
+the units apart by MSE, and MXU0's actions are as far from BF16 as a different sampling seed. The loss comes from the
+Linear layers. With only attention q.k^T / p.v on MXU0 and Linear on MXU1, TinyLlama moves +0.023 ppl and
+SmolVLA -0.00014 MSE (inside its band). Per call on real operands, MXU0's error is about 5 times MXU1's for Linear K
+of 320 and up: MXU0 rounds the BF16 partial K times, MXU1 K / 32 times. So the default export does not write
+`allowed_mxu`. The export measured safe on TinyLlama and SmolVLA keeps Linear and Conv2d on MXU1 and lets attention
+use both units:
+
+    --allowed-mxu mxu1,mxu0 --site-allowed-mxu kind:linear=mxu1                                     # no quantized Conv2d
+    --allowed-mxu mxu1,mxu0 --site-allowed-mxu kind:linear=mxu1 --site-allowed-mxu kind:conv2d=mxu1   # e.g. SmolVLA
+
+That holds for the lengths measured: p.v with up to 512 keys (TinyLlama) and about 1024 (SmolVLA). MXU0's error
+grows with K for attention too, so longer contexts need their own check. Attention is 0.045 of TinyLlama's MACs
+(512-token windows) and 0.14 of SmolVLA's. DiT's attention was not measured on its own.
 
 ### `manifest.json` (`atlas_torchao.export_manifest.v1`, NEW)
 
@@ -168,6 +245,9 @@ The loader works in six steps:
   0x7F / 0xFF. Exponents equal the modules' `weight_scale_exp`. The BF16 tensors are the post-fold
   ones.
 - **Manifest.** The sha256 values match the files, and a modified file is refused.
+- **Allowed MXU units** (`tests/test_allowed_mxu.py`). Without the flag, the `accumulate` block is the
+  literal old one and no site has `allowed_mxu`. With it, removing the added keys gives back the
+  default policy exactly; site overrides, refusals, the CLI flags and the reload are covered.
 - **CUDA.** A round trip (skipped without CUDA).
 - **SmolVLA.** The real `SmolVLMWithExpertModel` forward on tiny Llama stacks, with `atlas_v1`.
 - **Pi0.** A tiny random `PI0Pytorch` (`tests/pi0_tiny.py`), with `atlas_v1`. Needs the atlas-pi0
