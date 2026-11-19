@@ -284,14 +284,15 @@ def _persistent_export(tmp_path, opts):
 
 
 @pinned
-def test_cli_captures_decode_step_and_layer(tmp_path):
+def test_cli_captures_prefill_decode_step_and_layer(tmp_path):
     import os
     import subprocess
     import sys
     from pathlib import Path
 
     d, config_dir = _persistent_export(tmp_path, FP8)
-    for boundary, extra in (("causal_lm_decode_step", ["--host-embeddings"]), ("causal_lm_decode_layer", ["--layer", "1"])):
+    for boundary, extra in (("causal_lm_prefill", ["--all-logits"]), ("causal_lm_decode_step", ["--host-embeddings"]),
+                            ("causal_lm_decode_layer", ["--layer", "1"])):
         out = tmp_path / boundary
         done = subprocess.run([sys.executable, str(Path(fx_export.__file__).resolve()), "--export-dir", str(d), "--model",
                                str(config_dir), "--out-dir", str(out), "--seqlen", str(P), "--capacity", str(C),
@@ -302,6 +303,12 @@ def test_cli_captures_decode_step_and_layer(tmp_path):
         report = json.loads((out / "verification.json").read_text())
         assert report["status"] == "passed" and report["provenance"]["capacity"] == C
         assert report["fresh_process_reload"]["model_replay_modules_imported"] == []
+        if boundary == "causal_lm_prefill":       # all-position logits, then 2 x 2 K / V of the prompt's slots
+            parity = json.loads((out / "parity.json").read_text())
+            from safetensors.torch import load_file
+            fixtures = load_file(str(out / "fixtures.safetensors"))
+            outs = [fixtures[k] for k in parity["cases"][0]["outputs"]]
+            assert list(outs[0].shape) == [1, P, 128] and [list(t.shape) for t in outs[1:]] == [[1, 2, P, 16]] * 4
 
 
 @pinned
