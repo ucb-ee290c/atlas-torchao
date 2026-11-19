@@ -178,8 +178,16 @@ def main():
     if args.kl:
         kl_ref = load_llama(args.model, seqlen=args.seqlen, device=args.device)  # the bf16 reference
         result["kl"] = {}
-    for mode in args.modes:
-        if args.from_export and mode != "bf16":
+    import quant_modes
+
+    kept = None          # (model, algo record) of ref_conv, kept for a following native_fp8 (NEW)
+    for i_mode, mode in enumerate(args.modes):
+        shared = kept is not None and quant_modes.can_share_native(args.modes, i_mode)
+        if shared:
+            # NEW: the same quantized model (codes, exponents, calibration) with the FP8 kernels switched in
+            model, ref_mode, ref_algo_rec = kept
+            result["layers"][mode] = quant_modes.share_native(model, result["layers"][ref_mode], args)
+        elif args.from_export and mode != "bf16":
             import exporter.load_quantized as load_quantized
 
             # no calibration, no float weights of the quantized layers (docs/algos/export.md)
@@ -189,16 +197,22 @@ def main():
                                      "exported_mode": man["exported_mode"], "algo": man["recipe"]["algo"]}
         else:
             model = load_llama(args.model, seqlen=args.seqlen, device=args.device)  # fresh weights per mode
+        kept = None
         he_rec = None
-        if not he_default and not args.from_export:
+        if not he_default and not args.from_export and not shared:
             he_rec = head_embed.prepare(model, he_opts)           # the tie, before calibration
-        if mode != "bf16" and not args.from_export:
+        if mode != "bf16" and not args.from_export and not shared:
             result["layers"][mode] = algos.quantize(model, mode, skip=skip, options=args,
                                                     algo=algo, calib=calib)
         if he_rec is not None:
             if mode == "bf16" and he_opts["lm_head"] == "fp8":
                 head_embed.quantize_head_reference(model)        # no recipe in bf16: the reference rule
             he_rec = head_embed.finish(model, he_opts, he_rec)
+            result["head_embed"]["modes"][mode] = he_rec
+        elif shared and not he_default and not args.from_export:
+            # the kept ref_conv model already holds the tie and the storage modules (a second finish would re-wrap
+            # them); its fp8 head is a RefQuantLinear, switched to the FP8 kernels by share_native like every Linear
+            he_rec = {**result["head_embed"]["modes"][ref_mode], "shared_from_mode": ref_mode}
             result["head_embed"]["modes"][mode] = he_rec
         if mode == export_mode and "export" not in result:
             man = quant_export.export(
@@ -209,7 +223,8 @@ def main():
                 calib_batches=calib_cache[0][0] if calib_cache else None,
                 calib_record=calib_cache[0][1] if calib_cache else None,
                 allow_uncalibrated_fallback=getattr(args, "allow_uncalibrated_fallback", False),
-                head_embed=None if he_default else head_embed.export_record(he_opts, he_rec))
+                head_embed=None if he_default else head_embed.export_record(he_opts, he_rec),
+                **quant_export.allowed_mxu_kwargs(args))
             result["export"] = {"dir": args.export_dir, "mode": mode, "files": man["files"]}
             if args.export_only:
                 break
@@ -219,7 +234,8 @@ def main():
             rec = hw_two_term.apply(model, mode, args.act_two_term)
             if rec is not None:
                 result.setdefault("hw_two_term", {})[mode] = rec
-        result["algo"][mode] = algos.entry_record(result["layers"].get(mode), mode, args.algo)
+        result["algo"][mode] = ({**ref_algo_rec, "shared_from_mode": quant_modes.SHARED_NATIVE_FROM} if shared
+                                else algos.entry_record(result["layers"].get(mode), mode, args.algo))
         result["ladder"][mode] = (result["layers"][mode]["ladder"] if mode != "bf16"
                                   else ladder_record("bf16", {}, args))
         eq = result["ladder"][mode].get("equivalent_to")
@@ -263,6 +279,8 @@ def main():
                 print(f"  {mode} rmse {row['component']}: layers {row['n_layers']}  "
                       f"mean_rel_rmse {row['mean_rel_rmse']:.4e}  "
                       f"mean_cumulative_rel_rmse {row['mean_cumulative_rel_rmse']:.4e}", flush=True)
+        if quant_modes.can_share_native(args.modes, i_mode + 1):
+            kept = (model, mode, result["algo"][mode])
         del model
         if args.device.startswith("cuda"):
             torch.cuda.empty_cache()

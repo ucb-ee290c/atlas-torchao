@@ -357,6 +357,9 @@ def test_loop_manifest_and_composition_scripts(tmp_path, opts):
     assert loop["causal_lm"]["lm_head"] == ("quantized" if opts == FP8 else "skipped")
     for bundle in bundles.values():
         (bundle / "loop_manifest.json").write_bytes(out.read_bytes())
+    for other in ("smolvla", "dit"):          # a causal-LM bundle is refused under another model family
+        with pytest.raises(SystemExit, match="causal_lm"):
+            compose.main([other, str(bundles["prefill"]), str(bundles["decode_step"]), str(tmp_path / "x.json")])
     result = tmp_path / "compose.json"
     assert compose.main(["causal_lm", str(bundles["prefill"]), str(bundles["decode_step"]), str(result),
                          "--reference-cache", str(tmp_path / "refs.safetensors")]) == 0

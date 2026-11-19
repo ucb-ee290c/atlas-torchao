@@ -30,7 +30,7 @@ OPTION_SETS = [
 ]
 
 
-def _export(tmp_path, opts, spec=SPEC, name="export"):
+def _export(tmp_path, opts, spec=SPEC, name="export", **kw):
     m = tiny_llama(2)
     algo = algos.make(spec)
     batches, calib = _calib()
@@ -42,7 +42,7 @@ def _export(tmp_path, opts, spec=SPEC, name="export"):
     quant_export.export(m, d, mode="ref_conv", report=rep, algo=algo, algo_spec=spec, options=dict(FAST),
                         skip=skip, model_record={"kind": "causal_lm", "id": "tiny"}, calib_batches=batches,
                         calib_record={"source": "test"},
-                        head_embed=None if he.is_default(opts) else he.export_record(opts, rec))
+                        head_embed=None if he.is_default(opts) else he.export_record(opts, rec), **kw)
     return m, d
 
 
@@ -292,3 +292,49 @@ def test_table_decodes_equal_bit_decodes():
     assert torch.equal(emb._fp8_rows(codes, exp), rn.dequantize(codes, exp))
     pair = he.e2m1_pair_table()
     assert torch.equal(pair[codes.long()].reshape(16, 32), he.e2m1_table()[he.unpack_codes(codes).long()])
+
+
+# --- with the allowed MXU units and native_fp8 ---------------------------------------------------
+
+def test_allowed_mxu_covers_the_fp8_head(tmp_path):
+    """--lm-head fp8: the head is an ordinary quantized Linear, so kind:linear (and an exact name) select it."""
+    opts = {"tie": "none", "lm_head": "fp8", "embedding": "fp8"}
+    _, d = _export(tmp_path, opts, allowed_mxu=["mxu1", "mxu0"], site_allowed_mxu={"kind:linear": ["mxu1"]})
+    sites = json.loads((d / "policy.json").read_text())["sites"]
+    assert sites["lm_head"]["kind"] == "linear" and sites["lm_head"]["allowed_mxu"] == ["mxu1"]
+    assert sites["model.embed_tokens"]["kind"] == "embedding" and "allowed_mxu" not in sites["model.embed_tokens"]
+    _, d = _export(tmp_path, opts, name="exact", allowed_mxu=["mxu1", "mxu0"], site_allowed_mxu={"lm_head": ["mxu0"]})
+    assert json.loads((d / "policy.json").read_text())["sites"]["lm_head"]["allowed_mxu"] == ["mxu0"]
+
+
+@pytest.mark.parametrize("site", ["lm_head", "model.embed_tokens"])
+def test_allowed_mxu_refuses_storage_sites(tmp_path, site):
+    """An NVFP4 head (weight-only) and a quantized embedding (a lookup) run no FP8 contraction."""
+    opts = {"tie": "none", "lm_head": "nvfp4", "embedding": "nvfp4"}
+    with pytest.raises(ValueError, match="quantized storage"):
+        _export(tmp_path, opts, allowed_mxu=["mxu1"], site_allowed_mxu={site: ["mxu1"]})
+    _, d = _export(tmp_path, opts, name="kind", allowed_mxu=["mxu1"], site_allowed_mxu={"kind:linear": ["mxu1"]})
+    sites = json.loads((d / "policy.json").read_text())["sites"]
+    assert sites["lm_head"]["kind"] == "nvfp4_linear" and "allowed_mxu" not in sites["lm_head"]
+
+
+@pytest.mark.parametrize("opts", [OPTION_SETS[6], OPTION_SETS[7], OPTION_SETS[4]], ids=he.label)
+def test_share_native_switches_the_fp8_head(opts):
+    """native_fp8 sharing a ref_conv model with the head / embedding options installed: the fp8 head is switched to
+    the kernels like every Linear, the storage modules are not, and the digest equals ref_conv's (taken before
+    head_embed.finish installed the embedding). No forward pass, so this runs without a GPU."""
+    import quant_modes
+    from reference.native_fp8 import NativeFP8
+
+    m = tiny_llama(2)
+    algo = algos.make(SPEC)
+    _, calib = _calib()
+    rec = he.prepare(m, opts)
+    rep = algos.quantize(m, "ref_conv", he.skip_for(opts), dict(FAST), algo=algo, calib=calib)
+    he.finish(m, opts, rec)
+    rep.pop("algo", None)
+    new = quant_modes.share_native(m, rep, dict(FAST))
+    assert new["shared_quantization"]["weight_codes_sha256_equal"]
+    assert new["shared_quantization"]["switched"]["linear"] == 2 * 7 + 1
+    assert isinstance(m.get_output_embeddings().fm, NativeFP8)
+    assert not hasattr(m.get_input_embeddings(), "fm")
