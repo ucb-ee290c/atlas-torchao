@@ -4,10 +4,17 @@ Two functional models, both bit-exact ports of the reference sources at pi0-quan
 
     sa_linear   mxu0, the systolic array (func_models_sa/systolic_c: systolic_array_model.h,
                 sa_linear.h == systolic_array_linear.h, systolic_array_rtl_linear.py)
-    ipt_linear  mxu1, the inner-product trees, with two variants
+    ipt_linear  mxu1, the inner-product trees, with three variants
                   "numba"  funct_models_ipt/ipt_numba (_numba_kernels.py, ipt_rtl_linear.py),
                            the reference author's choice and the default
                   "c"      funct_models_ipt/ipt_c (inner_product_trees_model.h, ipt_linear.h)
+                  "model47" NEW: the Atlas backend's pinned arithmetic, npu-model 47b8599
+                           (npu_model/configs/rtl_math.py ipt_row) and its independent reference
+                           (rotary-host/reference/atlas_ref/arithmetic.py _inner_chunk). Same as
+                           "numba" except a tile total with fewer than 8 significant bits, see
+                           _aligned_to_bf16_once. npu-model 19caa5c ("fix(rtl_math): normalize IPT
+                           sums that cancel below eight bits", from silicon / RTL vectors) moved
+                           npu-model to the "numba" behaviour; "model47" reproduces the old pin.
 
 Call contract (src/mxu/accum_backends.py; pi0_inout/functional_models.py:7-12):
 
@@ -521,10 +528,13 @@ def _ipt_consts(vec_len: int, variant: str):
         # (InnerProductTreeParams.intWidth = 8 + headroom + 17, ipt_numba/params_and_requests.py:81-86),
         # whatever vec_len the wrapper is given.
         return 7, 32
+    if variant == "model47":
+        # rtl_math.py ipt_row / atlas_ref _inner_chunk: headroom 7, 32-bit integers, any vec_len.
+        return 7, 32
     if variant == "c":
         headroom = (vec_len + 1).bit_length() + 1                 # params_and_requests.h:84-86
         return headroom, 8 + headroom + 15                        # :88-93
-    raise ValueError(f"unknown ipt variant {variant!r}; choose 'numba' or 'c'")
+    raise ValueError(f"unknown ipt variant {variant!r}; choose 'numba', 'c' or 'model47'")
 
 
 def _wrap(v: torch.Tensor, width: int) -> torch.Tensor:
@@ -557,11 +567,18 @@ def _ieee_to_aligned(bits: torch.Tensor, anchor: torch.Tensor, mant_bits: int, e
     return torch.where(zero, 0, val)
 
 
-def _aligned_to_bf16_once(total: torch.Tensor, anchor: torch.Tensor, int_width: int) -> torch.Tensor:
+def _aligned_to_bf16_once(total: torch.Tensor, anchor: torch.Tensor, int_width: int,
+                          normalize_short: bool = True) -> torch.Tensor:
     """ipt_numba _aligned_to_bf16 (_numba_kernels.py:156-167) + _f64_to_bf16_rne (:108-153):
     total * 2^(anchor - (int_width - 1)) rounded once, RNE, to BF16; biased exponent >= 255
     -> +-0x7F7F (:148-149); biased exponent <= 0 -> +0 (:150-151); total 0 -> +0 (:164-165).
-    The value of a 32-bit integer is exact in float64, so the integer RNE here is identical."""
+    The value of a 32-bit integer is exact in float64, so the integer RNE here is identical.
+
+    normalize_short=False (NEW, variant "model47"): a magnitude with fewer than 8 significant bits
+    is not shifted left; its low 7 bits are the mantissa field under the exponent of its leading
+    bit, as npu-model 47b8599 rtl_math.py ipt_row and atlas_ref _inner_chunk do (`shift = max(0,
+    lead - 7)`, `sig & 127`). That needs cancellation down to |total| < 128 in a tile, so the two
+    agree everywhere else."""
     sign = (total < 0).to(torch.int64)
     mag = total.abs()
     bl = _bit_length(mag)
@@ -571,7 +588,7 @@ def _aligned_to_bf16_once(total: torch.Tensor, anchor: torch.Tensor, int_width: 
     half = torch.where(sh > 0, torch.ones_like(sh) << (sh - 1).clamp(min=0), 0)
     up = (sh > 0) & ((rem > half) | ((rem == half) & ((top & 1) == 1)))
     top = top + up.to(torch.int64)
-    top = torch.where(sh == 0, mag << (8 - bl).clamp(min=0), top)
+    top = torch.where(sh == 0, mag << (8 - bl).clamp(min=0) if normalize_short else mag, top)
     rcarry = top >= 256                                                              # :143-145
     top = torch.where(rcarry, top >> 1, top)
     unb = bl - 1 + anchor - (int_width - 1) + rcarry.to(torch.int64)
@@ -664,14 +681,29 @@ def _ipt_tile(xt: torch.Tensor, wt: torch.Tensor, lut: torch.Tensor, addend: tor
     total = _wrap(prod_sum + addend_int, int_width)                                 # :210
     if variant == "numba":
         bf16 = _aligned_to_bf16_once(total, anchor, int_width)
+    elif variant == "model47":
+        bf16 = _aligned_to_bf16_once(total, anchor, int_width, normalize_short=False)
     else:
         bf16 = _aligned_to_bf16_c(total, anchor, int_width)
     return output_conv_stage(bf16, sel, scale_exp)                                  # :211-212
 
 
+_ipt_tile_compiled = None
+
+
+def _get_ipt_tile_compiled():
+    """NEW: torch.compile of one IPT tile (default automatic-dynamic shapes, so the Python-int
+    arguments stay constants), fusing the product gather, alignment and lane sum into one kernel.
+    Integer ops only, as in eager; the tile loop stays in Python."""
+    global _ipt_tile_compiled
+    if _ipt_tile_compiled is None:
+        _ipt_tile_compiled = torch.compile(_ipt_tile)
+    return _ipt_tile_compiled
+
+
 def ipt_linear_bits(x: torch.Tensor, w: torch.Tensor, b: Optional[torch.Tensor] = None, *,
                     vec_len: int = 32, variant: str = "numba", scale_exp: int = 0,
-                    out_fmt_sel=OUT_BF16,
+                    out_fmt_sel=OUT_BF16, compile: Optional[bool] = None,
                     chunk_elems: int = _DEFAULT_CHUNK_ELEMS) -> torch.Tensor:
     """Raw output words (int32 holding uint16) of the IPT linear call.
 
@@ -684,7 +716,12 @@ def ipt_linear_bits(x: torch.Tensor, w: torch.Tensor, b: Optional[torch.Tensor] 
         the previous tile's output word as BF16 psum (UsePsum) (ipt_linear.h:147-165, 199-200;
         ipt_rtl_linear.py:266-292). With OutE4M3 that feedback is the E4M3 byte read as BF16.
       - lanes are independent, so num_lanes and output tiling cannot change values.
+    variant "model47" (NEW): "numba" with the Atlas backend's short-total conversion
+    (_aligned_to_bf16_once). compile (NEW, default ATLAS_ACCUM_COMPILE as for sa_linear_bits):
+    run each tile through torch.compile; same integer ops, so the same words.
     """
+    compile = _compile_default() if compile is None else compile
+    tile_fn = _get_ipt_tile_compiled() if compile else _ipt_tile
     xb, wb, bb, out_shape = _prepare(x, w, b)
     B, M, K = xb.shape
     N = wb.shape[1]
@@ -711,8 +748,8 @@ def ipt_linear_bits(x: torch.Tensor, w: torch.Tensor, b: Optional[torch.Tensor] 
                 addend, kind = torch.zeros(B, M, n1 - n0, dtype=torch.int64, device=device), 0
             else:
                 addend, kind = acc, 2
-            acc = _ipt_tile(xt, wt, lut, addend, kind, headroom, int_width, variant,
-                            sel, scale_exp).to(torch.int64)
+            acc = tile_fn(xt, wt, lut, addend, kind, headroom, int_width, variant,
+                          sel, scale_exp).to(torch.int64)
         out[:, :, n0:n1] = acc.to(torch.int32)
     return out.reshape(out_shape)
 

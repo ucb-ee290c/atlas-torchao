@@ -485,7 +485,9 @@ def test_dit_patch_embedding_exception_stays_a_visible_bf16_conv(tmp_path):
     (row,) = inspection["bf16_by_policy"]
     assert row["site"] == DIT_PATCH and row["status"] == "host" and row["in_graph"]
     assert row["weight_dtype"] == "bfloat16" and row["contraction_nodes"]
-    assert inspection["native_fp8_conv2d_sites"] == 1 and inspection["native_fp8_linear_sites"] == 1
+    # the quantized 1x1 Conv2d after it is a patch-row qlinear (stride == kernel, no padding: conv_patch_rows)
+    assert inspection["native_fp8_conv2d_sites"] == 0 and inspection["native_fp8_linear_sites"] == 2
+    assert inspection["native_fp8_conv2d_patch_row_sites"] == [DIT_PATCH + "_extra"]
     assert row["module"] not in {r["module"] for r in inspection["weight_site_bindings"]}
     program = torch.export.load(tmp_path / "fx" / "model.pt2")
     patch_nodes = [n for n in program.graph.nodes if n.op == "call_function"
