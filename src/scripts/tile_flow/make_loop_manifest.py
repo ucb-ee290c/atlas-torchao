@@ -358,22 +358,24 @@ def causal_manifest(prefill_bundle, step_bundle, decode_steps):
                       "layers": layers, "n_heads": config.num_attention_heads, "n_kv_heads": kv_heads, "head_dim": head_dim,
                       "hidden": config.hidden_size, "vocab": config.vocab_size, "host_embeddings": host_emb},
         "kv_cache": {"names": names, "dtype": "BF16", "capacity": capacity,
-                     "layout": "[batch, n_kv_heads, position, head_dim]: post-RoPE, pre-GQA K / V (transformers DynamicCache "
+                     "layout": "[batch, n_kv_heads, position, head_dim]: post-RoPE, pre-GQA K / V (transformers StaticCache "
                                "layout); one buffer per name, slot p holds position p",
                      "per_tensor_shape": [1, kv_heads, capacity, head_dim], "tensors": len(names),
                      "bytes_per_token": bytes_per_token, "bytes_total": bytes_per_token * capacity,
                      "initial_value": "every byte zero (+0.0)",
-                     "unused_slots": "must hold +0.0: the attention K / V operand exponents are dynamic per (batch, head) over "
-                                     "all C + 1 keys, masked or not; a zero never raises the amax, so the result equals "
-                                     "attention over the L + 1 valid keys"},
+                     "unused_slots": "must hold +0.0 (as StaticCache's zero-initialised buffers): the attention K / V operand "
+                                     "exponents are dynamic per (batch, head) over all C keys, masked or not, and a zero "
+                                     "never raises the amax; the decode step also relies on slot L being zero "
+                                     "(cache + slot * new)",
+                     "attention_keys": f"all {capacity} slots in both graphs, as LlamaAttention on a StaticCache"},
         "graphs": {
             "prefill": {"boundary": "causal_lm_prefill", "bundle": str(pb.resolve()), "prefill_length": length,
                         "calls_per_sequence": 1, "all_logits": p.get("all_logits", False),
-                        "inputs": _named_specs(pb / "fx", "input", [first, "attention_mask", "cos", "sin"]),
+                        "inputs": _named_specs(pb / "fx", "input", [first, "attention_mask", "cos", "sin"] + names),
                         "outputs": _named_specs(pb / "fx", "output", ["logits"] + names)},
             "decode_step": {"boundary": "causal_lm_decode_step", "bundle": str(sb.resolve()),
                             "calls_per_sequence": f"up to {decode_steps} (one per generated token after the first)",
-                            "inputs": _named_specs(sb / "fx", "input", [first, "attention_mask", "cos", "sin"] + names),
+                            "inputs": _named_specs(sb / "fx", "input", [first, "attention_mask", "cos", "sin", "slot"] + names),
                             "outputs": _named_specs(sb / "fx", "output", ["logits"] + [f"new_{n}" for n in names])}},
         "host": {
             "embeddings": ({"recipe": "BF16 table rows (F.embedding)" if emb_site.get("status") != "quantized" else
@@ -385,18 +387,27 @@ def causal_manifest(prefill_bundle, step_bundle, decode_steps):
             "rope": {"table": f"cos, sin BF16 [1, {capacity}, {head_dim}] = model.model.rotary_emb(x_bf16, positions "
                               f"0..{capacity - 1}) (fx_export.causal_rope_tables)", "rope": rope,
                      "prefill_rows": f"0..{length - 1}", "decode_row": "L (the cache length before the step)"},
-            "prefill_mask": f"BF16 [1, 1, {length}, {length}]: 0 on and below the diagonal, BF16 min (0xFF7F) above "
-                            "(fx_export.causal_prefill_mask = create_causal_mask, eager)",
-            "decode_mask": f"BF16 [1, 1, 1, {capacity + 1}]: 0 on slots 0..L-1 and on key {capacity} (the new token), "
-                           f"BF16 min (0xFF7F) on slots L..{capacity - 1} (fx_export.causal_decode_mask)",
-            "cache_write": "after the prefill: slots 0..P-1 <- its K / V; after a step at length L: slot L <- the new K / V, "
-                           "then L += 1 (fx_export.causal_cache_write); the graphs never write their inputs"},
+            "prefill_mask": f"BF16 [1, 1, {length}, {capacity}]: 0 where key <= query, BF16 min (0xFF7F) elsewhere "
+                            "(fx_export.causal_prefill_mask = create_causal_mask, eager, StaticCache)",
+            "prefill_cache": "the zeroed cache buffers (the graph attends over its new K / V in slots 0..P-1 and the "
+                             "cache's slots P..C-1)",
+            "decode_mask": f"BF16 [1, 1, 1, {capacity}]: 0 on slots 0..L (L: the new token), BF16 min (0xFF7F) on slots "
+                           f"L+1..{capacity - 1} (fx_export.causal_decode_mask = create_causal_mask, StaticCache)",
+            "decode_slot": f"BF16 [1, 1, {capacity}, 1]: 1.0 at slot L, 0 elsewhere (fx_export.causal_decode_slot); the "
+                           "step attends over cache + slot * new",
+            "cache_write": "zero every buffer, after the prefill: slots 0..P-1 <- its K / V; after a step at length L: "
+                           "slot L <- the new K / V, then L += 1 (fx_export.causal_cache_write); the graphs never write "
+                           "their inputs"},
         "loop": {"kind": "greedy", "decode_steps": decode_steps, "max_new_tokens": decode_steps + 1,
                  "token": "torch.argmax(logits, dim=-1) over the BF16 [batch, vocab] logits (first index on ties)",
                  "stop": "after the EOS token or after decode_steps steps", "eos_token_id": generation.get(
                      "eos_token_id", config.eos_token_id), "generation_config": generation,
                  "library_loop": "transformers GenerationMixin.generate(do_sample=False, use_cache=True, max_new_tokens="
-                                 f"{decode_steps + 1}) on the quantized model rebuilt from the export (DynamicCache)",
+                                 f"{decode_steps + 1}, past_key_values=StaticCache(max_cache_len={capacity})) on the "
+                                 "quantized model rebuilt from the export (fx_export.causal_generate)",
+                 "dynamic_cache_note": "generate's default DynamicCache attends over the L + 1 valid keys; its float32 "
+                                       "Q.K^T / P.V sums can round differently from the C-key sums, so it is not the loop "
+                                       "the graphs reproduce word for word",
                  "host_loop": "fx_export.causal_host_loop"},
     }
 

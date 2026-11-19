@@ -181,8 +181,10 @@ def compose_causal(a):
     """Causal-LM token loop (fx_export.CausalPrefill / CausalDecodeStep bundles, loop_manifest.json "causal_lm"):
       (1) each saved graph replays its recorded fixture cases word for word, from host inputs rebuilt from the prompts;
       (2) per prompt, the host loop (causal_host_loop: prefill once, decode_steps greedy steps, fixed-capacity cache) over
-          the saved graphs against transformers' generate(do_sample=False) on the quantized model rebuilt from the export:
-          tokens and every logit word;
+          the saved graphs against transformers' generate(do_sample=False) on the quantized model rebuilt from the export,
+          with a StaticCache of the manifest's capacity (decides `ok`): tokens and every logit word; with
+          --dynamic-reference-cache also against generate's default DynamicCache loop (reported, not decided on: its
+          attention contracts over L + 1 keys, the graphs' over C, and the float32 sums can round differently);
       (3) the step is pure (same inputs twice, inputs unchanged; no mutated user input in the signature);
       (4) the K / V shapes and dtypes against the manifest; graph census."""
     from safetensors.torch import load_file, save_file
@@ -221,6 +223,9 @@ def compose_causal(a):
                      and bool(c["embedding_nodes"]) == (not lm["host_embeddings"]) for c in res["graphs"].values())
     ref_cache = Path(a.reference_cache) if a.reference_cache else None
     refs = load_file(str(ref_cache)) if ref_cache and ref_cache.is_file() else {}
+    dyn_cache = Path(a.dynamic_reference_cache) if a.dynamic_reference_cache else None
+    dyn_refs = load_file(str(dyn_cache)) if dyn_cache and dyn_cache.is_file() else {}
+    res["library_loop"] = f"generate(do_sample=False) on StaticCache(max_cache_len={geometry.capacity})"
     with torch.no_grad():
         if embed is not None:
             res["host_embeddings_equal_embed_tokens"] = _bytes_equal(embed(prompts), model.model.embed_tokens(prompts))
@@ -235,26 +240,29 @@ def compose_causal(a):
                 row = {"graph": name, "case": i, "outputs_equal_recorded": len(got) == len(outs) and all(
                     _bytes_equal(x.contiguous(), y) for x, y in zip(got, outs))}
                 if name == "prefill":
-                    rebuilt = fx_export.causal_prefill_inputs(prompts[i:i + 1], rope, embed)
-                    row["inputs_equal_host_rebuilt"] = all(_bytes_equal(x, y) for x, y in zip(rebuilt, ins))
+                    rebuilt = fx_export.causal_prefill_inputs(prompts[i:i + 1], rope,
+                                                              fx_export.causal_empty_cache(geometry), embed)
+                    row["inputs_equal_host_rebuilt"] = len(rebuilt) == len(ins) and all(
+                        _bytes_equal(x, y) for x, y in zip(rebuilt, ins))
                 else:
                     length = int((ins[1] == 0).sum()) - 1
                     rebuilt = fx_export.causal_step_inputs(torch.zeros(1, 1, dtype=torch.int64), length, geometry.capacity,
-                                                           rope, ins[4:], None)
+                                                           rope, ins[5:], None)
                     row["cache_length"] = length
-                    row["mask_rope_equal_host_rebuilt"] = all(_bytes_equal(x, y) for x, y in zip(rebuilt[1:4], ins[1:4]))
-                    row["unused_slots_zero"] = all(not t[:, :, length:].any() for t in ins[4:])
+                    row["mask_rope_slot_equal_host_rebuilt"] = all(_bytes_equal(x, y) for x, y in zip(rebuilt[1:5], ins[1:5]))
+                    row["unused_slots_zero"] = all(not t[:, :, length:].any() for t in ins[5:])
                     row["kv_inputs_match_manifest"] = all(list(t.shape) == kv_spec["per_tensor_shape"] and
-                                                          t.dtype == torch.bfloat16 for t in ins[4:])
+                                                          t.dtype == torch.bfloat16 for t in ins[5:])
                 res["fixtures"].append(row)
                 res["ok"] &= all(v for k, v in row.items() if isinstance(v, bool))
         # (2) host loop over the saved graphs vs generate, per prompt
         for i in indices:
             prompt = prompts[i:i + 1]
             key = hashlib.sha256(prompt.numpy().tobytes()).hexdigest()[:16] + f"_{n_steps}"
+            dyn_key, key = key, key + f"_static{geometry.capacity}"
             t0 = time.time()
             if f"{key}.tokens" not in refs:
-                want_tokens, want_logits = fx_export.causal_generate(model, prompt, n_steps)
+                want_tokens, want_logits = fx_export.causal_generate(model, prompt, n_steps, geometry.capacity)
                 refs[f"{key}.tokens"] = want_tokens.contiguous()
                 refs[f"{key}.logits"] = torch.stack([t.contiguous() for t in want_logits])
                 if ref_cache:
@@ -273,6 +281,21 @@ def compose_causal(a):
                    "tokens": tokens[0].tolist(),
                    "kv_matches_manifest": len(cache) == kv_spec["tensors"] and all(
                        list(t.shape) == kv_spec["per_tensor_shape"] and t.dtype == torch.bfloat16 for t in cache)}
+            if dyn_cache is not None:    # generate's default DynamicCache loop (reported)
+                if f"{dyn_key}.tokens" not in dyn_refs:
+                    dyn_tokens, dyn_logits = fx_export.causal_generate(model, prompt, n_steps)
+                    dyn_refs[f"{dyn_key}.tokens"] = dyn_tokens.contiguous()
+                    dyn_refs[f"{dyn_key}.logits"] = torch.stack([t.contiguous() for t in dyn_logits])
+                    save_file(dyn_refs, str(dyn_cache))
+                dyn_tokens, dyn_logits = dyn_refs[f"{dyn_key}.tokens"], list(dyn_refs[f"{dyn_key}.logits"])
+                dd = [_words_differing(x, y) for x, y in zip(logits, dyn_logits)]
+                st = [_words_differing(x.to(torch.bfloat16), y) for x, y in zip(want_logits, dyn_logits)]
+                row["dynamic_cache_generate"] = {
+                    "tokens_equal": torch.equal(tokens, dyn_tokens), "logit_words_differing_per_token": dd,
+                    "first_differing_token": next((j for j, x in enumerate(dd) if x), None),
+                    "max_abs_diff": max(float((x.float() - y).abs().max()) for x, y in zip(logits, dyn_logits)),
+                    "static_generate_vs_dynamic_generate_first_differing_token": next(
+                        (j for j, x in enumerate(st) if x), None)}
             if i == indices[0]:          # (3) purity of the step on the last cache state of this loop
                 args = fx_export.causal_step_inputs(tokens[:, -1:], geometry.prefill_length + tokens.shape[1] - 1,
                                                     geometry.capacity, rope, cache, embed)
@@ -307,6 +330,8 @@ def main(argv=None):
     ap.add_argument("--prompts", type=int, default=None, help="causal_lm: only the first N prompts of host_cases")
     ap.add_argument("--prompt-indices", type=int, nargs="+", default=None, help="causal_lm: only these prompts of host_cases")
     ap.add_argument("--reference-cache", help="causal_lm: safetensors file caching generate's tokens / logits per prompt")
+    ap.add_argument("--dynamic-reference-cache",
+                    help="causal_lm: also compare with generate's default DynamicCache loop (cached / computed here)")
     a = ap.parse_args(argv)
     if a.model == "pi0":
         return compose_pi0(a)

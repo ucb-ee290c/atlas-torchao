@@ -1,13 +1,16 @@
 """Causal-LM inference phases (fx_export.CausalPrefill / CausalDecodeStep / CausalDecodeLayer) on a tiny Llama exported with
 today's static recipe (test_head_embed._export), with the default BF16 head and embedding and with the FP8 head and FP8
 embedding (--lm-head fp8 --embedding fp8):
-  - the prefill's logits and K / V are transformers' own prefill (DynamicCache), the decode step's are transformers' own step
-    on a DynamicCache of the same contents, and the host loop over the two (greedy argmax, fixed-capacity cache, host mask,
-    RoPE rows and embeddings) is generate(do_sample=False) token for token and logit word for logit word;
-  - the host inputs are transformers' (create_causal_mask, rotary_emb, embed_tokens), the step is pure, the capacity only
-    changes masked slots (results identical across capacities), and the per-layer decode boundary chains to the step;
+  - structurally: every attention call of the phases receives the query, keys, values and mask, word for word and shape for
+    shape, that the same call receives in transformers' own static-cache loop (generate on a StaticCache of max_cache_len C),
+    at the prefill and at every decode step;
+  - the host loop over the two phases (greedy argmax, fixed-capacity cache, host mask, slot, RoPE rows and embeddings) is
+    generate(do_sample=False) on that StaticCache token for token and logit word for logit word, and the prefill's logits /
+    K / V and a decode step's are transformers' own forward on a StaticCache;
+  - the host inputs are transformers' (create_causal_mask on a StaticCache, rotary_emb, embed_tokens), the step is pure,
+    and the per-layer decode boundary chains to the step;
   - the captured native-FP8 graphs have no symbolic shape, no RoPE trig, no input mutation (with host embeddings no
-    embedding lookup), replay the same words after save / load, and compose to generate."""
+    embedding lookup), replay the same words after save / load, and compose to the static-cache generate."""
 import json
 
 import pytest
@@ -56,8 +59,14 @@ def _host(model, tensors, policy, host_embeddings, capacity=C):
     return geometry, rope, embed
 
 
+def _static(model, capacity=C):
+    from transformers import StaticCache
+
+    return StaticCache(config=model.config, max_cache_len=capacity)
+
+
 @pytest.mark.parametrize("host_embeddings", [False, True], ids=["ids", "host_embeddings"])
-def test_host_loop_is_generate(exported, host_embeddings):
+def test_host_loop_is_static_cache_generate(exported, host_embeddings):
     opts, model, _, tensors, policy = exported
     geometry, rope, embed = _host(model, tensors, policy, host_embeddings)
     prefill = fx_export.CausalPrefill(model, host_embeddings).eval()
@@ -65,7 +74,7 @@ def test_host_loop_is_generate(exported, host_embeddings):
     with torch.no_grad():
         for prompt in _prompts():
             prompt = prompt[None]
-            want_tokens, want_logits = fx_export.causal_generate(model, prompt, N)
+            want_tokens, want_logits = fx_export.causal_generate(model, prompt, N, C)
             tokens, logits, cache = fx_export.causal_host_loop(prefill, step, prompt, N, geometry, rope, embed)
             assert torch.equal(tokens, want_tokens)
             assert len(logits) == len(want_logits) == N + 1
@@ -74,45 +83,58 @@ def test_host_loop_is_generate(exported, host_embeddings):
             assert all(not buffer[:, :, P + N:].any() for buffer in cache)
 
 
-def test_prefill_is_transformers_prefill(exported):
+def test_attention_receives_what_static_cache_loop_gives(exported, monkeypatch):
+    """Structural: the reference attention (ref_attention.ref_attention, which _hf_attention calls after the GQA
+    expansion) gets byte-identical, same-shape q, k, v and mask from the phases and from generate on a StaticCache,
+    call for call (layers x (prefill + steps)). End-to-end logit equality alone could pass by luck."""
+    import reference.ref_attention as ref_attention
+
+    _, model, _, tensors, policy = exported
+    geometry, rope, _ = _host(model, tensors, policy, False)
+    calls, original = [], ref_attention.ref_attention
+
+    def record(q, k, v, scaling, mask=None, *args, **kwargs):
+        calls.append(tuple(t.clone() for t in (q, k, v, mask)))
+        return original(q, k, v, scaling, mask, *args, **kwargs)
+    monkeypatch.setattr(ref_attention, "ref_attention", record)
+    prompt = _prompts(1)
+    with torch.no_grad():
+        fx_export.causal_generate(model, prompt, 4, C)
+        library, calls[:] = list(calls), []
+        fx_export.causal_host_loop(fx_export.CausalPrefill(model).eval(), fx_export.CausalDecodeStep(model).eval(), prompt,
+                                   4, geometry, rope)
+    assert len(calls) == len(library) == geometry.layers * 5
+    for ours, theirs in zip(calls, library):
+        assert all(_equal(a, b) for a, b in zip(ours, theirs))
+    assert calls[0][1].shape[-2] == calls[-1][1].shape[-2] == C          # C keys at the prefill and at a step
+
+
+def test_prefill_and_step_are_transformers_static_forward(exported):
     _, model, _, tensors, policy = exported
     geometry, rope, _ = _host(model, tensors, policy, False)
     prompt = _prompts(1)
     with torch.no_grad():
-        out = model(prompt, use_cache=True, logits_to_keep=0)
-        last = model(prompt, use_cache=True, logits_to_keep=1)          # what generate's prefill computes
-        got = fx_export.CausalPrefill(model).eval()(*fx_export.causal_prefill_inputs(prompt, rope))
-        every = fx_export.CausalPrefill(model, all_logits=True).eval()(*fx_export.causal_prefill_inputs(prompt, rope))
-    assert _equal(every[0], out.logits)
-    assert _equal(got[0], last.logits[:, -1])
-    want_kv = [t for layer in out.past_key_values.layers for t in (layer.keys, layer.values)]
-    assert len(got) - 1 == len(want_kv) == 2 * geometry.layers
-    assert all(_equal(a, b) for a, b in zip(got[1:], want_kv))
-    assert all(list(t.shape) == [1, geometry.n_kv_heads, P, geometry.head_dim] for t in got[1:])
-
-
-def test_decode_step_is_transformers_step(exported):
-    """One step at length L on the fixed-capacity buffers equals the model's forward of that token on a DynamicCache
-    holding the same L positions: logits, and the new K / V equal the DynamicCache's appended slot."""
-    from transformers import DynamicCache
-
-    _, model, _, tensors, policy = exported
-    geometry, rope, _ = _host(model, tensors, policy, False)
-    prefill, step = fx_export.CausalPrefill(model).eval(), fx_export.CausalDecodeStep(model).eval()
-    prompt = _prompts(1)
-    with torch.no_grad():
-        _, _, cache = fx_export.causal_host_loop(prefill, step, prompt, 3, geometry, rope)
-        length = P + 3
+        cache = _static(model)
+        last = model(prompt, past_key_values=cache, use_cache=True, logits_to_keep=1)   # what generate's prefill computes
+        every = model(prompt, past_key_values=_static(model), use_cache=True, logits_to_keep=0)
+        empty = fx_export.causal_empty_cache(geometry)
+        got = fx_export.CausalPrefill(model).eval()(*fx_export.causal_prefill_inputs(prompt, rope, empty))
+        all_pos = fx_export.CausalPrefill(model, all_logits=True).eval()(*fx_export.causal_prefill_inputs(prompt, rope, empty))
+        assert _equal(got[0], last.logits[:, -1]) and _equal(all_pos[0], every.logits)
+        assert len(got) - 1 == 2 * geometry.layers
+        for i, layer in enumerate(cache.layers):
+            assert _equal(got[1 + 2 * i], layer.keys[:, :, :P]) and _equal(got[2 + 2 * i], layer.values[:, :, :P])
+            assert not layer.keys[:, :, P:].any()
+        assert all(list(t.shape) == [1, geometry.n_kv_heads, P, geometry.head_dim] for t in got[1:])
+        # one step at length P on the same contents
+        kv = fx_export.causal_empty_cache(geometry)
+        fx_export.causal_cache_write(kv, got[1:], 0)
         token = torch.tensor([[5]])
-        got = step(*fx_export.causal_step_inputs(token, length, C, rope, cache))
-        dyn = DynamicCache(config=model.config)
-        for i in range(geometry.layers):
-            dyn.update(cache[2 * i][:, :, :length].clone(), cache[2 * i + 1][:, :, :length].clone(), i)
-        out = model(token, past_key_values=dyn, use_cache=True)
-    assert _equal(got[0], out.logits[:, -1])
-    for i in range(geometry.layers):
-        assert _equal(got[1 + 2 * i], dyn.layers[i].keys[:, :, length:])
-        assert _equal(got[2 + 2 * i], dyn.layers[i].values[:, :, length:])
+        step = fx_export.CausalDecodeStep(model).eval()(*fx_export.causal_step_inputs(token, P, C, rope, kv))
+        out = model(token, past_key_values=cache, use_cache=True)
+    assert _equal(step[0], out.logits[:, -1])
+    for i, layer in enumerate(cache.layers):
+        assert _equal(step[1 + 2 * i], layer.keys[:, :, P:P + 1]) and _equal(step[2 + 2 * i], layer.values[:, :, P:P + 1])
 
 
 def test_host_inputs_are_transformers(exported):
@@ -123,39 +145,38 @@ def test_host_inputs_are_transformers(exported):
     prompt = _prompts(1)
     embeds = model.model.embed_tokens(prompt)
     with torch.no_grad():
-        mask = create_causal_mask(config=model.config, inputs_embeds=embeds, attention_mask=None, past_key_values=None,
+        cache = _static(model)
+        mask = create_causal_mask(config=model.config, inputs_embeds=embeds, attention_mask=None, past_key_values=cache,
                                   position_ids=torch.arange(P)[None])
-        assert _equal(fx_export.causal_prefill_mask(P), mask)
+        assert _equal(fx_export.causal_prefill_mask(P, C), mask)
+        model(prompt, past_key_values=cache, use_cache=True)
+        for length in (P, P + 1):
+            mask = create_causal_mask(config=model.config, inputs_embeds=embeds[:, :1], attention_mask=None,
+                                      past_key_values=cache, position_ids=torch.tensor([[length]]))
+            assert _equal(fx_export.causal_decode_mask(length, C), mask)
+            model(torch.tensor([[3]]), past_key_values=cache, use_cache=True)
         for position in (0, 7, C - 1):          # the row of the table is the model's own per-position computation
             cos, sin = model.model.rotary_emb(embeds[:, :1], torch.tensor([[position]]))
             assert _equal(rope[0][:, position:position + 1], cos) and _equal(rope[1][:, position:position + 1], sin)
         assert _equal(fx_export.causal_token_embedder(tensors, policy)(prompt), embeds)
-    mask = fx_export.causal_decode_mask(10, C)
-    assert mask.shape == (1, 1, 1, C + 1) and mask.dtype == torch.bfloat16
-    assert not mask[..., :10].any() and not mask[..., C].any()
-    assert (mask[..., 10:C] == torch.finfo(torch.bfloat16).min).all()
-    with pytest.raises(ValueError):
-        fx_export.causal_decode_mask(C, C)
+    slot = fx_export.causal_decode_slot(10, C)
+    assert slot.shape == (1, 1, C, 1) and slot.dtype == torch.bfloat16 and slot.sum() == 1 and slot[0, 0, 10, 0] == 1
+    for bad in (C, -1):
+        with pytest.raises(ValueError):
+            fx_export.causal_decode_mask(bad, C)
 
 
-def test_decode_step_is_pure_and_capacity_independent(exported):
+def test_decode_step_is_pure(exported):
     _, model, _, tensors, policy = exported
-    prompt = _prompts(1)
-    results = []
+    geometry, rope, _ = _host(model, tensors, policy, False)
+    prefill, step = fx_export.CausalPrefill(model).eval(), fx_export.CausalDecodeStep(model).eval()
     with torch.no_grad():
-        for capacity in (16, C):
-            geometry, rope, _ = _host(model, tensors, policy, False, capacity)
-            prefill, step = fx_export.CausalPrefill(model).eval(), fx_export.CausalDecodeStep(model).eval()
-            tokens, logits, cache = fx_export.causal_host_loop(prefill, step, prompt, 4, geometry, rope)
-            args = fx_export.causal_step_inputs(tokens[:, -1:], P + 4, capacity, rope, cache)
-            before = [t.clone() for t in args]
-            first, second = step(*args), step(*args)
-            assert all(_equal(a, b) for a, b in zip(first, second))
-            assert all(_equal(a, b) for a, b in zip(args, before))
-            results.append((tokens, logits, first))
-    (t16, l16, s16), (t24, l24, s24) = results
-    assert torch.equal(t16, t24)
-    assert all(_equal(a, b) for a, b in zip(l16, l24)) and all(_equal(a, b) for a, b in zip(s16, s24))
+        tokens, _, cache = fx_export.causal_host_loop(prefill, step, _prompts(1), 4, geometry, rope)
+        args = fx_export.causal_step_inputs(tokens[:, -1:], P + 4, C, rope, cache)
+        before = [t.clone() for t in args]
+        first, second = step(*args), step(*args)
+    assert all(_equal(a, b) for a, b in zip(first, second))
+    assert all(_equal(a, b) for a, b in zip(args, before))
 
 
 def test_decode_layers_chain_to_the_step(exported):
@@ -164,11 +185,12 @@ def test_decode_layers_chain_to_the_step(exported):
     prefill, step = fx_export.CausalPrefill(model).eval(), fx_export.CausalDecodeStep(model).eval()
     with torch.no_grad():
         tokens, _, cache = fx_export.causal_host_loop(prefill, step, _prompts(1), 2, geometry, rope)
-        token, mask, cos, sin, *kv = fx_export.causal_step_inputs(tokens[:, -1:], P + 2, C, rope, cache)
-        want = step(token, mask, cos, sin, *kv)
+        token, mask, cos, sin, slot, *kv = fx_export.causal_step_inputs(tokens[:, -1:], P + 2, C, rope, cache)
+        want = step(token, mask, cos, sin, slot, *kv)
         hidden = model.model.embed_tokens(token)
         for i in range(geometry.layers):
-            hidden, k, v = fx_export.CausalDecodeLayer(model, i).eval()(hidden, cos, sin, mask, kv[2 * i], kv[2 * i + 1])
+            hidden, k, v = fx_export.CausalDecodeLayer(model, i).eval()(hidden, cos, sin, mask, slot, kv[2 * i],
+                                                                         kv[2 * i + 1])
             assert _equal(k, want[1 + 2 * i]) and _equal(v, want[2 + 2 * i])
         logits = model.lm_head(model.model.norm(hidden)).view(1, -1)
     assert _equal(logits, want[0])
@@ -182,12 +204,15 @@ def test_phase_cases(exported):
         cases = fx_export.causal_phase_cases(model, boundary, geometry, 0, "cpu", count=count,
                                              host_embeddings=getattr(boundary, "host_embeddings", False))
         assert len(cases) == count
-        assert len({tuple(t.sum().item() for t in case) for case in cases}) == count
+        assert len({tuple(t.float().sum().item() for t in case) for case in cases}) == count
+        if isinstance(boundary, fx_export.CausalPrefill):
+            assert all(not t.any() for case in cases for t in case[4:])
         if isinstance(boundary, fx_export.CausalDecodeStep):
             lengths = [int((case[1] == 0).sum()) - 1 for case in cases]
             assert lengths == [P, P + 3]
+            assert [int(case[4][0, 0, :, 0].argmax()) for case in cases] == lengths
             assert cases[0][0].shape == (1, 1, geometry.hidden)
-            assert all(not t[:, :, length:].any() for case, length in zip(cases, lengths) for t in case[4:])
+            assert all(not t[:, :, length:].any() for case, length in zip(cases, lengths) for t in case[5:])
 
 
 def _census(program):
@@ -202,7 +227,7 @@ def _census(program):
 
 @pinned
 @pytest.mark.parametrize("host_embeddings", [False, True], ids=["ids", "host_embeddings"])
-def test_phase_graphs_capture_and_compose_to_generate(tmp_path, exported, host_embeddings):
+def test_phase_graphs_capture_and_compose_to_static_cache_generate(tmp_path, exported, host_embeddings):
     opts, model, d, tensors, policy = exported
     geometry, rope, embed = _host(model, tensors, policy, host_embeddings)
     programs = {}
@@ -223,7 +248,7 @@ def test_phase_graphs_capture_and_compose_to_generate(tmp_path, exported, host_e
     with torch.no_grad():
         for prompt in _prompts(2, seed=23):
             prompt = prompt[None]
-            want_tokens, want_logits = fx_export.causal_generate(model, prompt, N)
+            want_tokens, want_logits = fx_export.causal_generate(model, prompt, N, C)
             tokens, logits, _ = fx_export.causal_host_loop(programs["prefill"].module(), programs["step"].module(),
                                                            prompt, N, geometry, rope, embed)
             assert torch.equal(tokens, want_tokens)
@@ -318,8 +343,10 @@ def test_loop_manifest_and_composition_scripts(tmp_path, opts):
     loop = json.loads(out.read_text())
     assert loop["kv_cache"]["per_tensor_shape"] == [1, 2, C, 16] and loop["kv_cache"]["tensors"] == 4
     assert loop["kv_cache"]["bytes_per_token"] == 2 * 2 * 2 * 16 * 2
-    assert [s["shape"] for s in loop["graphs"]["decode_step"]["inputs"][:4]] == [[1, 1, 64], [1, 1, 1, C + 1], [1, 1, 16],
-                                                                                 [1, 1, 16]]
+    assert [s["shape"] for s in loop["graphs"]["decode_step"]["inputs"][:5]] == [[1, 1, 64], [1, 1, 1, C], [1, 1, 16],
+                                                                                 [1, 1, 16], [1, 1, C, 1]]
+    assert [s["shape"] for s in loop["graphs"]["prefill"]["inputs"][:5]] == [[1, P, 64], [1, 1, P, C], [1, P, 16],
+                                                                             [1, P, 16], [1, 2, C, 16]]
     assert loop["causal_lm"]["lm_head"] == ("quantized" if opts == FP8 else "skipped")
     for bundle in bundles.values():
         (bundle / "loop_manifest.json").write_bytes(out.read_bytes())
