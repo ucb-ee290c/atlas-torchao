@@ -263,7 +263,7 @@ outside the evaluated ones for the policies, and DROID or dummy observations for
 
 ## Matrix unit choice: the inner-product tree for every linear layer
 
-Run every Linear on the inner-product tree (MXU1, `--mxu ipt`, the default) and treat the systolic array (MXU0, `--mxu sa`) as an ablation. The RTL gives the reasons (audit: `handoff/HW_AWARE_AUDIT.md`):
+Run every Linear on the inner-product tree (MXU1, `--mxu ipt`, the default) and treat the systolic array (MXU0, `--mxu sa`) as an ablation. The RTL gives the reasons:
 
 - **Rounding.** The IPT aligns all 32 products and the incoming BF16 partial sum to one anchor in a 32-bit integer (17 guard bits below the largest product, shifted-out bits truncated), sums them exactly and rounds once per 32-wide K tile (`AnchorAccumulationTree.scala`). The SA's elaborated PE (`CustomFMA`, `SystolicArrayParams.scala:75`) rounds to BF16 after every one of the 32 adds in a tile. For K = 4416 (138 tiles) that is 138 roundings against 4416, which is the measured +3.8 pt TinyLlama cost and the DiT adaLN degradation of the SA in earlier runs.
 - **Latency.** A matmul takes 35 cycles on MXU1 and 95 on MXU0 (`rtl-timing.md:51`; spec 02 says 96, the RTL-calibrated 95 is used). The issue gap is 32 cycles on both, so throughput per MXU is the same; the IPT is the lower-latency path.

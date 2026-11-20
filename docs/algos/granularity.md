@@ -101,7 +101,7 @@ the repeated group value), `attn=block` (attention q and p per 32 rows of each (
 for `a=block` (flattened row-major `B*T` tokens, partial last block) are specified in
 [tile-aware.md](tile-aware.md). `block32` along K is **not hardware-realizable** (H3).
 
-## Dynamic scale chain (NEW, closes H2; `src/hw_scale.py`, `chip_profile.count_dynamic_scale_chain`)
+## Dynamic scale chain (NEW, closes H2; `src/chip/hw_scale.py`, `chip_profile.count_dynamic_scale_chain`)
 
 The real route from data to a scale register: `vredmax.row`/`vredmin.row` (34 cycles) -> `vstore` (35) ->
 scalar `lhu` of the BF16 amax -> RV32I integer ops -> `sb` of the E8M0 byte -> `seld` (4). The integer step
@@ -127,7 +127,7 @@ variants and cycles only in the vector variant; the per-token factor vector is c
 | # | Question |
 |---|---|
 | H1 | Is the per-row / per-column output vmul the intended rescale path, or is a per-lane scale planned in the pop path? `PopAccBF16` has no scale; `MxuCmd.scaleE8M0` is one per instruction, `MxuBundles.scala:31,47`. |
-| H2 | **Closed in software (NEW, `src/hw_scale.py`).** The VPU has no exponent-extract instruction; the exponent is derived on the RV32I scalar core from the BF16 amax pattern in 10 instructions on the normal path (15 static, 14 worst; 12 and 16 with `lhu` and `sb`): see "Dynamic scale chain". Hardware can still shorten it (an exponent-extract instruction or the unimplemented scale CSR window). |
+| H2 | **Closed in software (NEW, `src/chip/hw_scale.py`).** The VPU has no exponent-extract instruction; the exponent is derived on the RV32I scalar core from the BF16 amax pattern in 10 instructions on the normal path (15 static, 14 worst; 12 and 16 with `lhu` and `sb`): see "Dynamic scale chain". Hardware can still shorten it (an exponent-extract instruction or the unimplemented scale CSR window). |
 | H3 | Per-block scales inside the reduction: is a pop/vmul/push of the partial sum per K tile acceptable, or will the compute request get an exponent input? RTL `ComputeReq` has no scale field, `MxuBundles.scala:60-67`. |
 | H4 | Is the scale encoding E8M0 only? `software-spec.yaml` lists `scale_encoding` and `block_size` as unknown. |
 | H5 | Should FP8Pack keep subnormals? OCP MX requires them. |
