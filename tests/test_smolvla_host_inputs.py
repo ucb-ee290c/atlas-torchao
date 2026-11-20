@@ -533,3 +533,27 @@ def test_fold_identity_nodes_replaces_single_input_cat(tmp_path):
     torch.export.save(program, tmp_path / "p.pt2")
     for p in (program, torch.export.load(tmp_path / "p.pt2")):
         assert torch.equal(p.module()(*args).view(torch.int16), expected.view(torch.int16))
+
+
+# -- CLI: a host-input flag is refused outside the boundaries it applies to --------------------------------------------
+
+@pytest.mark.parametrize("flag,boundary", [
+    ("--host-text-embeddings", "smolvla_text_layers"), ("--host-time-embedding", "smolvla_text_layers"),
+    ("--host-time-embedding", "smolvla_prefix"), ("--host-text-embeddings", "smolvla_denoise_step"),
+    ("--host-rope", "causal_lm"), ("--host-text-embeddings", "causal_lm_layer"),
+    ("--host-time-embedding", "causal_lm_decode_step")])
+def test_cli_refuses_a_host_flag_outside_its_boundaries(tmp_path, capsys, flag, boundary):
+    """Refused right after parsing, before any export is read (the export directory does not exist)."""
+    with pytest.raises(SystemExit) as e:
+        fx_export.main(["--export-dir", str(tmp_path / "missing"), "--out-dir", str(tmp_path / "out"),
+                        "--boundary", boundary, flag])
+    assert e.value.code == 2
+    assert f"{flag} applies to --boundary" in capsys.readouterr().err
+    assert not (tmp_path / "out").exists()
+
+
+def test_cli_host_flag_table():
+    assert fx_export.HOST_FLAG_BOUNDARIES == {
+        "host_rope": ("smolvla_flow_loss", "smolvla_text_layers", "smolvla_prefix", "smolvla_denoise_step"),
+        "host_text_embeddings": ("smolvla_flow_loss", "smolvla_prefix"),
+        "host_time_embedding": ("smolvla_flow_loss", "smolvla_denoise_step")}

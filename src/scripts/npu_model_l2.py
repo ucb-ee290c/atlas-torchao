@@ -6,7 +6,11 @@ npu-model needs Python >= 3.13 (PEP 696 type-parameter defaults in npu_model/isa
 simulator under a 3.14 interpreter (--py314), and does the analytic and bit-for-bit comparisons. The same file is
 the child (`--child`). The simulator checkout is only read; no file is written inside it.
 
-    /scratch2/lorenhung/envs/atlas-lerobot/bin/python -I src/scripts/npu_model_l2.py --py314 <venv314>/bin/python
+    python -I src/scripts/npu_model_l2.py --py314 <venv314>/bin/python --export <export>/model.safetensors \
+        --out <results>/l2_npu_model.json
+
+--export is an atlas_v1 TinyLlama export (its layer-0 weight codes are read). The simulator inputs go to
+<out dir>/l2/work. npu-model is $NPU_MODEL, else the third_party/npu_model submodule.
 
 Kernel (generated here, MXU1 = inner-product tree, weight [N,K] tiles pushed WITHOUT vtrpose.xlu): per output
 strip n, for k in 0..Kt-1: vload A tile(s), vload W tile (burst of `burst` tiles per DMA), vmatpush.weight,
@@ -33,9 +37,7 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 
-NPU_MODEL = os.environ.get("NPU_MODEL", "/scratch2/lorenhung/atlas-npu-rtl/src/npu-model")
-EXPORT = ("/scratch2/lorenhung/atlas-fp8/handoff/atlas_v1/export_smoke/tinyllama/atlas_v1/model.safetensors")
-OUT = Path("/scratch2/lorenhung/atlas-fp8/results/hw-verify/l2")
+NPU_MODEL = os.environ.get("NPU_MODEL", str(HERE.parents[1] / "third_party" / "npu_model"))   # default: the submodule
 TILE = 32
 VA = 0x800                          # VMEM word address (4 B words) of the A region, as the shipped kernels use 0x800
 
@@ -157,12 +159,12 @@ def load_codes(export: str, name: str, n_rows: int, k: int) -> np.ndarray:
         return np.ascontiguousarray(f.get_tensor(name)[:n_rows, :k])
 
 
-def make_case(c: dict, d: Path, seed: int):
+def make_case(c: dict, d: Path, seed: int, export: str):
     import torch
     import reference.ref_numerics as rn
     Nt, Kt, mb = c["Nt"], c["Kt"], c["mb"]
     N, K, M = Nt * TILE, Kt * TILE, mb * TILE
-    w = load_codes(EXPORT, c["tensor"], N, K)                                   # [N, K] uint8 codes, as exported
+    w = load_codes(export, c["tensor"], N, K)                                   # [N, K] uint8 codes, as exported
     g = torch.Generator().manual_seed(seed)
     xf = torch.randn(M, K, generator=g)
     x = rn.e4m3_vpack(xf.to(torch.bfloat16), rn.po2_scale_exp(xf, dims=-1)).to(torch.uint8).numpy()
@@ -196,9 +198,8 @@ def analytic(c: dict):
 def parent(args):
     import torch
     import mxu.accum_torch as at
-    OUT.mkdir(parents=True, exist_ok=True)
-    d = OUT / "work"
-    d.mkdir(exist_ok=True)
+    d = Path(args.out).resolve().parent / "l2" / "work"
+    d.mkdir(parents=True, exist_ok=True)
     layers = {   # name: (tensor, N tiles of the real layer, K tiles)
         "q_proj_2048x2048": ("model.layers.0.self_attn.q_proj.weight_codes", 64, 64),
         "k_proj_256x2048": ("model.layers.0.self_attn.k_proj.weight_codes", 8, 64),
@@ -211,18 +212,18 @@ def parent(args):
             for nrun in (1, 2):
                 c = dict(name=f"{lname}_mb{mb}_n{nrun}", layer=lname, tensor=tensor, mb=mb, Nt=nrun, Kt=Kt, burst=4,
                          Nfull=Nfull, max_cycles=args.max_cycles)
-                meta[c["name"]] = make_case(c, d, seed=11 + Kt + mb)
+                meta[c["name"]] = make_case(c, d, seed=11 + Kt + mb, export=args.export)
                 cases.append(c)
         if args.full:                         # the whole layer (all N tiles); mb=2 only where it is cheap
             for mb in ((1, 2) if lname in ("k_proj_256x2048", "q_proj_2048x2048") else (1,)):
                 c = dict(name=f"{lname}_mb{mb}_full", layer=lname, tensor=tensor, mb=mb, Nt=Nfull, Kt=Kt, burst=4,
                          Nfull=Nfull, max_cycles=args.max_cycles)
-                meta[c["name"]] = make_case(c, d, seed=11 + Kt + mb)
+                meta[c["name"]] = make_case(c, d, seed=11 + Kt + mb, export=args.export)
                 cases.append(c)
     if args.extra_burst1:                     # 1 KiB transfers instead of 4 KiB bursts, one shape
         c = dict(name="q_proj_2048x2048_mb1_n1_burst1", layer="q_proj_2048x2048", tensor=layers["q_proj_2048x2048"][0],
                  mb=1, Nt=1, Kt=64, burst=1, Nfull=64, max_cycles=args.max_cycles)
-        meta[c["name"]] = make_case(c, d, seed=11 + 64 + 1)
+        meta[c["name"]] = make_case(c, d, seed=11 + 64 + 1, export=args.export)
         cases.append(c)
     if args.only:
         cases = [c for c in cases if any(s in c["name"] for s in args.only)]
@@ -301,13 +302,15 @@ def main():
     ap.add_argument("--extra-burst1", action="store_true")
     ap.add_argument("--full", action="store_true", help="also simulate each whole layer (about 20k simulated cycles/s)")
     ap.add_argument("--only", nargs="*", default=None, help="substrings: run only matching cases")
-    ap.add_argument("--out", default=str(OUT.parent / "l2_npu_model.json"))
+    ap.add_argument("--export", default=None, help="model.safetensors of an atlas_v1 TinyLlama export (required)")
+    ap.add_argument("--out", default=None, help="result JSON (required); the simulator inputs go to <its dir>/l2/work")
     args = ap.parse_args()
     if args.child:
         child(args.child)
     else:
-        if not args.py314:
-            ap.error("--py314 is required")
+        for flag in ("py314", "export", "out"):
+            if not getattr(args, flag):
+                ap.error(f"--{flag} is required")
         parent(args)
 
 

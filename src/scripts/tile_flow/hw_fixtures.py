@@ -41,10 +41,11 @@ fixtures.safetensors, so the harness itself is checked on every case. Graph node
 --units runs a subset of units; results already in <out>/fixtures_hw.json for the other units are kept, each
 unit's entry recording the generator commit that produced it.
 
---crosscheck ATLAS_REF_ROOT (the directory holding atlas_ref/) re-computes contraction outputs with atlas_ref's
-own NumPy engine from the operands captured at each call and compares words: a random row x column x
-batch subset of every call, plus all columns of a row block for a stratified sample of calls (first and last
-call of each op kind, the first float32-out qlinear and the first call with K % 32 != 0).
+--crosscheck DIR (the directory holding atlas_ref/, what the tests call $ATLAS_REF_DIR) re-computes
+contraction outputs with atlas_ref's own NumPy engine from the operands captured at each call and compares
+words: a random row x column x batch subset of every call, plus all columns of a row block for a stratified
+sample of calls (first and last call of each op kind, the first float32-out qlinear and the first call with
+K % 32 != 0).
 
 Usage (CPU only):
     CUDA_VISIBLE_DEVICES= python src/scripts/tile_flow/hw_fixtures.py --bundle /path/to/bundle \\

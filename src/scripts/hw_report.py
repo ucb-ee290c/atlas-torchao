@@ -1,7 +1,7 @@
 """Per-layer shape / DMA / MXU / flush report for an Atlas FP8 export, plus the pop-scale applicability table.
 
-    python src/scripts/hw_report.py [--export model.safetensors] [--T 1 32 128 2048] [--mxu ipt|sa]
-                                [--out-json results/hw-verify/hw_report_tinyllama.json] [--out-md -]
+    python src/scripts/hw_report.py --export model.safetensors --out-json hw_report.json
+                                [--T 1 32 128 2048] [--mxu ipt|sa] [--out-md -]
 
 Reads the export's header and uint8 E4M3 code tensors (safetensors), policy.json and manifest.json beside
 it. Weight flush mass is an UPPER BOUND (zero codes = flushed values + true zeros). Activation flush mass
@@ -21,10 +21,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 import chip.hw_cost as hc  # noqa: E402
 import chip.hw_params as hp  # noqa: E402
-
-DEFAULT_EXPORT = ("/scratch2/lorenhung/atlas-fp8/handoff/atlas_v1/export_smoke/tinyllama/atlas_v1/"
-                  "model.safetensors")
-RESULTS = Path("/scratch2/lorenhung/atlas-fp8/results/hw-verify")
 
 
 def read_export(path: Path):
@@ -163,11 +159,12 @@ def fmt_md(rep: dict) -> str:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--export", default=DEFAULT_EXPORT)
+    ap.add_argument("--export", required=True, help="model.safetensors of an atlas_v1 export (policy.json and "
+                                                   "manifest.json beside it)")
     ap.add_argument("--T", type=int, nargs="+", default=[1, 32, 128, 2048])
     ap.add_argument("--T-main", type=int, default=None, help="token count for the per-layer mxu_cycles_T column")
     ap.add_argument("--mxu", choices=("ipt", "sa"), default="ipt")
-    ap.add_argument("--out-json", default=str(RESULTS / "hw_report_tinyllama.json"))
+    ap.add_argument("--out-json", required=True, help="where the full report goes (JSON)")
     ap.add_argument("--out-md", default="-", help="markdown summary table path, or - for stdout")
     args = ap.parse_args()
     rep = build(args)

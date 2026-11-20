@@ -1,7 +1,7 @@
 """Replay npu-model's Verilator trace of VectorEngineTop (tests/rtl/vector_traces.json, no build needed) through
 ChipVPU / ref_numerics and compare every output word.
 
-    python replay_vector_traces.py [--out result.json] [--npu-model DIR]
+    python replay_vector_traces.py [--out result.json] [--npu-model DIR]   (default $NPU_MODEL, else third_party/npu_model)
 
 Harness encoding (NpuModelVectorTraceTest.scala): opcode = list index + 1 over
 add sub mul rcp sqrt sin cos tanh log exp exp2 square cube rsum(vredsum.row) csum(vredsum.bf16) fp8 fp8pack
@@ -18,7 +18,7 @@ Operation semantics replayed here:
   vunpack  out[4+h][r] = BF16 of bytes (h*32+r)*16.. +15 of mem[2] viewed as 32 rows x 32 bytes
 which are checked here by the zero-mismatch result itself; any op that does not replay is reported.
 """
-import argparse, json, sys
+import argparse, json, os, sys
 from collections import defaultdict
 from pathlib import Path
 import torch
@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 import chip.chip_ops as co
 import reference.ref_numerics as rn
 
-NPU_MODEL = "/scratch2/lorenhung/atlas-npu-rtl/src/npu-model"
+NPU_MODEL = str(Path(__file__).resolve().parents[3] / "third_party" / "npu_model")   # the pinned submodule
 NAMES = ["add", "sub", "mul", "rcp", "sqrt", "sin", "cos", "tanh", "log", "exp", "exp2", "square", "cube", "rsum", "csum", "fp8",
          "fp8pack", "fp8unpack", "relu", "rmax", "rmin", "cmax", "cmin", "pairmax", "pairmin", "mov", "vliOne", "vliCol", "vliRow", "vliAll"]
 EDGE = [0, 0x8000, 1, 0x8001, 0x007f, 0x807f, 0x7f80, 0xff80, 0x7fc1, 0xffa1, 0x7f7f, 0xff7f, 0x3f80, 0xbf80, 0x3c80, 0x43ef]
@@ -147,7 +147,7 @@ def replay(npu_model=NPU_MODEL):
 
 
 def main():
-    ap = argparse.ArgumentParser(); ap.add_argument("--out"); ap.add_argument("--npu-model", default=NPU_MODEL)
+    ap = argparse.ArgumentParser(); ap.add_argument("--out"); ap.add_argument("--npu-model", default=os.environ.get("NPU_MODEL", NPU_MODEL))
     a = ap.parse_args()
     rows = replay(a.npu_model)
     tot = sum(r.get("words", 0) for r in rows); bad = sum(r.get("mismatches", 0) for r in rows)

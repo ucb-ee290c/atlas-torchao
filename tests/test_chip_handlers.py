@@ -22,6 +22,7 @@ def close(a, b, rtol=2e-2, atol=1e-2):
     return torch.allclose(a.float(), b.float(), rtol=rtol, atol=atol)
 
 
+@pytest.mark.usefixtures("refs")
 def test_add_alpha_and_inplace():
     r = router()
     x, y = torch.randn(4, 8).bfloat16(), torch.randn(4, 8).bfloat16()
@@ -32,6 +33,7 @@ def test_add_alpha_and_inplace():
     assert ret is z and close(z, x.float() + y.float())
 
 
+@pytest.mark.usefixtures("refs")
 def test_broadcast_both_sides_and_dtype_promotion():
     r = router()
     a = torch.randn(1, 5)
@@ -41,6 +43,7 @@ def test_broadcast_both_sides_and_dtype_promotion():
     assert close(out, a * b.float())
 
 
+@pytest.mark.usefixtures("refs")
 def test_reductions():
     r = router()
     x = torch.randn(2, 3, 70)
@@ -51,6 +54,7 @@ def test_reductions():
     assert torch.equal(run(r, A.amin.default, x, [-1]), x.bfloat16().float().amin(-1))
 
 
+@pytest.mark.usefixtures("refs")
 def test_activations_and_norms():
     r = router()
     x = torch.randn(4, 64).bfloat16()
@@ -65,6 +69,7 @@ def test_activations_and_norms():
     assert close(s, torch.softmax(x.float(), -1), atol=1e-2)
 
 
+@pytest.mark.usefixtures("refs")
 def test_pow_clamp_abs_log():
     r = router()
     x = torch.rand(4, 32) + 0.5
@@ -79,6 +84,7 @@ def test_pow_clamp_abs_log():
     assert close(run(r, A.log.default, x), x.log(), atol=2e-2)
 
 
+@pytest.mark.usefixtures("refs")
 def test_matmuls_on_mxu_and_conv():
     r = router()
     g = torch.Generator().manual_seed(0)
@@ -99,6 +105,7 @@ def test_matmuls_on_mxu_and_conv():
     assert torch.equal(o, torch.arange(4.0).reshape(1, 4, 1).expand(1, 4, 3))
 
 
+@pytest.mark.usefixtures("refs")
 def test_masked_softmax_masks():
     """vexp wraps below -336 (exp(-3.3e38) = 1 in the model); the exp floor keeps the mask a mask."""
     r = router()
@@ -134,6 +141,7 @@ def test_scheduler_style_scalar_times_cuda_sample():
     assert out.device.type == "cuda" and close(out, sample.float() - 0.3)
 
 
+@pytest.mark.usefixtures("refs")
 @pytest.mark.parametrize("func,args", [
     (A.div.Tensor, (torch.tensor(0.0006), torch.tensor(0.0017))),
     (A.rsub.Scalar, (torch.tensor(0.9994), 1)),
@@ -152,6 +160,7 @@ def test_one_element_fp32_schedule_arithmetic_runs_on_the_scalar_core(func, args
     assert r.cov.report()["new_decisions"][0]["op"] == f"{name} (scalar)"
 
 
+@pytest.mark.usefixtures("refs")
 def test_coefficient_times_sample_stays_on_the_vpu():
     r = router()
     coef, sample = torch.tensor(0.3), torch.randn(2, 8)
@@ -160,6 +169,7 @@ def test_coefficient_times_sample_stays_on_the_vpu():
                       {}, None)[0] == "VPU"
 
 
+@pytest.mark.usefixtures("refs")
 def test_ddpm_sampling_on_the_chip_stays_finite():
     """At t = 1 BF16 lanes give beta_prod_t = current_beta_t = 0, and 0 / 0 made the sample NaN."""
     ddpm = pytest.importorskip("diffusers.schedulers.scheduling_ddpm")
@@ -189,6 +199,7 @@ def test_clamp_computes_on_the_device_pytorch_would():
     assert cc._operand_device(zero, zero) is zero
 
 
+@pytest.mark.usefixtures("refs")
 def test_clamp_tensor_bounds_match_torch():
     r = router()
     x = torch.randn(4, 32)

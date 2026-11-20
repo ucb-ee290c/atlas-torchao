@@ -11,8 +11,19 @@ follows is listed in the manifest under `new_decisions`.
 ## When the export is written
 
 The CLI exports the first mode in `--modes` that uses the reference numerics: `ref_linear`,
-`ref_attn`, `ref_conv` / `reference`, `reference_hw`, `chip` or `chip_rope_vpu`. If `ref_conv` is
-present, it wins. All of these modes share the same weights.
+`ref_attn`, `ref_conv` / `reference`, `reference_hw`, `chip`, `chip_rope_vpu` or `native_fp8`. If
+`ref_conv` is present, it wins, also over `native_fp8`. All of these modes share the same weights.
+
+`native_fp8` is an export mode too (it needs a CUDA GPU with FP8 tensor cores). It uses ref_conv's
+operand casts, so it writes the same codes and exponents as the ref_conv export of the same model and
+recipe; only its matmuls run on the FP8 tensor cores. The files name the mode: `exported_mode` and
+`profile` are `native_fp8`, `accumulate.exported_mode_accumulation` names the FP8 kernel instead of
+`framework`, and the manifest's `ladder` is native_fp8's record. `tests/test_native_fp8_export.py`
+(GPU) checks that `--modes bf16 native_fp8 --export-dir` gives model.safetensors tensors byte-identical
+to the ref_conv export, and that policy.json and manifest.json differ only in those fields.
+`load_quantized` rebuilds an export in its `exported_mode` unless it is given a mode: pass
+`mode="ref_conv"` (or `--modes ref_conv` with `--from-export`) to rebuild a native_fp8 export without
+such a GPU. `src/exporter/fx_export.py` always rebuilds in ref_conv.
 
 The export is written right after `algos.quantize`: calibration, folds and algorithm transforms
 have all been applied, and evaluation has not started. Evaluation then runs as usual.

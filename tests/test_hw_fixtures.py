@@ -4,8 +4,10 @@ atlas_ref is pinned to npu-model 47b8599, whose MXU1 leaves a tile total under 8
 hw_fixtures' default MXU1 normalizes it (npu-model 19caa5c, silicon / RTL), so the bit-for-bit comparison uses
 variant "model47" and the short-total case checks both.
 
-atlas_ref (rotary-host/reference/atlas_ref) lives outside this repo: set ATLAS_REF_ROOT to the directory that
-holds atlas_ref/ (the tests skip otherwise). The model47 edge case below needs no reference tree.
+atlas_ref (rotary-host/reference/atlas_ref) lives outside this repo: set ATLAS_REF_DIR to the directory that
+holds atlas_ref/, as for tests/test_mxu_atlas_ref.py (the tests skip otherwise). ATLAS_REF_ROOT is still read when
+ATLAS_REF_DIR is unset, but it is deprecated here: src/layer_rmse.py uses ATLAS_REF_ROOT for the parent of the
+pi0-quant / smolVLA-quant checkouts. The model47 edge case below needs no reference tree.
 """
 
 import os
@@ -22,7 +24,7 @@ sys.path.insert(0, str(REPO / "src" / "scripts" / "tile_flow"))
 
 import mxu.accum_torch as at  # noqa: E402
 
-ROOT = os.environ.get("ATLAS_REF_ROOT")
+ROOT = os.environ.get("ATLAS_REF_DIR") or os.environ.get("ATLAS_REF_ROOT")   # ATLAS_REF_ROOT: deprecated fallback
 
 
 def test_model47_short_total():
@@ -49,7 +51,7 @@ def _codes(rng, shape, cancel=False):
     return c.astype(np.uint8)
 
 
-@pytest.mark.skipif(not ROOT, reason="ATLAS_REF_ROOT not set")
+@pytest.mark.skipif(not ROOT, reason="ATLAS_REF_DIR not set")
 @pytest.mark.parametrize("unit", ["mxu1", "mxu0"])
 @pytest.mark.parametrize("compile", [False, True])
 def test_contraction_matches_atlas_ref(unit, compile):
