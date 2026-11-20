@@ -3050,6 +3050,14 @@ def smolvla_cases(policy, n_images, seed, device, count=2, image_size=None, keep
             for case in smolvla_raw_cases(policy, n_images, seed, device, count, image_size)]
 
 
+# the capture boundaries each host-input flag applies to; main() refuses a flag with any other boundary
+HOST_FLAG_BOUNDARIES = {
+    "host_rope": ("smolvla_flow_loss", "smolvla_text_layers", "smolvla_prefix", "smolvla_denoise_step"),
+    "host_text_embeddings": ("smolvla_flow_loss", "smolvla_prefix"),
+    "host_time_embedding": ("smolvla_flow_loss", "smolvla_denoise_step"),
+}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--export-dir")
@@ -3104,6 +3112,10 @@ def main(argv=None):
     parser.add_argument("--n-images", type=int, default=1, help="cameras at the smolvla_flow_loss / smolvla_prefix boundary")
     parser.add_argument("--verify-dir", help="fresh-process replay of an existing FX bundle")
     args = parser.parse_args(argv)
+    for flag, boundaries in HOST_FLAG_BOUNDARIES.items():
+        if getattr(args, flag) and args.boundary not in boundaries:
+            parser.error(f"--{flag.replace('_', '-')} applies to --boundary {' / '.join(boundaries)}, "
+                         f"not {args.boundary}")
     if args.verify_dir:
         report = verify_saved(args.verify_dir, args.device)
         _json(Path(args.verify_dir) / "fresh_process_verification.json", report)
@@ -3118,11 +3130,7 @@ def main(argv=None):
         if (kind == "causal_lm") != args.boundary.startswith("causal_lm"):
             parser.error(f"export kind {kind!r} does not match --boundary {args.boundary}; the CLI captures causal-LM "
                          "boundaries for a causal-LM export and SmolVLA boundaries for a policy export")
-        smolvla_flags = [f for f, on in (("--host-rope", args.host_rope), ("--host-text-embeddings", args.host_text_embeddings),
-                                         ("--host-time-embedding", args.host_time_embedding)) if on]
         causal_flags = [f for f, on in (("--host-embeddings", args.host_embeddings), ("--all-logits", args.all_logits)) if on]
-        if args.boundary.startswith("causal_lm") and smolvla_flags:
-            parser.error(f"{', '.join(smolvla_flags)} apply to the SmolVLA boundaries, not --boundary {args.boundary}")
         if args.boundary.startswith("smolvla_") and causal_flags:
             parser.error(f"{', '.join(causal_flags)} apply to the causal-LM phase boundaries, not --boundary {args.boundary}")
         if args.boundary.startswith("smolvla_"):
@@ -3153,8 +3161,6 @@ def main(argv=None):
                     cases, boundary = step_cases, SmolVLADenoiseStep(lerobot_policy, args.host_rope,
                                                                      args.host_time_embedding).eval()
             else:
-                if (args.host_text_embeddings or args.host_time_embedding) and args.boundary != "smolvla_flow_loss":
-                    parser.error("--host-text-embeddings / --host-time-embedding apply to --boundary smolvla_flow_loss")
                 # the host token embeddings are computed before the boundary replaces embed_language_tokens
                 cases = smolvla_cases(lerobot_policy, args.n_images, args.seed, args.device, host_rope=args.host_rope,
                                       host_text_embeddings=args.host_text_embeddings,
