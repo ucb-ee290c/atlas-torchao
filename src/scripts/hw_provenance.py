@@ -72,9 +72,11 @@ def build_record(export_dir, results, rtl=None, npu_model=None, torchao=None, co
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--export", required=True)
-    ap.add_argument("--rtl", default="/scratch2/lorenhung/atlas-npu-rtl/src")
-    ap.add_argument("--npu-model", default="/scratch2/lorenhung/atlas-npu-rtl/src/npu-model")
-    ap.add_argument("--torchao", default=str(Path(__file__).resolve().parents[2]))
+    repo = Path(__file__).resolve().parents[2]
+    ap.add_argument("--rtl", required=True, help="the atlas-npu RTL checkout the results were produced with")
+    ap.add_argument("--npu-model", default=str(repo / "third_party" / "npu_model"),
+                    help="the npu-model checkout (default: the third_party/npu_model submodule)")
+    ap.add_argument("--torchao", default=str(repo))
     ap.add_argument("--results", nargs="+", required=True)
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
