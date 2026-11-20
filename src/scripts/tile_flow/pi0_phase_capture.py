@@ -11,10 +11,11 @@ denoising step reading that cache, as two graphs with the host owning the Euler 
 The existing export is reused (read only); capture cases are the existing single-step bundle's fixture inputs.
 usage (PYTHONPATH=<worktree>/src, atlas-pi0 env):
   pi0_phase_capture.py prefix|step --export-dir EXPORT --single-step-bundle BUNDLE --loop-manifest LM --out DIR
-        --openpi-dir OPENPI --checkpoint-dir CKPT [--stack-cameras] [--dry]"""
+        --openpi-dir OPENPI --checkpoint-dir CKPT [--tokenizer-path TOK, default $PALIGEMMA_TOKENIZER] [--stack-cameras] [--dry]"""
 import argparse
 import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -126,11 +127,14 @@ def main(argv=None):
     ap.add_argument("--out", required=True)
     ap.add_argument("--openpi-dir", required=True)
     ap.add_argument("--checkpoint-dir", required=True)
-    ap.add_argument("--tokenizer-path", default="/scratch2/lorenhung/models/big_vision/paligemma_tokenizer.model")
+    ap.add_argument("--tokenizer-path", default=os.environ.get("PALIGEMMA_TOKENIZER"),
+                    help="paligemma_tokenizer.model (default $PALIGEMMA_TOKENIZER)")
     ap.add_argument("--stack-cameras", action="store_true")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--dry", action="store_true")
     a = ap.parse_args(argv)
+    if not a.tokenizer_path:
+        ap.error("--tokenizer-path is required (or set $PALIGEMMA_TOKENIZER)")
     sys.path.insert(0, str(Path(a.single_step_bundle)))            # pi0_fx.py (only for --stack-cameras)
     import exporter.fx_export as fx_export
     import exporter.load_quantized as load_quantized
