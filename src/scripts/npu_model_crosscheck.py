@@ -8,7 +8,7 @@ sides and counts disagreements. Every comparison is bit for bit (NaN compares as
     python src/scripts/npu_model_crosscheck.py [--out result.json] [--npu-model DIR]
 
 Needs torch, the pi0-quant submodule (third_party) and an npu-model checkout (default
-$NPU_MODEL or /scratch2/lorenhung/atlas-npu-rtl/src/npu-model). Only rtl_math.py is imported, by
+$NPU_MODEL, else the third_party/npu_model submodule). Only rtl_math.py is imported, by
 path, so npu-model's own Python requirement does not apply.
 """
 
@@ -29,7 +29,7 @@ import mxu.accum_torch as at  # noqa: E402
 import chip.chip_ops as co  # noqa: E402
 import reference.ref_numerics as rn  # noqa: E402
 
-DEFAULT_NPU_MODEL = "/scratch2/lorenhung/atlas-npu-rtl/src/npu-model"
+DEFAULT_NPU_MODEL = str(Path(__file__).resolve().parents[2] / "third_party" / "npu_model")   # the pinned submodule
 DEFAULT_EXPORT = "/scratch2/lorenhung/atlas-fp8/handoff/atlas_v1/export_smoke/tinyllama/atlas_v1/model.safetensors"
 UNARY_NAMES = {"relu": "relu", "rcp": "rcp", "sqrt": "sqrt", "sin": "sin", "cos": "cos",
                "log": "log", "tanh": "tanh", "exp": "exp", "exp2": "exp2", "square": "square",
