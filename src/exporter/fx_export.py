@@ -1875,7 +1875,8 @@ def capture_fx(module, cases, directory, *, policy, provenance=None, strict=True
                 counter.clear()
                 leaves, spec = _leaves(module(*args))
                 case_calls.append(collections.Counter(counter))
-                outputs = [value.detach().cpu().clone() for value in leaves]
+                # contiguous copies: a phase output may be a transposed view (the K / V of LlamaAttention)
+                outputs = [value.detach().cpu().clone().contiguous() for value in leaves]
                 expected.append((outputs, spec))
                 input_keys = [f"case_{i}.input_{j}" for j in range(len(args))]
                 output_keys = [f"case_{i}.output_{j}" for j in range(len(outputs))]
@@ -2082,6 +2083,361 @@ def causal_layer_cases(model, index, seqlen, seed, device, count=2):
     return cases
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# Causal-LM inference phases for a host-owned token loop: prefill (fills the KV cache) and one decode step
+# ---------------------------------------------------------------------------------------------------------------------
+# Cache (both phases): one K and one V buffer per decoder layer, post-RoPE and pre-GQA, BF16
+# [batch, n_kv_heads, C, head_dim] (C, the capacity, is a capture parameter): transformers' StaticCache layout, slot p
+# holding position p, every slot zero until written. Both graphs attend over all C slots, as LlamaAttention does on a
+# StaticCache (StaticLayer.update returns the whole buffer, create_causal_mask spans max_cache_len): the prefill over
+# [its P new K / V; cache slots P..C-1], a decode step at length L over the cache with its new K / V in slot L
+# (cache + slot * new, the host's one-hot slot; the cache holds zero there). The host mask hides the slots past the
+# current position. The graphs write nothing: their new K / V are outputs, and the host writes them into its buffers.
+# Why C keys and not the L + 1 valid ones: the float32 Q.K^T and P.V contractions of the reference attention round
+# differently for different key counts (the zero products do not change the value, the summation order does), so a
+# static graph equals transformers' static-cache loop word for word, not its DynamicCache loop (L + 1 keys).
+# Unused slots must hold +0.0 (as StaticCache's): the K / V operand exponents are dynamic per (batch, head) over every
+# key, masked or not, and a zero never raises the amax.
+
+def _split_kv(flat):
+    return [(flat[i], flat[i + 1]) for i in range(0, len(flat), 2)]
+
+
+class _CacheStandIn:
+    """past_key_values for LlamaAttention at the phase boundaries (update() is the only method it calls): the keys and
+    values StaticLayer.update returns, computed without writing into the cache inputs.
+
+    past: {layer index: (k, v)}, the host's buffers [B, H_kv, C, D]. Prefill (slot None): P new K / V are slots 0..P-1,
+    so the attention reads cat([new, past[:, :, P:]]) (P is static). Decode step (slot: BF16 [B, 1, C, 1], 1.0 at the
+    write position L, 0 elsewhere): past + slot * new, which is the buffer with the new K / V in slot L when that slot
+    holds zero, as StaticLayer.update's index_copy_ leaves it (x * 1 and x + 0 are exact)."""
+
+    def __init__(self, past, slot=None):
+        self.past, self.slot = past, slot
+        self.new = {}
+
+    def update(self, key_states, value_states, layer_idx, *args, **kwargs):
+        if layer_idx in self.new:
+            raise ValueError(f"cache stand-in: layer {layer_idx} updated twice")
+        self.new[layer_idx] = (key_states, value_states)
+        past_k, past_v = self.past[layer_idx]
+        if self.slot is None:
+            n = key_states.shape[-2]
+            return torch.cat([key_states, past_k[:, :, n:]], dim=-2), torch.cat([value_states, past_v[:, :, n:]], dim=-2)
+        return past_k + self.slot * key_states, past_v + self.slot * value_states
+
+    def flat(self):
+        return tuple(t for index in sorted(self.new) for t in self.new[index])
+
+
+def _decoder_stack(layers, hidden, attention_mask, cos, sin, cache):
+    """LlamaModel.forward's layer loop with the host mask and RoPE tables and the cache stand-in (the output-capturing
+    ContextVar set to "no collector" as the model forward sets it; see CausalLayer)."""
+    collector = _output_collector()
+    token = collector.set(None) if collector is not None else None
+    try:
+        for layer in layers:
+            out = layer(hidden, attention_mask=attention_mask, position_embeddings=(cos, sin), past_key_values=cache)
+            hidden = out[0] if isinstance(out, tuple) else out
+    finally:
+        if collector is not None:
+            collector.reset(token)
+    return hidden
+
+
+def _phase_tree(model, host_embeddings):
+    """The modules a phase graph reads, under their original paths (model.model.layers.N, model.model.norm,
+    model.lm_head, and model.model.embed_tokens unless the host gathers the embeddings), so the lifted state keeps the
+    export names behind `model.`. The rotary embedding is not registered: the host computes the RoPE tables."""
+    tree = torch.nn.Module()
+    tree.model = torch.nn.Module()
+    tree.model.layers = torch.nn.ModuleList(list(model.model.layers[:model.config.num_hidden_layers]))
+    tree.model.norm = model.model.norm
+    tree.lm_head = model.lm_head
+    if not host_embeddings:
+        tree.model.embed_tokens = model.model.embed_tokens
+    return tree
+
+
+class CausalPrefill(torch.nn.Module):
+    """The prefill of a causal LM's greedy generation on a static cache (GenerationMixin.generate's first forward with
+    a StaticCache of max_cache_len C) at its own boundary: the prompt and the empty cache -> the last position's logits
+    and the post-RoPE K / V of every decoder layer for slots 0..P-1.
+
+    Inputs: input_ids (int64 [B, P]) or, with host_embeddings, the token embeddings gathered on the host (BF16 [B, P,
+    hidden]; causal_token_embedder), the host additive mask (BF16 [B, 1, P, C]: 0 where key <= query, the BF16 minimum
+    elsewhere; causal_prefill_mask), the host RoPE rows 0..P-1 (cos, sin BF16 [B, P, head_dim]; causal_rope_tables),
+    then k_0, v_0, ..., k_{L-1}, v_{L-1}: the cache buffers, BF16 [B, n_kv_heads, C, head_dim], all zero.
+    Outputs: logits (BF16 [B, vocab], the last position; with all_logits [B, P, vocab]), then the new k_0, v_0, ...,
+    BF16 [B, n_kv_heads, P, head_dim] each, for slots 0..P-1. The forward is LlamaModel's layer loop, its final norm and
+    the LM head on the last position (generate's logits_to_keep=1), with the model's own modules; only the mask / RoPE
+    construction and the cache object are replaced by inputs and a stand-in (_CacheStandIn)."""
+
+    static_graph = True          # capture_fx refuses a dynamically shaped value (no dead-node pass: the graph is as traced)
+
+    def __init__(self, model, host_embeddings=False, all_logits=False):
+        super().__init__()
+        self.model = _phase_tree(model, host_embeddings)
+        self.host_embeddings = host_embeddings
+        self.all_logits = all_logits
+
+    def forward(self, tokens, attention_mask, cos, sin, *kv):
+        inner = self.model.model
+        if len(kv) != 2 * len(inner.layers):
+            raise ValueError(f"expected {2 * len(inner.layers)} K / V inputs, got {len(kv)}")
+        hidden = tokens if self.host_embeddings else inner.embed_tokens(tokens)
+        cache = _CacheStandIn(dict(enumerate(_split_kv(kv))))
+        hidden = _decoder_stack(inner.layers, hidden, attention_mask, cos, sin, cache)
+        hidden = inner.norm(hidden)
+        if self.all_logits:
+            logits = self.model.lm_head(hidden)
+        else:
+            logits = self.model.lm_head(hidden[:, -1:]).view(hidden.shape[0], -1)
+        return (logits, *cache.flat())
+
+
+class CausalDecodeStep(torch.nn.Module):
+    """One decode step of a causal LM's greedy generation on a static cache at its own boundary: one new token and the
+    KV cache -> logits and the new token's K / V. The host owns the loop (argmax, cache writes, mask, slot and RoPE row
+    per step; causal_host_loop, loop_manifest.json).
+
+    Inputs: input_ids (int64 [B, 1]) or, with host_embeddings, its embedding (BF16 [B, 1, hidden]), the host additive
+    mask (BF16 [B, 1, 1, C]; causal_decode_mask: 0 on slots 0..L, the BF16 minimum on slots L+1..C-1), the host RoPE row
+    of position L (cos, sin BF16 [B, 1, head_dim]), the write slot (BF16 [B, 1, C, 1], 1.0 at L; causal_decode_slot),
+    then k_0, v_0, ..., k_{L-1}, v_{L-1}: the cache, BF16 [B, n_kv_heads, C, head_dim] each, zero from slot L on.
+    Outputs: logits (BF16 [B, vocab]), then the new token's k_0, v_0, ..., BF16 [B, n_kv_heads, 1, head_dim] each; the
+    host writes them into slot L. Every shape is static; the length L reaches the graph only through the mask, the slot
+    and the RoPE row, so nothing is sliced by a run-time length and no input is mutated."""
+
+    static_graph = True          # capture_fx refuses a dynamically shaped value (no dead-node pass: the graph is as traced)
+
+    def __init__(self, model, host_embeddings=False):
+        super().__init__()
+        self.model = _phase_tree(model, host_embeddings)
+        self.host_embeddings = host_embeddings
+
+    def forward(self, tokens, attention_mask, cos, sin, slot, *kv):
+        inner = self.model.model
+        if len(kv) != 2 * len(inner.layers):
+            raise ValueError(f"expected {2 * len(inner.layers)} K / V inputs, got {len(kv)}")
+        hidden = tokens if self.host_embeddings else inner.embed_tokens(tokens)
+        cache = _CacheStandIn(dict(enumerate(_split_kv(kv))), slot)
+        hidden = _decoder_stack(inner.layers, hidden, attention_mask, cos, sin, cache)
+        hidden = inner.norm(hidden)
+        logits = self.model.lm_head(hidden).view(hidden.shape[0], -1)
+        return (logits, *cache.flat())
+
+
+class CausalDecodeLayer(torch.nn.Module):
+    """One decoder layer of CausalDecodeStep at its own boundary (the per-layer route of the backend):
+    (hidden [B, 1, hidden], cos, sin [B, 1, head_dim], mask [B, 1, 1, C], slot [B, 1, C, 1], k, v [B, n_kv_heads, C,
+    head_dim]) -> (hidden, new k, new v [B, n_kv_heads, 1, head_dim]); the input order of CausalLayer, then the slot and
+    the layer's cache. Registered under its original path as CausalLayer, so the lifted buffers keep the export names
+    behind `model.` and the policy sites keep their identity."""
+
+    static_graph = True          # capture_fx refuses a dynamically shaped value (no dead-node pass: the graph is as traced)
+
+    def __init__(self, model, index):
+        super().__init__()
+        self.index = str(index)
+        self.model = torch.nn.Module()
+        self.model.model = torch.nn.Module()
+        self.model.model.layers = torch.nn.ModuleDict({self.index: model.model.layers[index]})
+        self.policy_site_scope = (f"model.layers.{index}.",)
+
+    def forward(self, hidden, cos, sin, attention_mask, slot, past_k, past_v):
+        layer = self.model.model.layers[self.index]
+        cache = _CacheStandIn({layer.self_attn.layer_idx: (past_k, past_v)}, slot)
+        hidden = _decoder_stack([layer], hidden, attention_mask, cos, sin, cache)
+        return (hidden, *cache.flat())
+
+
+# --- host side: what the host computes around the two graphs (loop_manifest.json "host") ------------------------------
+
+def causal_geometry(model, capacity, prefill_length):
+    """The cache geometry and loop constants the host needs, read from the model config."""
+    config = model.config
+    head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+    if not 0 < prefill_length < capacity:
+        raise ValueError(f"prefill length {prefill_length} leaves no decode slot in capacity {capacity}")
+    return SimpleNamespace(layers=config.num_hidden_layers, n_heads=config.num_attention_heads,
+                           n_kv_heads=config.num_key_value_heads, head_dim=head_dim, hidden=config.hidden_size,
+                           vocab=config.vocab_size, capacity=capacity, prefill_length=prefill_length,
+                           dtype=model.model.norm.weight.dtype)
+
+
+def causal_rope_tables(model, capacity, batch=1, dtype=torch.bfloat16, device="cpu"):
+    """(cos, sin) BF16 [batch, capacity, head_dim]: the model's own rotary embedding (LlamaRotaryEmbedding.forward:
+    float32 inv_freq x position outer product, cat, cos / sin, attention_scaling, cast to the activation dtype) at
+    positions 0..capacity-1. Row p is what LlamaModel.forward computes for position p; the prefill takes rows 0..P-1,
+    the decode step at length L row L."""
+    x = torch.zeros(1, dtype=dtype, device=device)
+    positions = torch.arange(capacity, device=device)[None].expand(batch, -1)
+    cos, sin = model.model.rotary_emb(x, positions)
+    return cos.contiguous(), sin.contiguous()
+
+
+def causal_prefill_mask(length, capacity, batch=1, dtype=torch.bfloat16, device="cpu"):
+    """BF16 [batch, 1, length, capacity]: 0 where key <= query, the dtype minimum elsewhere (transformers'
+    create_causal_mask with the eager mask function for an unpadded prompt on a StaticCache of max_cache_len capacity)."""
+    mask = torch.full((length, capacity), torch.finfo(dtype).min, dtype=dtype, device=device).triu(1)
+    return mask[None, None].expand(batch, 1, length, capacity).contiguous()
+
+
+def causal_decode_mask(length, capacity, batch=1, dtype=torch.bfloat16, device="cpu"):
+    """BF16 [batch, 1, 1, capacity] for a decode step at cache length `length` (the new token in slot `length`): 0 on
+    slots 0..length, the dtype minimum on slots length+1..capacity-1."""
+    if not 0 <= length < capacity:
+        raise ValueError(f"cache length {length} outside 0..{capacity - 1}")
+    mask = torch.zeros(batch, 1, 1, capacity, dtype=dtype, device=device)
+    mask[..., length + 1:] = torch.finfo(dtype).min
+    return mask
+
+
+def causal_decode_slot(length, capacity, batch=1, dtype=torch.bfloat16, device="cpu"):
+    """BF16 [batch, 1, capacity, 1]: 1.0 at slot `length` (where the step's new K / V go), 0 elsewhere."""
+    if not 0 <= length < capacity:
+        raise ValueError(f"cache length {length} outside 0..{capacity - 1}")
+    slot = torch.zeros(batch, 1, capacity, 1, dtype=dtype, device=device)
+    slot[:, :, length] = 1
+    return slot
+
+
+def causal_empty_cache(geometry, batch=1, device="cpu"):
+    """2 * layers zero buffers BF16 [batch, n_kv_heads, capacity, head_dim] (k_0, v_0, k_1, ...)."""
+    return [torch.zeros(batch, geometry.n_kv_heads, geometry.capacity, geometry.head_dim, dtype=geometry.dtype,
+                        device=device) for _ in range(2 * geometry.layers)]
+
+
+def causal_cache_write(cache, new, position):
+    """Write each graph output K / V [B, H_kv, n, D] into its buffer at slots position..position+n-1 (host side)."""
+    if len(cache) != len(new):
+        raise ValueError(f"{len(new)} new K / V tensors for {len(cache)} cache buffers")
+    for buffer, value in zip(cache, new):
+        if position + value.shape[2] > buffer.shape[2]:
+            raise ValueError(f"cache capacity {buffer.shape[2]} exceeded at position {position} + {value.shape[2]}")
+        buffer[:, :, position:position + value.shape[2]] = value
+
+
+def causal_token_embedder(tensors, policy, name="model.embed_tokens"):
+    """ids -> BF16 token embeddings gathered on the host from the export's own tensors (the loop manifest's recipe):
+    a BF16 table: its rows; an FP8 embedding (exporter.head_embed, --embedding fp8): the stored decode table at the
+    code rows times 2^(row exponent), cast to BF16 (QuantEmbedding.forward, exact in BF16)."""
+    site = policy["sites"].get(name, {})
+    if site.get("kind") != "embedding" or site.get("status") != "quantized":
+        table = tensors[f"{name}.weight"]
+        return lambda ids: torch.nn.functional.embedding(ids, table)
+    if site.get("format") != "fp8" or site.get("tied_to"):
+        raise ValueError(f"host embeddings cover a BF16 table or an untied FP8 embedding, not {site.get('format')!r}"
+                         f"{' tied' if site.get('tied_to') else ''}")
+    codes, exp = tensors[site["weight"]["codes"]], tensors[site["weight"]["scale_exp"]]
+    lut = tensors[site["decode_tables"]["weight_decode_atlas_lut"]]
+    dtype = getattr(torch, site.get("weight_dtype", "bfloat16"))
+    return lambda ids: (lut[torch.nn.functional.embedding(ids, codes).long()]
+                        * torch.exp2(torch.nn.functional.embedding(ids, exp).float())).to(dtype)
+
+
+def causal_prefill_inputs(tokens, rope, cache, embed=None):
+    """Prefill graph inputs for a prompt (int64 [B, P]): tokens or host embeddings, mask, cos / sin rows 0..P-1, the
+    (zero) cache buffers."""
+    batch, length = tokens.shape
+    cos, sin = rope
+    first = tokens if embed is None else embed(tokens)
+    return (first, causal_prefill_mask(length, cache[0].shape[2], batch, cos.dtype, cos.device),
+            cos[:, :length].contiguous(), sin[:, :length].contiguous(), *cache)
+
+
+def causal_step_inputs(token, length, capacity, rope, cache, embed=None):
+    """Decode-step graph inputs for one token (int64 [B, 1]) at cache length `length`."""
+    cos, sin = rope
+    first = token if embed is None else embed(token)
+    batch = token.shape[0]
+    return (first, causal_decode_mask(length, capacity, batch, cos.dtype, cos.device),
+            cos[:, length:length + 1].contiguous(), sin[:, length:length + 1].contiguous(),
+            causal_decode_slot(length, capacity, batch, cos.dtype, cos.device), *cache)
+
+
+def causal_host_loop(prefill, step, prompt, n_steps, geometry, rope, embed=None, eos_token_id=None):
+    """The greedy token loop the host runs around the two graphs (loop_manifest.json "loop"): zero the cache, prefill
+    once, write its K / V into slots 0..P-1, then token = argmax(logits) (torch.argmax: the first index on ties, as
+    generate's greedy search); stop after an EOS token or after n_steps decode steps, otherwise run the step at length
+    L, write its K / V into slot L, L += 1. Returns (tokens [B, n] int64, the prefill's token first, [logits per
+    generated token], cache buffers)."""
+    if prompt.shape[1] != geometry.prefill_length:
+        raise ValueError(f"prompt of {prompt.shape[1]} tokens; the prefill graph takes {geometry.prefill_length}")
+    cache = causal_empty_cache(geometry, prompt.shape[0], prompt.device)
+    out = prefill(*causal_prefill_inputs(prompt, rope, cache, embed))
+    causal_cache_write(cache, out[1:], 0)
+    length, tokens, all_logits = prompt.shape[1], [], [out[0]]
+    while True:
+        token = torch.argmax(all_logits[-1], dim=-1, keepdim=True)
+        tokens.append(token)
+        if len(tokens) > n_steps or (eos_token_id is not None and bool((token == eos_token_id).all())):
+            break
+        out = step(*causal_step_inputs(token, length, geometry.capacity, rope, cache, embed))
+        all_logits.append(out[0])
+        causal_cache_write(cache, out[1:], length)
+        length += 1
+    return torch.cat(tokens, dim=1), all_logits, cache
+
+
+def causal_generate(model, prompt, n_steps, capacity=None):
+    """transformers' own greedy loop on the same model: generate(do_sample=False, use_cache=True) with
+    max_new_tokens = n_steps + 1 (the prefill's token and one per decode step), on a StaticCache of max_cache_len
+    `capacity` (the loop the phase graphs reproduce), or with capacity None on generate's default DynamicCache. Returns
+    (new tokens [B, n], [raw logits per generated token], as generate records them: float32)."""
+    kwargs = {}
+    if capacity is not None:
+        from transformers import StaticCache
+
+        kwargs["past_key_values"] = StaticCache(config=model.config, max_cache_len=capacity)
+    out = model.generate(prompt, max_new_tokens=n_steps + 1, do_sample=False, use_cache=True, output_logits=True,
+                         return_dict_in_generate=True, num_beams=1, **kwargs)
+    return out.sequences[:, prompt.shape[1]:], list(out.logits)
+
+
+def causal_phase_cases(model, boundary, geometry, seed, device, count=2, host_embeddings=False, steps=(0, 3),
+                       embed=None, prompts=None):
+    """`count` input tuples for a CausalPrefill / CausalDecodeStep / CausalDecodeLayer capture on prompts of the
+    prefill length (`prompts`, int64 [count, P], or random ids from seed + i). A decode-step case is the greedy loop's
+    input at decode step steps[i] of the eager phases (a cache of real K / V, different lengths per case); a
+    decode-layer case is that step's input to layer `boundary.index` (host_embeddings selects the step's token input)."""
+    vocab = model.config.vocab_size
+    if host_embeddings and embed is None:
+        embed = model.model.embed_tokens
+    embed = embed if host_embeddings else None
+    rope = causal_rope_tables(model, geometry.capacity, dtype=geometry.dtype, device=device)
+    prefill = CausalPrefill(model, host_embeddings=host_embeddings).eval()
+    step = CausalDecodeStep(model, host_embeddings=host_embeddings).eval()
+    cases = []
+    with torch.no_grad():
+        for i in range(count):
+            prompt = (prompts[i:i + 1].to(device) if prompts is not None else torch.randint(
+                vocab, (1, geometry.prefill_length), generator=torch.Generator().manual_seed(seed + i)).to(device))
+            if isinstance(boundary, CausalPrefill):
+                cache = causal_empty_cache(geometry, 1, device)
+                cases.append(tuple(t.clone() for t in causal_prefill_inputs(prompt, rope, cache, embed)))  # own storage
+                continue
+            at = steps[i % len(steps)] + i // len(steps)
+            captured = []
+
+            def record(*args):
+                captured.append(tuple(t.clone() for t in args))     # the host writes into its buffers after the step
+                return step(*args)
+            causal_host_loop(prefill, record, prompt, at + 1, geometry, rope, embed)
+            args = captured[at]
+            if isinstance(boundary, CausalDecodeStep):
+                cases.append(args)
+                continue
+            index = int(boundary.index)
+            token, mask, cos, sin, slot, *kv = args
+            hidden = token if host_embeddings else model.model.embed_tokens(token)
+            hidden = _decoder_stack(model.model.layers[:index], hidden, mask, cos, sin,
+                                    _CacheStandIn(dict(enumerate(_split_kv(kv))), slot))
+            cases.append(tuple(t.contiguous() for t in (hidden, cos, sin, mask, slot, kv[2 * index], kv[2 * index + 1])))
+    return cases
+
+
 def _rope_head_dim(policy):
     inner = policy.model.vlm_with_expert
     dims = {inner.vlm.config.text_config.head_dim, inner.lm_expert.config.head_dim}
@@ -2265,10 +2621,6 @@ class _PrefixKV:
             return key_states, value_states
         layer = self.layers[layer_idx]
         return torch.cat([layer.keys, key_states], dim=-2), torch.cat([layer.values, value_states], dim=-2)
-
-
-def _split_kv(flat):
-    return [(flat[i], flat[i + 1]) for i in range(0, len(flat), 2)]
 
 
 def _smolvla_layer_tail(layer, att_output, hidden_states):
@@ -2714,12 +3066,16 @@ def main(argv=None):
                         help="dtype of the held weight-code buffers with --native-fp8. uint8 (default) keeps the "
                              "export bytes; float8_e4m3fn is a bitcast of the same bytes, refused when a layer "
                              "holds a code on which torch and ref_numerics decode differently")
-    parser.add_argument("--boundary", choices=("causal_lm", "causal_lm_layer", "smolvla_flow_loss", "smolvla_text_layers",
+    parser.add_argument("--boundary", choices=("causal_lm", "causal_lm_layer", "causal_lm_prefill", "causal_lm_decode_step",
+                                               "causal_lm_decode_layer", "smolvla_flow_loss", "smolvla_text_layers",
                                                "smolvla_prefix", "smolvla_denoise_step"),
                         default="causal_lm",
                         help="capture boundary: causal-LM logits (default), one decoder layer of a causal LM "
-                             "(CausalLayer: hidden, cos, sin, mask -> hidden; see --layer) or the SmolVLA "
-                             "flow-matching loss forward, or its first --layers text / expert layers "
+                             "(CausalLayer: hidden, cos, sin, mask -> hidden; see --layer), the causal-LM token-loop phases "
+                             "causal_lm_prefill (CausalPrefill: prompt of --seqlen tokens, mask, cos, sin, zero --capacity "
+                             "K / V -> logits, K / V), causal_lm_decode_step (CausalDecodeStep: token, mask, cos, sin, slot, "
+                             "--capacity K / V -> logits, new K / V) and causal_lm_decode_layer (one layer of the step, "
+                             "--layer); or the SmolVLA flow-matching loss forward, or its first --layers text / expert layers "
                              "(SmolVLATextLayers: prefix, suffix embeddings, attention mask, position ids -> suffix output), "
                              "or one of the two inference phases: smolvla_prefix (SmolVLAPrefix: images, tokens, state -> "
                              "per-layer K / V) and smolvla_denoise_step (SmolVLADenoiseStep: x_t, time, prefix K / V -> v_t); "
@@ -2735,7 +3091,16 @@ def main(argv=None):
                              "create_sinusoidal_pos_embedding, cast as embed_suffix casts it) computed on the host as a "
                              "last input, so the graph holds none of its float64 math")
     parser.add_argument("--layers", type=int, default=2, help="text / expert layers with --boundary smolvla_text_layers")
-    parser.add_argument("--layer", type=int, default=0, help="decoder layer index with --boundary causal_lm_layer")
+    parser.add_argument("--layer", type=int, default=0,
+                        help="decoder layer index with --boundary causal_lm_layer / causal_lm_decode_layer")
+    parser.add_argument("--capacity", type=int, default=128,
+                        help="KV-cache capacity C (static; the StaticCache max_cache_len) of the causal_lm_prefill / "
+                             "causal_lm_decode_step / causal_lm_decode_layer boundaries")
+    parser.add_argument("--host-embeddings", action="store_true",
+                        help="causal_lm_prefill / causal_lm_decode_step: the first input is the token embeddings, "
+                             "gathered on the host from the export's own table (causal_token_embedder), not the ids")
+    parser.add_argument("--all-logits", action="store_true",
+                        help="causal_lm_prefill: logits of every prompt position, not only the last")
     parser.add_argument("--n-images", type=int, default=1, help="cameras at the smolvla_flow_loss / smolvla_prefix boundary")
     parser.add_argument("--verify-dir", help="fresh-process replay of an existing FX bundle")
     args = parser.parse_args(argv)
@@ -2753,6 +3118,13 @@ def main(argv=None):
         if (kind == "causal_lm") != args.boundary.startswith("causal_lm"):
             parser.error(f"export kind {kind!r} does not match --boundary {args.boundary}; the CLI captures causal-LM "
                          "boundaries for a causal-LM export and SmolVLA boundaries for a policy export")
+        smolvla_flags = [f for f, on in (("--host-rope", args.host_rope), ("--host-text-embeddings", args.host_text_embeddings),
+                                         ("--host-time-embedding", args.host_time_embedding)) if on]
+        causal_flags = [f for f, on in (("--host-embeddings", args.host_embeddings), ("--all-logits", args.all_logits)) if on]
+        if args.boundary.startswith("causal_lm") and smolvla_flags:
+            parser.error(f"{', '.join(smolvla_flags)} apply to the SmolVLA boundaries, not --boundary {args.boundary}")
+        if args.boundary.startswith("smolvla_") and causal_flags:
+            parser.error(f"{', '.join(causal_flags)} apply to the causal-LM phase boundaries, not --boundary {args.boundary}")
         if args.boundary.startswith("smolvla_"):
             import eval_policy
 
@@ -2792,14 +3164,34 @@ def main(argv=None):
                                            host_time_embedding=args.host_time_embedding).eval()
             config_dict = __import__("dataclasses").asdict(lerobot_policy.config)
         else:
-            model, _, _ = load_quantized.load_quantized(args.model, args.export_dir, args.device,
-                                                       mode="ref_conv", seqlen=args.seqlen)
+            model, _, _ = load_quantized.load_quantized(args.model, args.export_dir, args.device, mode="ref_conv",
+                                                       seqlen=max(args.seqlen, args.capacity)
+                                                       if args.boundary.startswith(("causal_lm_decode", "causal_lm_prefill"))
+                                                       else args.seqlen)
             config_dict = model.config.to_dict()
-            if args.boundary == "causal_lm_layer":
+            if args.boundary in ("causal_lm_layer", "causal_lm_decode_layer"):
                 if not 0 <= args.layer < model.config.num_hidden_layers:
                     parser.error(f"--layer {args.layer} outside 0..{model.config.num_hidden_layers - 1}")
+            phase = args.boundary in ("causal_lm_prefill", "causal_lm_decode_step", "causal_lm_decode_layer")
+            if (args.host_embeddings or args.all_logits) and not phase:
+                parser.error("--host-embeddings / --all-logits apply to the causal_lm_prefill / decode boundaries")
+            if args.boundary == "causal_lm_layer":
                 cases = causal_layer_cases(model, args.layer, args.seqlen, args.seed, args.device)
                 boundary = CausalLayer(model, args.layer).eval()
+            elif phase:
+                geometry = causal_geometry(model, args.capacity, args.seqlen)
+                embed = None
+                if args.host_embeddings:
+                    tensors, _, _ = load_quantized.read_export(args.export_dir, verify=False)
+                    embed = causal_token_embedder(tensors, policy)
+                if args.boundary == "causal_lm_prefill":
+                    boundary = CausalPrefill(model, args.host_embeddings, args.all_logits).eval()
+                elif args.boundary == "causal_lm_decode_step":
+                    boundary = CausalDecodeStep(model, args.host_embeddings).eval()
+                else:
+                    boundary = CausalDecodeLayer(model, args.layer).eval()
+                cases = causal_phase_cases(model, boundary, geometry, args.seed, args.device,
+                                           host_embeddings=args.host_embeddings, embed=embed)
             else:
                 vocab = model.config.vocab_size
                 cases = [(torch.randint(vocab, (1, args.seqlen), generator=torch.Generator().manual_seed(args.seed + i))
@@ -2819,7 +3211,12 @@ def main(argv=None):
                                             sort_keys=True, default=str).encode()).hexdigest(),
                                         "capture_source": _capture_source(),
                                         "seed": args.seed, "seqlen": args.seqlen,
-                                        **({"layer": args.layer} if args.boundary == "causal_lm_layer" else {}),
+                                        **({"layer": args.layer} if args.boundary in ("causal_lm_layer",
+                                                                                      "causal_lm_decode_layer") else {}),
+                                        **({"capacity": args.capacity, "prefill_length": args.seqlen,
+                                            "host_embeddings": args.host_embeddings, "all_logits": args.all_logits}
+                                           if args.boundary.startswith(("causal_lm_prefill", "causal_lm_decode"))
+                                           else {}),
                                         **({"layers": args.layers} if args.boundary == "smolvla_text_layers" else {}),
                                         **({"n_images": args.n_images} if args.boundary in ("smolvla_flow_loss",
                                                                                             "smolvla_prefix") else {}),

@@ -1,5 +1,5 @@
-"""Write loop_manifest.json: what the host has to do around the per-phase FX graphs of the Multi-Task DiT, of Pi0 and of
-SmolVLA.
+"""Write loop_manifest.json: what the host has to do around the per-phase FX graphs of the Multi-Task DiT, of Pi0, of
+SmolVLA and of a causal LM.
 Every number is read from a config, a source file, a scheduler object or a fixture of an existing bundle; none is typed in
 (docs/algos/tile-aware.md#per-phase-graphs-and-loop-manifest). The manifest says how many denoising steps the real model takes, the scheduler / Euler constants,
 which inputs change per call, which operations stay on the host and how often each graph is called.
@@ -9,6 +9,7 @@ usage (run with PYTHONPATH=<worktree>/src):
                         [--steps-per-call N]                                                   # atlas-lerobot env
   make_loop_manifest.py pi0 --single-step-bundle DIR --checkpoint-dir CKPT --openpi-dir OPENPI --out PATH   # atlas-pi0 env
   make_loop_manifest.py smolvla --policy lerobot/smolvla_libero [--n-images 2] [--host-rope] --out PATH        # atlas-lerobot env
+  make_loop_manifest.py causal_lm --prefill-bundle DIR --step-bundle DIR [--decode-steps 32] --out PATH       # TinyLlama
 `--single-step-bundle` is the existing one-step bundle (read only): its bundle_manifest.json names the checkpoint snapshot, its
 fx/fixtures.safetensors gives the observation tensor shapes, dtypes and the camera masks of the capture cases. SmolVLA has no
 one-step bundle: its numbers come from the policy's config.json, the VLM's config.json and lerobot's euler_integrate itself
@@ -594,9 +595,119 @@ def smolvla_manifest(policy_id, n_images, host_rope=False, host_text_embeddings=
         "not_provided": ["unrolled 10-step graph", "RTC guidance (rtc_config is null)"]}
 
 
+# ------------------------------------------------------------------------------------------------------------------
+# Causal LM (TinyLlama): prefill + decode step, host-owned greedy token loop
+# ------------------------------------------------------------------------------------------------------------------
+
+def _named_specs(fx_dir, prefix, names):
+    specs, _ = _fixture_specs(fx_dir)
+    keys = sorted((k for k in specs if k.startswith(prefix + "_")), key=lambda k: int(k.split("_")[1]))
+    if len(keys) != len(names):
+        raise ValueError(f"{fx_dir}: {len(keys)} {prefix}s, expected {len(names)} ({names[:4]}...)")
+    return [{"name": n, **specs[k]} for n, k in zip(names, keys)]
+
+
+def causal_manifest(prefill_bundle, step_bundle, decode_steps):
+    """loop_manifest.json of the causal-LM token loop (fx_export.CausalPrefill / CausalDecodeStep). The geometry is read from
+    the architecture config, the capacity / prefill length / host-embedding choice from the two bundles' capture provenance,
+    the graph I/O from their fixtures, the generation constants from the model's generation config."""
+    from transformers import AutoConfig, GenerationConfig
+
+    pb, sb = Path(prefill_bundle), Path(step_bundle)
+    prov = {name: json.loads((b / "fx" / "verification.json").read_text())["provenance"] for name, b in
+            (("prefill", pb), ("decode_step", sb))}
+    if prov["prefill"]["boundary"] != "causal_lm_prefill" or prov["decode_step"]["boundary"] != "causal_lm_decode_step":
+        raise ValueError(f"boundaries {prov['prefill']['boundary']}, {prov['decode_step']['boundary']}")
+    for key in ("export_manifest_sha256", "host_embeddings", "capacity", "prefill_length", "architecture_locator"):
+        if prov["prefill"][key] != prov["decode_step"][key]:
+            raise ValueError(f"the two bundles differ in {key}: {prov['prefill'][key]} vs {prov['decode_step'][key]}")
+    p = prov["prefill"]
+    config = AutoConfig.from_pretrained(p["architecture_locator"])
+    try:
+        generation = GenerationConfig.from_pretrained(p["architecture_locator"]).to_diff_dict()
+    except OSError:
+        generation = GenerationConfig.from_model_config(config).to_diff_dict()
+    head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+    layers, kv_heads, capacity, length = config.num_hidden_layers, config.num_key_value_heads, p["capacity"], p["prefill_length"]
+    if length + decode_steps > capacity:
+        raise ValueError(f"prefill {length} + {decode_steps} decode steps exceed capacity {capacity}")
+    export = json.loads((pb / "export" / "manifest.json").read_text())
+    policy = json.loads((pb / "export" / "policy.json").read_text())
+    names = [f"{kind}_{i}" for i in range(layers) for kind in ("k", "v")]
+    host_emb = p["host_embeddings"]
+    first = "token_embeddings" if host_emb else "input_ids"
+    rope = getattr(config, "rope_parameters", None) or {"rope_theta": getattr(config, "rope_theta", None),
+                                                          "rope_type": (getattr(config, "rope_scaling", None) or {}).get(
+                                                              "rope_type", "default")}
+    emb_site = policy["sites"].get("model.embed_tokens", {})
+    bytes_per_token = 2 * layers * kv_heads * head_dim * 2
+    return {
+        "schema": SCHEMA, "model": "causal_lm",
+        "causal_lm": {"id": p["architecture_locator"], "export_dir": str((pb / "export").resolve()),
+                      "export_manifest_sha256": p["export_manifest_sha256"], "recipe": (export.get("recipe") or {}).get("algo"),
+                      "head_embed": export.get("head_embed", {"options": {"tie": "none", "lm_head": "bf16", "embedding": "bf16"}}),
+                      "lm_head": policy["sites"].get("lm_head", {}).get("status", "absent"),
+                      "embedding": emb_site.get("format", "bf16") if emb_site.get("status") == "quantized" else "bf16",
+                      "layers": layers, "n_heads": config.num_attention_heads, "n_kv_heads": kv_heads, "head_dim": head_dim,
+                      "hidden": config.hidden_size, "vocab": config.vocab_size, "host_embeddings": host_emb},
+        "kv_cache": {"names": names, "dtype": "BF16", "capacity": capacity,
+                     "layout": "[batch, n_kv_heads, position, head_dim]: post-RoPE, pre-GQA K / V (transformers StaticCache "
+                               "layout); one buffer per name, slot p holds position p",
+                     "per_tensor_shape": [1, kv_heads, capacity, head_dim], "tensors": len(names),
+                     "bytes_per_token": bytes_per_token, "bytes_total": bytes_per_token * capacity,
+                     "initial_value": "every byte zero (+0.0)",
+                     "unused_slots": "must hold +0.0 (as StaticCache's zero-initialised buffers): the attention K / V operand "
+                                     "exponents are dynamic per (batch, head) over all C keys, masked or not, and a zero "
+                                     "never raises the amax; the decode step also relies on slot L being zero "
+                                     "(cache + slot * new)",
+                     "attention_keys": f"all {capacity} slots in both graphs, as LlamaAttention on a StaticCache"},
+        "graphs": {
+            "prefill": {"boundary": "causal_lm_prefill", "bundle": str(pb.resolve()), "prefill_length": length,
+                        "calls_per_sequence": 1, "all_logits": p.get("all_logits", False),
+                        "inputs": _named_specs(pb / "fx", "input", [first, "attention_mask", "cos", "sin"] + names),
+                        "outputs": _named_specs(pb / "fx", "output", ["logits"] + names)},
+            "decode_step": {"boundary": "causal_lm_decode_step", "bundle": str(sb.resolve()),
+                            "calls_per_sequence": f"up to {decode_steps} (one per generated token after the first)",
+                            "inputs": _named_specs(sb / "fx", "input", [first, "attention_mask", "cos", "sin", "slot"] + names),
+                            "outputs": _named_specs(sb / "fx", "output", ["logits"] + [f"new_{n}" for n in names])}},
+        "host": {
+            "embeddings": ({"recipe": "BF16 table rows (F.embedding)" if emb_site.get("status") != "quantized" else
+                            "weight_decode_atlas_lut[codes[ids]] * 2^weight_scale_exp[ids], cast to BF16 "
+                            "(fx_export.causal_token_embedder; QuantEmbedding.forward)",
+                            "tensors": ["model.embed_tokens.weight"] if emb_site.get("status") != "quantized" else
+                            [emb_site["weight"]["codes"], emb_site["weight"]["scale_exp"],
+                             emb_site["decode_tables"]["weight_decode_atlas_lut"]]} if host_emb else None),
+            "rope": {"table": f"cos, sin BF16 [1, {capacity}, {head_dim}] = model.model.rotary_emb(x_bf16, positions "
+                              f"0..{capacity - 1}) (fx_export.causal_rope_tables)", "rope": rope,
+                     "prefill_rows": f"0..{length - 1}", "decode_row": "L (the cache length before the step)"},
+            "prefill_mask": f"BF16 [1, 1, {length}, {capacity}]: 0 where key <= query, BF16 min (0xFF7F) elsewhere "
+                            "(fx_export.causal_prefill_mask = create_causal_mask, eager, StaticCache)",
+            "prefill_cache": "the zeroed cache buffers (the graph attends over its new K / V in slots 0..P-1 and the "
+                             "cache's slots P..C-1)",
+            "decode_mask": f"BF16 [1, 1, 1, {capacity}]: 0 on slots 0..L (L: the new token), BF16 min (0xFF7F) on slots "
+                           f"L+1..{capacity - 1} (fx_export.causal_decode_mask = create_causal_mask, StaticCache)",
+            "decode_slot": f"BF16 [1, 1, {capacity}, 1]: 1.0 at slot L, 0 elsewhere (fx_export.causal_decode_slot); the "
+                           "step attends over cache + slot * new",
+            "cache_write": "zero every buffer, after the prefill: slots 0..P-1 <- its K / V; after a step at length L: "
+                           "slot L <- the new K / V, then L += 1 (fx_export.causal_cache_write); the graphs never write "
+                           "their inputs"},
+        "loop": {"kind": "greedy", "decode_steps": decode_steps, "max_new_tokens": decode_steps + 1,
+                 "token": "torch.argmax(logits, dim=-1) over the BF16 [batch, vocab] logits (first index on ties)",
+                 "stop": "after the EOS token or after decode_steps steps", "eos_token_id": generation.get(
+                     "eos_token_id", config.eos_token_id), "generation_config": generation,
+                 "library_loop": "transformers GenerationMixin.generate(do_sample=False, use_cache=True, max_new_tokens="
+                                 f"{decode_steps + 1}, past_key_values=StaticCache(max_cache_len={capacity})) on the "
+                                 "quantized model rebuilt from the export (fx_export.causal_generate)",
+                 "dynamic_cache_note": "generate's default DynamicCache attends over the L + 1 valid keys; its float32 "
+                                       "Q.K^T / P.V sums can round differently from the C-key sums, so it is not the loop "
+                                       "the graphs reproduce word for word",
+                 "host_loop": "fx_export.causal_host_loop"},
+    }
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("model", choices=("dit", "pi0", "smolvla"))
+    ap.add_argument("model", choices=("dit", "pi0", "smolvla", "causal_lm"))
     ap.add_argument("--single-step-bundle")
     ap.add_argument("--policy", default="lerobot/smolvla_libero", help="smolvla: policy repo id (local HF cache)")
     ap.add_argument("--n-images", type=int, default=2, help="smolvla: cameras at the prefix boundary")
@@ -605,6 +716,9 @@ def main(argv=None):
                     help="smolvla: the prefix graph takes the host language-token embeddings")
     ap.add_argument("--host-time-embedding", action="store_true",
                     help="smolvla: the step graph takes the host flow-timestep embedding")
+    ap.add_argument("--prefill-bundle", help="causal_lm: the CausalPrefill bundle")
+    ap.add_argument("--step-bundle", help="causal_lm: the CausalDecodeStep bundle")
+    ap.add_argument("--decode-steps", type=int, default=32, help="causal_lm: decode steps of the greedy loop")
     ap.add_argument("--out", required=True)
     ap.add_argument("--checkpoint-dir")
     ap.add_argument("--openpi-dir")
@@ -615,9 +729,13 @@ def main(argv=None):
                          f"{DEFAULT_STEPS_PER_CALL}; 1 for a dynamic activation recipe whose scale spans rows)")
     ap.add_argument("--stack-cameras", action="store_true", help="pi0: record the one-tower-call deviation instead of one SigLIP call per camera")
     a = ap.parse_args(argv)
-    if a.model != "smolvla" and not a.single_step_bundle:
+    if a.model in ("dit", "pi0") and not a.single_step_bundle:
         ap.error(f"{a.model} needs --single-step-bundle")
-    if a.model == "dit":
+    if a.model == "causal_lm":
+        if not a.prefill_bundle or not a.step_bundle:
+            ap.error("causal_lm needs --prefill-bundle and --step-bundle")
+        manifest = causal_manifest(a.prefill_bundle, a.step_bundle, a.decode_steps)
+    elif a.model == "dit":
         manifest = dit_manifest(a.single_step_bundle, a.layout, a.steps_per_call)
     elif a.model == "smolvla":
         manifest = smolvla_manifest(a.policy, a.n_images, a.host_rope, a.host_text_embeddings, a.host_time_embedding)
@@ -628,7 +746,8 @@ def main(argv=None):
     out = Path(a.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(manifest, indent=1, allow_nan=False) + "\n")
-    print(json.dumps({"out": str(out), "sha256": _sha(out), "denoising_steps": manifest["denoising_steps"]}))
+    print(json.dumps({"out": str(out), "sha256": _sha(out), **({"decode_steps": manifest["loop"]["decode_steps"]}
+                      if a.model == "causal_lm" else {"denoising_steps": manifest["denoising_steps"]})}))
     return 0
 
 

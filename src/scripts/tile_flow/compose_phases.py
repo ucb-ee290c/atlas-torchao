@@ -26,8 +26,11 @@ for the one-step comparison.
 usage (PYTHONPATH=<worktree>/src):
   compose_phases.py dit PHASES_DIR SINGLE_STEP_BUNDLE OUT_JSON [--eager-loop EXPORT_DIR] [--seed N]            # atlas-lerobot env
   compose_phases.py pi0 PHASES_DIR SINGLE_STEP_BUNDLE OUT_JSON [--eager-loop EXPORT_DIR --openpi-dir D --checkpoint-dir D]  # atlas-pi0 env
-  compose_phases.py smolvla PREFIX_BUNDLE DENOISE_STEP_BUNDLE OUT_JSON [--eager-loop EXPORT_DIR] [--unpadded]   # atlas-lerobot env"""
+  compose_phases.py smolvla PREFIX_BUNDLE DENOISE_STEP_BUNDLE OUT_JSON [--eager-loop EXPORT_DIR] [--unpadded]   # atlas-lerobot env
+  compose_phases.py causal_lm PREFILL_BUNDLE STEP_BUNDLE OUT_JSON [--decode-steps N] [--reference-cache F]   # causal LM token loop
+  (see compose_causal)"""
 import argparse
+import hashlib
 import json
 import sys
 import time
@@ -439,11 +442,171 @@ def compose_dit_hoisted(a):
     return 0 if res["ok"] else 1
 
 
+def _causal_graph_census(program):
+    """Graph-level checks of a saved phase graph: symbolic shapes, RoPE trig, embedding lookups, float64 values, input
+    mutation, node counts."""
+    import collections
+
+    calls = [n for n in program.graph.nodes if n.op == "call_function"]
+    symbolic = [n.name for n in program.graph.nodes if any(
+        not isinstance(d, int) for d in getattr(n.meta.get("val"), "shape", ()))]
+    return {"symbolic_shape_nodes": symbolic,
+            "rope_trig_nodes": [n.name for n in calls if str(n.target) in ("aten.sin.default", "aten.cos.default")],
+            "embedding_nodes": [n.name for n in calls if str(n.target) == "aten.embedding.default"],
+            "float64_nodes": [n.name for n in calls if getattr(n.meta.get("val"), "dtype", None) == torch.float64],
+            "user_inputs_mutated": dict(program.graph_signature.user_inputs_to_mutate),
+            "atlas_ops": dict(collections.Counter(str(n.target) for n in calls if str(n.target).startswith("atlas."))),
+            "nodes": len(program.graph.nodes)}
+
+
+def _words_differing(a, b):
+    """Logit words that differ (a: the graph's BF16 logits, b: generate's float32 record of the same BF16 values)."""
+    a = a.float()
+    return int((a.view(torch.int32) != b.view(torch.int32)).sum())
+
+
+def compose_causal(a):
+    """Causal-LM token loop (fx_export.CausalPrefill / CausalDecodeStep bundles, loop_manifest.json "causal_lm"):
+      (1) each saved graph replays its recorded fixture cases word for word, from host inputs rebuilt from the prompts;
+      (2) per prompt, the host loop (causal_host_loop: prefill once, decode_steps greedy steps, fixed-capacity cache) over
+          the saved graphs against transformers' generate(do_sample=False) on the quantized model rebuilt from the export,
+          with a StaticCache of the manifest's capacity (decides `ok`): tokens and every logit word; with
+          --dynamic-reference-cache also against generate's default DynamicCache loop (reported, not decided on: its
+          attention contracts over L + 1 keys, the graphs' over C, and the float32 sums can round differently);
+      (3) the step is pure (same inputs twice, inputs unchanged; no mutated user input in the signature);
+      (4) the K / V shapes and dtypes against the manifest; graph census."""
+    from safetensors.torch import load_file, save_file
+
+    import exporter.fx_export as fx_export
+    import exporter.load_quantized as load_quantized
+
+    pb, sb = Path(a.phases_dir), Path(a.single_step_bundle)
+    if (pb / "loop_manifest.json").read_bytes() != (sb / "loop_manifest.json").read_bytes():
+        raise SystemExit("the two bundles carry different loop manifests")
+    if (pb / "host_cases.safetensors").read_bytes() != (sb / "host_cases.safetensors").read_bytes():
+        raise SystemExit("the two bundles were captured on different prompts")
+    manifest = json.loads((pb / "loop_manifest.json").read_text())
+    lm, kv_spec, loop = manifest["causal_lm"], manifest["kv_cache"], manifest["loop"]
+    n_steps = a.decode_steps if a.decode_steps is not None else loop["decode_steps"]
+    prompts = load_file(str(pb / "host_cases.safetensors"))["prompts"]
+    indices = list(range(prompts.shape[0]))[:a.prompts] if a.prompt_indices is None else a.prompt_indices
+    # seqlen: the context the loop needs (build_causal_lm adds linear RoPE scaling only beyond the model's own context)
+    model, _, _ = load_quantized.load_quantized(lm["id"], pb / "export", "cpu", mode="ref_conv", seqlen=kv_spec["capacity"])
+    geometry = fx_export.causal_geometry(model, kv_spec["capacity"], manifest["graphs"]["prefill"]["prefill_length"])
+    geometry_ok = (geometry.layers, geometry.n_kv_heads, geometry.head_dim) == (lm["layers"], lm["n_kv_heads"], lm["head_dim"])
+    rope = fx_export.causal_rope_tables(model, geometry.capacity)
+    embed = None
+    if lm["host_embeddings"]:
+        tensors, policy, _ = load_quantized.read_export(pb / "export")
+        embed = fx_export.causal_token_embedder(tensors, policy)
+        del tensors
+    programs = {name: torch.export.load(b / "fx" / "model.pt2") for name, b in (("prefill", pb), ("decode_step", sb))}
+    prefill, step = programs["prefill"].module(), programs["decode_step"].module()
+    res = {"prefill_bundle": str(pb), "decode_step_bundle": str(sb), "host_embeddings": lm["host_embeddings"],
+           "head_embed": lm["head_embed"].get("options"), "capacity": geometry.capacity,
+           "prefill_length": geometry.prefill_length, "decode_steps": n_steps, "geometry_matches_manifest": geometry_ok,
+           "torch_threads": torch.get_num_threads(), "graphs": {k: _causal_graph_census(v) for k, v in programs.items()},
+           "fixtures": [], "prompts": [], "ok": geometry_ok}
+    res["ok"] &= all(not c["symbolic_shape_nodes"] and not c["rope_trig_nodes"] and not c["user_inputs_mutated"]
+                     and bool(c["embedding_nodes"]) == (not lm["host_embeddings"]) for c in res["graphs"].values())
+    ref_cache = Path(a.reference_cache) if a.reference_cache else None
+    refs = load_file(str(ref_cache)) if ref_cache and ref_cache.is_file() else {}
+    dyn_cache = Path(a.dynamic_reference_cache) if a.dynamic_reference_cache else None
+    dyn_refs = load_file(str(dyn_cache)) if dyn_cache and dyn_cache.is_file() else {}
+    res["library_loop"] = f"generate(do_sample=False) on StaticCache(max_cache_len={geometry.capacity})"
+    with torch.no_grad():
+        if embed is not None:
+            res["host_embeddings_equal_embed_tokens"] = _bytes_equal(embed(prompts), model.model.embed_tokens(prompts))
+            res["ok"] &= res["host_embeddings_equal_embed_tokens"]
+        res["prompt_indices"] = indices
+        # (1) recorded fixtures, replayed in this process, from rebuilt host inputs
+        for name, b, program in (("prefill", pb, prefill), ("decode_step", sb, step)):
+            fixtures = load_file(str(b / "fx" / "fixtures.safetensors"))
+            for i, case in enumerate(json.loads((b / "fx" / "parity.json").read_text())["cases"]):
+                ins, outs = [fixtures[k] for k in case["inputs"]], [fixtures[k] for k in case["outputs"]]
+                got = program(*ins)
+                row = {"graph": name, "case": i, "outputs_equal_recorded": len(got) == len(outs) and all(
+                    _bytes_equal(x.contiguous(), y) for x, y in zip(got, outs))}
+                if name == "prefill":
+                    rebuilt = fx_export.causal_prefill_inputs(prompts[i:i + 1], rope,
+                                                              fx_export.causal_empty_cache(geometry), embed)
+                    row["inputs_equal_host_rebuilt"] = len(rebuilt) == len(ins) and all(
+                        _bytes_equal(x, y) for x, y in zip(rebuilt, ins))
+                else:
+                    length = int((ins[1] == 0).sum()) - 1
+                    rebuilt = fx_export.causal_step_inputs(torch.zeros(1, 1, dtype=torch.int64), length, geometry.capacity,
+                                                           rope, ins[5:], None)
+                    row["cache_length"] = length
+                    row["mask_rope_slot_equal_host_rebuilt"] = all(_bytes_equal(x, y) for x, y in zip(rebuilt[1:5], ins[1:5]))
+                    row["unused_slots_zero"] = all(not t[:, :, length:].any() for t in ins[5:])
+                    row["kv_inputs_match_manifest"] = all(list(t.shape) == kv_spec["per_tensor_shape"] and
+                                                          t.dtype == torch.bfloat16 for t in ins[5:])
+                res["fixtures"].append(row)
+                res["ok"] &= all(v for k, v in row.items() if isinstance(v, bool))
+        # (2) host loop over the saved graphs vs generate, per prompt
+        for i in indices:
+            prompt = prompts[i:i + 1]
+            key = hashlib.sha256(prompt.numpy().tobytes()).hexdigest()[:16] + f"_{n_steps}"
+            dyn_key, key = key, key + f"_static{geometry.capacity}"
+            t0 = time.time()
+            if f"{key}.tokens" not in refs:
+                want_tokens, want_logits = fx_export.causal_generate(model, prompt, n_steps, geometry.capacity)
+                refs[f"{key}.tokens"] = want_tokens.contiguous()
+                refs[f"{key}.logits"] = torch.stack([t.contiguous() for t in want_logits])
+                if ref_cache:
+                    save_file(refs, str(ref_cache))
+            want_tokens, want_logits = refs[f"{key}.tokens"], list(refs[f"{key}.logits"])
+            t1 = time.time()
+            tokens, logits, cache = fx_export.causal_host_loop(prefill, step, prompt, n_steps, geometry, rope, embed,
+                                                               loop["eos_token_id"])
+            t2 = time.time()
+            diffs = [_words_differing(x, y) for x, y in zip(logits, want_logits)]
+            row = {"prompt": i, "generate_seconds": round(t1 - t0, 1), "host_loop_seconds": round(t2 - t1, 1),
+                   "tokens_generated": int(tokens.shape[1]), "tokens_equal_generate": torch.equal(tokens, want_tokens),
+                   "logits_compared": len(diffs), "logit_words_differing_per_token": diffs,
+                   "logits_byte_identical": len(logits) == len(want_logits) and not any(diffs),
+                   "max_abs_diff": max(float((x.float() - y).abs().max()) for x, y in zip(logits, want_logits)),
+                   "tokens": tokens[0].tolist(),
+                   "kv_matches_manifest": len(cache) == kv_spec["tensors"] and all(
+                       list(t.shape) == kv_spec["per_tensor_shape"] and t.dtype == torch.bfloat16 for t in cache)}
+            if dyn_cache is not None:    # generate's default DynamicCache loop (reported)
+                if f"{dyn_key}.tokens" not in dyn_refs:
+                    dyn_tokens, dyn_logits = fx_export.causal_generate(model, prompt, n_steps)
+                    dyn_refs[f"{dyn_key}.tokens"] = dyn_tokens.contiguous()
+                    dyn_refs[f"{dyn_key}.logits"] = torch.stack([t.contiguous() for t in dyn_logits])
+                    save_file(dyn_refs, str(dyn_cache))
+                dyn_tokens, dyn_logits = dyn_refs[f"{dyn_key}.tokens"], list(dyn_refs[f"{dyn_key}.logits"])
+                dd = [_words_differing(x, y) for x, y in zip(logits, dyn_logits)]
+                st = [_words_differing(x.to(torch.bfloat16), y) for x, y in zip(want_logits, dyn_logits)]
+                row["dynamic_cache_generate"] = {
+                    "tokens_equal": torch.equal(tokens, dyn_tokens), "logit_words_differing_per_token": dd,
+                    "first_differing_token": next((j for j, x in enumerate(dd) if x), None),
+                    "max_abs_diff": max(float((x.float() - y).abs().max()) for x, y in zip(logits, dyn_logits)),
+                    "static_generate_vs_dynamic_generate_first_differing_token": next(
+                        (j for j, x in enumerate(st) if x), None)}
+            if i == indices[0]:          # (3) purity of the step on the last cache state of this loop
+                args = fx_export.causal_step_inputs(tokens[:, -1:], geometry.prefill_length + tokens.shape[1] - 1,
+                                                    geometry.capacity, rope, cache, embed)
+                before = [tensor_record(t) for t in args]
+                first, second = step(*args), step(*args)
+                res["step_pure_same_inputs_twice"] = all(_bytes_equal(x, y) for x, y in zip(first, second))
+                res["step_inputs_unchanged"] = [tensor_record(t) for t in args] == before
+                res["ok"] &= res["step_pure_same_inputs_twice"] and res["step_inputs_unchanged"]
+            res["prompts"].append(row)
+            res["ok"] &= row["tokens_equal_generate"] and row["logits_byte_identical"] and row["kv_matches_manifest"]
+            Path(a.out).write_text(json.dumps(res, indent=1))
+            print(json.dumps({k: v for k, v in row.items() if k != "tokens"}), flush=True)
+    Path(a.out).write_text(json.dumps(res, indent=1))
+    print(json.dumps({k: v for k, v in res.items() if k not in ("prompts", "fixtures")}, indent=1))
+    return 0 if res["ok"] else 1
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("model", choices=("dit", "pi0", "smolvla"))
-    ap.add_argument("phases_dir", help="dit / pi0: the phases directory; smolvla: the prefix bundle")
-    ap.add_argument("single_step_bundle", help="dit / pi0: the single-step bundle; smolvla: the denoise_step bundle")
+    ap.add_argument("model", choices=("dit", "pi0", "smolvla", "causal_lm"))
+    ap.add_argument("phases_dir", help="dit / pi0: the phases directory; smolvla: the prefix bundle; causal_lm: the prefill bundle")
+    ap.add_argument("single_step_bundle", help="dit / pi0: the single-step bundle; smolvla: the denoise_step bundle; "
+                                               "causal_lm: the decode-step bundle")
     ap.add_argument("out")
     ap.add_argument("--eager-loop", metavar="EXPORT_DIR")
     ap.add_argument("--seed", type=int, default=0)
@@ -453,11 +616,26 @@ def main(argv=None):
     ap.add_argument("--checkpoint-dir")
     ap.add_argument("--tokenizer-path", default="/scratch2/lorenhung/models/big_vision/paligemma_tokenizer.model")
     ap.add_argument("--unpadded", action="store_true", help="smolvla: also an all-true language mask case (eager loop)")
+    ap.add_argument("--decode-steps", type=int, default=None, help="causal_lm: decode steps (default: the manifest's)")
+    ap.add_argument("--prompts", type=int, default=None, help="causal_lm: only the first N prompts of host_cases")
+    ap.add_argument("--prompt-indices", type=int, nargs="+", default=None, help="causal_lm: only these prompts of host_cases")
+    ap.add_argument("--reference-cache", help="causal_lm: safetensors file caching generate's tokens / logits per prompt")
+    ap.add_argument("--dynamic-reference-cache",
+                    help="causal_lm: also compare with generate's default DynamicCache loop (cached / computed here)")
     a = ap.parse_args(argv)
+    # the loop manifest names its model family: refuse a bundle of another family (e.g. a causal-LM bundle under
+    # `smolvla` or `dit`, a SmolVLA or DiT bundle under `causal_lm`); Pi0's manifest records a dict there
+    family = {"dit": "multi_task_dit", "smolvla": "smolvla", "causal_lm": "causal_lm"}
+    loop_path = Path(a.phases_dir) / "loop_manifest.json"
+    recorded = json.loads(loop_path.read_text()).get("model") if loop_path.is_file() else None
+    if isinstance(recorded, str) and recorded != family.get(a.model, "pi0"):
+        raise SystemExit(f"{loop_path} is a {recorded!r} loop manifest, not {a.model}")
     if a.model == "pi0":
         return compose_pi0(a)
     if a.model == "smolvla":
         return compose_smolvla(a)
+    if a.model == "causal_lm":
+        return compose_causal(a)
     if "modulate" in json.loads((Path(a.phases_dir) / "loop_manifest.json").read_text())["graphs"]:
         return compose_dit_hoisted(a)
     from safetensors.torch import load_file
