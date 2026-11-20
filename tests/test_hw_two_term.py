@@ -144,6 +144,7 @@ def test_down_only_unwrap_and_rank3():
     assert tt.unwrap(m) == 1
 
 
+@pytest.mark.usefixtures("refs")
 def test_reference_hw_matches_by_hand():
     m = quantized("reference_hw", spec="granularity:w=channel,a=token,rule=nc", crosscheck="on", crosscheck_frac=1.0)
     x = heavy(5, 64, seed=8)

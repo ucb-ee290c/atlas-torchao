@@ -1,4 +1,5 @@
 """Every aten op the three models execute has a unit (or an explicit host reason)."""
+import pytest
 import torch
 
 import chip.chip_coverage as cc
@@ -49,6 +50,7 @@ def test_float_compute_ops_have_entries():
             assert e.reason, name
 
 
+@pytest.mark.usefixtures("refs")
 def test_classify_examples():
     r = cc.ChipRouter(cc.Coverage(), mxu_impl="ref_cpu")
     A = torch.ops.aten
@@ -66,6 +68,7 @@ def test_classify_examples():
     assert r.classify(A.max.dim, "max", (x, 1), {}, None)[0] == "host"
 
 
+@pytest.mark.usefixtures("refs")
 def test_where_is_additive_mask():
     r = cc.ChipRouter(cc.Coverage(), mxu_impl="ref_cpu")
     x = torch.randn(3, 5).bfloat16()
@@ -75,6 +78,7 @@ def test_where_is_additive_mask():
     assert (out[~m] < -1e29).all()
 
 
+@pytest.mark.usefixtures("refs")
 def test_mtdit_emulator_protocol():
     em = cc.make_mtdit_op_emulator()
     A = torch.ops.aten
