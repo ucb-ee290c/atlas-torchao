@@ -14,8 +14,8 @@ with calibration, folds and algorithm transforms applied) and before any evaluat
                      requirements. load_quantized.py executes it (its round trip is the test).
   manifest.json      provenance, sha256 of the two files above, NEW decisions, pending rulings.
 
-Only the reference-numerics modes (ref_linear .. chip) can be exported: they are the ones whose
-weights are E4M3 codes with E8M0-style exponents (src/reference/ref_profile.py, src/reference/ref_attention.py).
+Only the reference-numerics modes (ref_linear .. chip_rope_vpu, and native_fp8, which casts as ref_conv does) can be
+exported: they are the ones whose weights are E4M3 codes with E8M0-style exponents (src/reference/ref_profile.py, src/reference/ref_attention.py).
 Everything not taken from a source is marked NEW here and listed in NEW_DECISIONS.
 """
 
@@ -129,7 +129,10 @@ M2M_V2_MATCHING = ["policy_sha256", "sites[].site_id", "sites[].status (quantize
 
 def pick_mode(modes) -> str | None:
     """The mode whose quantized model is exported: ref_conv if present, else the first mode of
-    `modes` whose profile is a reference-numerics one (ref_linear .. chip); None if there is none."""
+    `modes` whose profile is a reference-numerics one (ref_linear, ref_attn, ref_conv / reference,
+    reference_hw, chip, chip_rope_vpu, native_fp8); None if there is none. native_fp8 uses ref_conv's
+    casts, so its export holds the same codes and exponents; only exported_mode, profile and the
+    accumulation record name native_fp8 (docs/algos/export.md#when-the-export-is-written)."""
     import quant_modes
 
     ok = [m for m in modes if m != "bf16"
@@ -144,7 +147,9 @@ def add_args(ap) -> None:
     g = ap.add_argument_group("export (docs/algos/export.md)")
     g.add_argument("--export-dir", default=None,
                    help="write model.safetensors, policy.json and manifest.json of the first "
-                        "reference-numerics mode in --modes (ref_conv preferred) right after quantization")
+                        "reference-numerics mode in --modes (ref_linear, ref_attn, ref_conv / reference, "
+                        "reference_hw, chip, chip_rope_vpu, native_fp8; ref_conv preferred) right after "
+                        "quantization. native_fp8 writes ref_conv's codes and exponents under its own mode name")
     g.add_argument("--export-only", action="store_true",
                    help="with --export-dir: quantize the exported mode, write the export and stop "
                         "(no evaluation)")
@@ -197,7 +202,7 @@ def check_args(ap, args) -> str | None:
     mode = pick_mode(args.modes)
     if mode is None:
         ap.error("--export-dir needs a reference-numerics mode in --modes (ref_linear, ref_attn, ref_conv, "
-                 "reference, reference_hw, chip, chip_rope_vpu)")
+                 "reference, reference_hw, chip, chip_rope_vpu, native_fp8)")
     return mode
 
 
