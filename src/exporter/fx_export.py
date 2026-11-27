@@ -3076,7 +3076,7 @@ def main(argv=None):
                              "holds a code on which torch and ref_numerics decode differently")
     parser.add_argument("--boundary", choices=("causal_lm", "causal_lm_layer", "causal_lm_prefill", "causal_lm_decode_step",
                                                "causal_lm_decode_layer", "smolvla_flow_loss", "smolvla_text_layers",
-                                               "smolvla_prefix", "smolvla_denoise_step"),
+                                               "smolvla_prefix", "smolvla_denoise_step", "dronet"),
                         default="causal_lm",
                         help="capture boundary: causal-LM logits (default), one decoder layer of a causal LM "
                              "(CausalLayer: hidden, cos, sin, mask -> hidden; see --layer), the causal-LM token-loop phases "
@@ -3087,7 +3087,8 @@ def main(argv=None):
                              "(SmolVLATextLayers: prefix, suffix embeddings, attention mask, position ids -> suffix output), "
                              "or one of the two inference phases: smolvla_prefix (SmolVLAPrefix: images, tokens, state -> "
                              "per-layer K / V) and smolvla_denoise_step (SmolVLADenoiseStep: x_t, time, prefix K / V -> v_t); "
-                             "every SmolVLA boundary takes the host-computed attention mask and position ids")
+                             "every SmolVLA boundary takes the host-computed attention mask and position ids; or DroNet "
+                             "(frame -> steering, collision logit; needs --frames)")
     parser.add_argument("--host-rope", action="store_true",
                         help="SmolVLA boundaries: take the host RoPE cos / sin tables (smolvla_rope_tables) instead of "
                              "the position ids, so the graph computes no RoPE angle")
@@ -3110,6 +3111,8 @@ def main(argv=None):
     parser.add_argument("--all-logits", action="store_true",
                         help="causal_lm_prefill: logits of every prompt position, not only the last")
     parser.add_argument("--n-images", type=int, default=1, help="cameras at the smolvla_flow_loss / smolvla_prefix boundary")
+    parser.add_argument("--frames", help="npz with a uint8 `frames` array (N, 200, 200): the two capture cases of "
+                                         "--boundary dronet are two distinct frames drawn from it with --seed")
     parser.add_argument("--verify-dir", help="fresh-process replay of an existing FX bundle")
     args = parser.parse_args(argv)
     for flag, boundaries in HOST_FLAG_BOUNDARIES.items():
@@ -3133,7 +3136,28 @@ def main(argv=None):
         causal_flags = [f for f, on in (("--host-embeddings", args.host_embeddings), ("--all-logits", args.all_logits)) if on]
         if args.boundary.startswith("smolvla_") and causal_flags:
             parser.error(f"{', '.join(causal_flags)} apply to the causal-LM phase boundaries, not --boundary {args.boundary}")
-        if args.boundary.startswith("smolvla_"):
+        if args.boundary == "dronet":
+            if kind != "dronet":
+                parser.error(f"--boundary dronet needs a DroNet export (found kind {kind!r})")
+            if not args.frames:
+                parser.error("--boundary dronet needs --frames (real frames: the capture cases must exercise real "
+                             "activation ranges)")
+            import numpy as np
+            from dronet import model as dronet_model
+
+            boundary, _, _ = load_quantized.load_quantized(
+                None, args.export_dir, args.device, mode="ref_conv",
+                build=lambda: (dronet_model.FusedHeadDroNet() if (manifest.get("model") or {}).get("fused_heads")
+                               else dronet_model.DroNet()).to(torch.bfloat16).to(args.device))
+            boundary.eval()
+            images = np.load(args.frames)["frames"]
+            picks = np.random.default_rng(args.seed).choice(len(images), 2, replace=False).tolist()
+            cases = [(torch.from_numpy(images[i]).float().div(255)[None, None].to(torch.bfloat16).to(args.device),)
+                     for i in picks]
+            config_dict = {"architecture": "dronet_resnet8", "input": [1, 1, 200, 200], "frame_indices": picks}
+            frames_record = {"frames": str(Path(args.frames).resolve()), "frames_sha256": _file_record(args.frames)["sha256"],
+                             "frame_indices": picks}
+        elif args.boundary.startswith("smolvla_"):
             import eval_policy
 
             model_id = args.model or manifest["model"]["id"]
@@ -3228,7 +3252,8 @@ def main(argv=None):
                                                                                             "smolvla_prefix") else {}),
                                         **({"host_rope": True} if args.host_rope else {}),
                                         **({"host_text_embeddings": True} if args.host_text_embeddings else {}),
-                                        **({"host_time_embedding": True} if args.host_time_embedding else {})})
+                                        **({"host_time_embedding": True} if args.host_time_embedding else {}),
+                                        **(frames_record if args.boundary == "dronet" else {})})
     print(json.dumps(report, indent=2))
     return 0
 
