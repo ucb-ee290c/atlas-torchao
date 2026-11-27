@@ -9,6 +9,7 @@ usage (run with PYTHONPATH=<worktree>/src):
                         [--steps-per-call N]                                                   # atlas-lerobot env
   make_loop_manifest.py pi0 --single-step-bundle DIR --checkpoint-dir CKPT --openpi-dir OPENPI --out PATH   # atlas-pi0 env
   make_loop_manifest.py smolvla --policy lerobot/smolvla_libero [--n-images 2] [--host-rope] --out PATH        # atlas-lerobot env
+  make_loop_manifest.py causal_lm_layer --layer-bundle DIR --out PATH                                           # one decoder layer
   make_loop_manifest.py causal_lm --prefill-bundle DIR --step-bundle DIR [--decode-steps 32] --out PATH       # TinyLlama
 `--single-step-bundle` is the existing one-step bundle (read only): its bundle_manifest.json names the checkpoint snapshot, its
 fx/fixtures.safetensors gives the observation tensor shapes, dtypes and the camera masks of the capture cases. SmolVLA has no
@@ -607,6 +608,58 @@ def _named_specs(fx_dir, prefix, names):
     return [{"name": n, **specs[k]} for n, k in zip(names, keys)]
 
 
+def _named_specs_exact(fx_dir, prefix, names):
+    """Like _named_specs for a graph whose inputs / outputs are all named in `names` (input_0, input_1, ...)."""
+    specs, _ = _fixture_specs(fx_dir)
+    keys = sorted((k for k in specs if k.startswith(prefix + "_")), key=lambda k: int(k.split("_")[1]))
+    if len(keys) != len(names):
+        raise ValueError(f"{fx_dir}: {len(keys)} {prefix}s, expected {len(names)} ({names})")
+    return [{"name": n, **specs[k]} for n, k in zip(names, keys)]
+
+
+def causal_layer_manifest(layer_bundle):
+    """loop_manifest.json of one decoder layer's decode step (fx_export.CausalDecodeLayer, causal_phase_capture.py --phase
+    decode_layer): the same host loop as the whole step, the graph holding layer `layer` only. The host runs the embedding,
+    the layers before and after it, the final norm and the lm_head itself; this graph is called once per generated token."""
+    from transformers import AutoConfig
+
+    lb = Path(layer_bundle)
+    prov = json.loads((lb / "fx" / "verification.json").read_text())["provenance"]
+    if prov["boundary"] != "causal_lm_decode_layer":
+        raise ValueError(f"boundary {prov['boundary']}, expected causal_lm_decode_layer")
+    layer, capacity = prov["layer"], prov["capacity"]
+    config = AutoConfig.from_pretrained(prov["architecture_locator"])
+    head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+    kv_heads = config.num_key_value_heads
+    export = json.loads((lb / "export" / "manifest.json").read_text())
+    names = [f"k_{layer}", f"v_{layer}"]
+    return {
+        "schema": SCHEMA, "model": "causal_lm_layer",
+        "causal_lm": {"id": prov["architecture_locator"], "export_dir": str((lb / "export").resolve()),
+                      "export_manifest_sha256": prov["export_manifest_sha256"],
+                      "recipe": (export.get("recipe") or {}).get("algo"), "layer": layer,
+                      "layers": config.num_hidden_layers, "n_heads": config.num_attention_heads, "n_kv_heads": kv_heads,
+                      "head_dim": head_dim, "hidden": config.hidden_size, "host_embeddings": prov["host_embeddings"]},
+        "kv_cache": {"names": names, "dtype": "BF16", "capacity": capacity,
+                     "layout": "[batch, n_kv_heads, position, head_dim]: post-RoPE, pre-GQA K / V (transformers StaticCache "
+                               "layout); slot p holds position p",
+                     "per_tensor_shape": [1, kv_heads, capacity, head_dim], "tensors": 2,
+                     "initial_value": "every byte zero (+0.0); slot L must be zero before the step (cache + slot * new)"},
+        "graphs": {"decode_layer": {
+            "boundary": "causal_lm_decode_layer", "bundle": str(lb.resolve()), "calls_per_token": 1,
+            "inputs": _named_specs_exact(lb / "fx", "input", ["hidden", "cos", "sin", "attention_mask", "slot"] + names),
+            "outputs": _named_specs_exact(lb / "fx", "output", ["hidden", f"new_k_{layer}", f"new_v_{layer}"])}},
+        "host": {
+            "rope": f"cos, sin BF16 [1, 1, {head_dim}]: row L of model.model.rotary_emb at positions 0..{capacity - 1} "
+                    "(fx_export.causal_rope_tables)",
+            "decode_mask": f"BF16 [1, 1, 1, {capacity}]: 0 on slots 0..L, BF16 min (0xFF7F) on slots L+1..{capacity - 1} "
+                           "(fx_export.causal_decode_mask)",
+            "decode_slot": f"BF16 [1, 1, {capacity}, 1]: 1.0 at slot L, 0 elsewhere (fx_export.causal_decode_slot)",
+            "cache_write": "after a step at length L: slot L <- new_k, new_v (fx_export.causal_cache_write); the graph "
+                           "never writes its inputs"},
+    }
+
+
 def causal_manifest(prefill_bundle, step_bundle, decode_steps):
     """loop_manifest.json of the causal-LM token loop (fx_export.CausalPrefill / CausalDecodeStep). The geometry is read from
     the architecture config, the capacity / prefill length / host-embedding choice from the two bundles' capture provenance,
@@ -707,7 +760,7 @@ def causal_manifest(prefill_bundle, step_bundle, decode_steps):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("model", choices=("dit", "pi0", "smolvla", "causal_lm"))
+    ap.add_argument("model", choices=("dit", "pi0", "smolvla", "causal_lm", "causal_lm_layer"))
     ap.add_argument("--single-step-bundle")
     ap.add_argument("--policy", default="lerobot/smolvla_libero", help="smolvla: policy repo id (local HF cache)")
     ap.add_argument("--n-images", type=int, default=2, help="smolvla: cameras at the prefix boundary")
@@ -718,6 +771,7 @@ def main(argv=None):
                     help="smolvla: the step graph takes the host flow-timestep embedding")
     ap.add_argument("--prefill-bundle", help="causal_lm: the CausalPrefill bundle")
     ap.add_argument("--step-bundle", help="causal_lm: the CausalDecodeStep bundle")
+    ap.add_argument("--layer-bundle", help="causal_lm_layer: the CausalDecodeLayer bundle")
     ap.add_argument("--decode-steps", type=int, default=32, help="causal_lm: decode steps of the greedy loop")
     ap.add_argument("--out", required=True)
     ap.add_argument("--checkpoint-dir")
@@ -731,7 +785,11 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.model in ("dit", "pi0") and not a.single_step_bundle:
         ap.error(f"{a.model} needs --single-step-bundle")
-    if a.model == "causal_lm":
+    if a.model == "causal_lm_layer":
+        if not a.layer_bundle:
+            ap.error("causal_lm_layer needs --layer-bundle")
+        manifest = causal_layer_manifest(a.layer_bundle)
+    elif a.model == "causal_lm":
         if not a.prefill_bundle or not a.step_bundle:
             ap.error("causal_lm needs --prefill-bundle and --step-bundle")
         manifest = causal_manifest(a.prefill_bundle, a.step_bundle, a.decode_steps)
@@ -747,7 +805,7 @@ def main(argv=None):
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(manifest, indent=1, allow_nan=False) + "\n")
     print(json.dumps({"out": str(out), "sha256": _sha(out), **({"decode_steps": manifest["loop"]["decode_steps"]}
-                      if a.model == "causal_lm" else {"denoising_steps": manifest["denoising_steps"]})}))
+                      if a.model == "causal_lm" else {} if a.model == "causal_lm_layer" else {"denoising_steps": manifest["denoising_steps"]})}))
     return 0
 
 

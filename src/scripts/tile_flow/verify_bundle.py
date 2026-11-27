@@ -292,7 +292,15 @@ def run(export, fx, out, allow_fallback=False, allow_unquantized_attention=True,
     exp_stems = _wrapper_stems(bufs, "weight_scale_exp")
     in_graph = {n for n in sites if n in code_stems}
     unused_derived = sorted(set(sites) - in_graph)
-    unused_declared = sorted(r["site"] for r in gi.get("unused_quantized_modules", []))
+    # A boundary that holds only part of the model (policy_site_scope, e.g. one decoder layer) never calls the sites outside
+    # its scope: they are unused by construction, so they count as declared unused next to the bundle's own list.
+    site_scope = gi.get("policy_site_scope")
+
+    def _outside_scope(name):
+        return site_scope is not None and not any(name.startswith(prefix) for prefix in site_scope)
+
+    unused_declared = sorted({r["site"] for r in gi.get("unused_quantized_modules", [])}
+                             | {n for n in sites if _outside_scope(n)})
     unused_agree = unused_derived == unused_declared
     used = {n: s for n, s in sites.items() if n in in_graph}
     n_lin_used = sum(1 for s in used.values() if s["kind"] == "linear")
@@ -312,7 +320,8 @@ def run(export, fx, out, allow_fallback=False, allow_unquantized_attention=True,
                 and str(n.target) == "atlas.quantize_act.default" and len(n.args) > 6 and ":" in str(n.args[6])}
     tagged = bool(act_tags) or "unused_attention_modules" in gi
     absent_derived = sorted(a for a in attn_all if a not in act_tags) if tagged else []
-    absent_declared = sorted(r["site"] for r in gi.get("unused_attention_modules", []))
+    absent_declared = sorted({r["site"] for r in gi.get("unused_attention_modules", [])}
+                             | {a for a in attn_all if _outside_scope(a)})
     absent_agree = absent_derived == absent_declared
     attn_policy = [a for a in attn_all if a not in absent_derived]
     qk_nodes = [n for n in prog.graph.nodes if n.op == "call_function" and str(n.target) == "atlas.qk_matmul.default"]
