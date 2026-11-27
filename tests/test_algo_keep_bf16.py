@@ -106,4 +106,5 @@ def test_selects_the_dit_patch_embedding(monkeypatch):
     import eval_policy as ep
 
     policy, _ = ep.load_policy(DIT, "cpu", torch.float32)
-    assert list(algos.make(RULE).select(policy)) == [DIT_PATCH]
+    # transformers 5.22's CLIPVisionModel has no `vision_model.` level (5.5 had one)
+    assert list(algos.make(RULE).select(policy)) in ([DIT_PATCH], [DIT_PATCH.replace(".vision_model.", ".")])

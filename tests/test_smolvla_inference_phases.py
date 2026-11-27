@@ -42,7 +42,7 @@ def _grid(steps=STEPS):
 
 
 def _lerobot_prefill(model, images, img_masks, lang_tokens, lang_masks, state):
-    from lerobot.policies.common.vla_utils import make_att_2d_masks
+    make_att_2d_masks = pytest.importorskip("lerobot.policies.common.vla_utils").make_att_2d_masks
 
     embs, pad, att = model.embed_prefix(list(images), img_masks, lang_tokens, lang_masks, state=state)
     _, cache = model.vlm_with_expert.forward(attention_mask=make_att_2d_masks(pad, att),
@@ -106,7 +106,7 @@ def test_phases_are_lerobots_prefill_denoise_step_and_sample_actions(quantized, 
 
 
 def test_boundaries_restore_rope_and_layer_methods(quantized):
-    import lerobot.policies.smolvla.smolvlm_with_expert as swe
+    swe = pytest.importorskip("lerobot.policies.smolvla.smolvlm_with_expert")
 
     policy, _ = quantized
     inner = policy.model.vlm_with_expert
@@ -131,7 +131,7 @@ def test_step_rope_tables_are_chosen_by_role_not_length():
     x = torch.randn(1, 4, 2, 8)
     with pytest.raises(ValueError, match="distinct sequence lengths"):
         rope.apply_rope(x, positions)
-    import lerobot.policies.smolvla.smolvlm_with_expert as swe
+    swe = pytest.importorskip("lerobot.policies.smolvla.smolvlm_with_expert")
 
     for role, offset in (("suffix", 9), ("expert", 0)):
         rope.role = role
@@ -142,7 +142,7 @@ def test_step_rope_tables_are_chosen_by_role_not_length():
 
 
 def test_step_host_inputs_are_denoise_steps():
-    from lerobot.policies.common.vla_utils import make_att_2d_masks
+    make_att_2d_masks = pytest.importorskip("lerobot.policies.common.vla_utils").make_att_2d_masks
 
     pad = torch.tensor([[True] * 6 + [False] * 3 + [True]])
     geometry = SimpleNamespace(tokens_per_image=4, chunk_size=CHUNK, head_dim=8)
