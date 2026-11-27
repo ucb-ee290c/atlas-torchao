@@ -32,6 +32,7 @@ usage (PYTHONPATH=<worktree>/src):
 import argparse
 import hashlib
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -614,7 +615,8 @@ def main(argv=None):
     ap.add_argument("--cache-dir", default=None, help="pi0: save eager and composed loop outputs here")
     ap.add_argument("--openpi-dir")
     ap.add_argument("--checkpoint-dir")
-    ap.add_argument("--tokenizer-path", default="/scratch2/lorenhung/models/big_vision/paligemma_tokenizer.model")
+    ap.add_argument("--tokenizer-path", default=os.environ.get("PALIGEMMA_TOKENIZER"),
+                    help="pi0 --eager-loop: paligemma_tokenizer.model (default $PALIGEMMA_TOKENIZER)")
     ap.add_argument("--unpadded", action="store_true", help="smolvla: also an all-true language mask case (eager loop)")
     ap.add_argument("--decode-steps", type=int, default=None, help="causal_lm: decode steps (default: the manifest's)")
     ap.add_argument("--prompts", type=int, default=None, help="causal_lm: only the first N prompts of host_cases")
@@ -623,6 +625,8 @@ def main(argv=None):
     ap.add_argument("--dynamic-reference-cache",
                     help="causal_lm: also compare with generate's default DynamicCache loop (cached / computed here)")
     a = ap.parse_args(argv)
+    if a.model == "pi0" and a.eager_loop and not a.tokenizer_path:
+        ap.error("pi0 --eager-loop needs --tokenizer-path (or $PALIGEMMA_TOKENIZER)")
     # the loop manifest names its model family: refuse a bundle of another family (e.g. a causal-LM bundle under
     # `smolvla` or `dit`, a SmolVLA or DiT bundle under `causal_lm`); Pi0's manifest records a dict there
     family = {"dit": "multi_task_dit", "smolvla": "smolvla", "causal_lm": "causal_lm"}

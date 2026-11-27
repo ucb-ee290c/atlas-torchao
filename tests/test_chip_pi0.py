@@ -158,6 +158,7 @@ def _pi0_mask(att_2d):
     return torch.where(att_2d[:, None, :, :], 0.0, -2.3819763e38)
 
 
+@pytest.mark.usefixtures("refs")
 def test_pi0_mask_masks_through_the_vexp_floor():
     """Prefix-LM mask with padding (make_att_2d_masks, pi0_pytorch.py:52-81): masked logits are
     -2.38e38 after the vadd; vexp alone would return exp(-2.38e38 - max) = 1 (the model wraps below
@@ -185,6 +186,7 @@ def test_pi0_mask_masks_through_the_vexp_floor():
     assert r.vpu.exp(torch.tensor([-2.3819763e38])).item() == 1.0                # why the floor is needed
 
 
+@pytest.mark.usefixtures("refs")
 def test_flow_time_loop_stays_float32():
     """sample_actions' `time += dt` / `while time >= -dt / 2` (pi0_pytorch.py:402-419): the 0-d
     in-place update stays on the host in float32, as in the reference (no add_ in pi0-quant's

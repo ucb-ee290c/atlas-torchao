@@ -367,7 +367,7 @@ MXU, Q and P +321%). It uses the per-token cast and is not part of any tile reci
 
 ### Hardware cost report
 
-`python -I src/scripts/hw_report.py [--export model.safetensors] [--T 1 32 128 2048] [--mxu ipt|sa]` (model
+`python -I src/scripts/hw_report.py --export model.safetensors --out-json hw_report.json [--T 1 32 128 2048] [--mxu ipt|sa]` (model
 `src/chip/hw_cost.py`, constants `src/chip/hw_params.py`, tests `tests/test_hw_cost.py`). It reports per-layer shapes, DMA
 and MXU cycles, flush bounds, and where a pop scale is free. The report predates the tile recipes and was run on the per-channel
 TinyLlama `atlas_v1` export; its findings motivate the tile layout:

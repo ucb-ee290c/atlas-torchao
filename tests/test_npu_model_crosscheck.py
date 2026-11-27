@@ -1,7 +1,7 @@
 """atlas-torchao's Atlas numerics against npu-model's RTL-fitted numerics, bit for bit.
 
 The comparison code is src/scripts/npu_model_crosscheck.py (run it directly for a report). Skipped when
-no npu-model checkout is found ($NPU_MODEL, default /scratch2/lorenhung/atlas-npu-rtl/src/npu-model)
+no npu-model checkout is found ($NPU_MODEL, default the third_party/npu_model submodule)
 or the pi0-quant submodule is missing.
 """
 import os

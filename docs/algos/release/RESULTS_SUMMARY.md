@@ -4,7 +4,7 @@
 
 Select AWQ plus GPTQ, token and channel granularity (`nc`), and rounded vector addition (`rn`) for `atlas_v1`. AWQ has the lowest measured chip error on TinyLlama, SmolVLA and Pi0. It ties the SmoothQuant candidate bit for bit on DiT at `ref_conv`; a DiT chip recipe result is unavailable. Keep `atlas_v1_static` as the fallback while the hardware team resolves runtime scales.
 
-**NEW:** the canonical DiT recipe keeps the CLIP patch embedding in BF16. This composite choice combines the measured AWQ candidate with the measured patch exception. Its fresh full-checkpoint export passed an eight-frame, 96-tensor byte-identical round trip at `5ff028ee58b28606873278236a379dcc09339b82`. DiT chip accuracy is an unmeasured benchmark gap, not an export release gate. These results evaluate numerical simulation on L40S, not execution on Atlas hardware.
+**NEW:** the canonical DiT recipe keeps the CLIP patch embedding in BF16. This composite choice combines the measured AWQ candidate with the measured patch exception. Its fresh full-checkpoint export passed an eight-frame, 96-tensor byte-identical round trip at `5ff028ee58b28606873278236a379dcc09339b82`. DiT chip accuracy is an unmeasured benchmark gap, not an export release gate. These results evaluate numerical simulation on the GPU box, not execution on Atlas hardware.
 
 ## TinyLlama
 
