@@ -476,7 +476,9 @@ def compose_causal(a):
           attention contracts over L + 1 keys, the graphs' over C, and the float32 sums can round differently);
       (3) the step is pure (same inputs twice, inputs unchanged; no mutated user input in the signature);
       (4) the K / V shapes and dtypes against the manifest; graph census."""
-    from safetensors.torch import load_file, save_file
+    from safetensors.torch import load_file
+
+    from exporter.quant_export import save_file
 
     import exporter.fx_export as fx_export
     import exporter.load_quantized as load_quantized

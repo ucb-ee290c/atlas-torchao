@@ -221,6 +221,8 @@ def test_manifest_digests_and_fields(tmp_path, spec):
     for f in ("model.safetensors", "policy.json"):
         assert man["files"][f]["sha256"] == hashlib.sha256((d / f).read_bytes()).hexdigest()
     assert man["policy_sha256"] == man["files"]["policy.json"]["sha256"]
+    # safetensors 0.8 alone writes 0600; the export must be as readable as its JSON files
+    assert (d / "model.safetensors").stat().st_mode == (d / "policy.json").stat().st_mode
     disk = json.loads((d / "manifest.json").read_text())
     assert disk["files"] == man["files"]
     assert disk["m2m_manifest_v2_aligned"] == "partial" and disk["m2m_manifest_v2_differences"]
@@ -233,6 +235,27 @@ def test_manifest_digests_and_fields(tmp_path, spec):
     (d / "policy.json").write_text((d / "policy.json").read_text() + " ")
     with pytest.raises(ValueError, match="sha256"):
         load_quantized.read_export(d)
+
+
+def test_save_file_is_reproducible_and_readable(tmp_path):
+    """safetensors 0.8 writes __metadata__ in hash-map order and mode 0600; quant_export.save_file fixes both."""
+    import os
+
+    from safetensors import safe_open
+
+    tensors = {"b": torch.arange(6, dtype=torch.float32).reshape(2, 3), "a": torch.tensor([1, 2], dtype=torch.uint8)}
+    meta = {"schema": "s", "format_version": "1", "exported_mode": "ref_conv", "z": "last"}
+    paths = [tmp_path / f"{i}.safetensors" for i in range(6)]
+    for p in paths:
+        quant_export.save_file(tensors, p, metadata=meta)
+    assert len({p.read_bytes() for p in paths}) == 1        # unsorted, 6 saves match by chance with p < 1e-5
+    back = load_file(paths[0])
+    assert back.keys() == tensors.keys() and all(torch.equal(back[k], tensors[k]) for k in tensors)
+    with safe_open(paths[0], framework="pt") as f:
+        assert f.metadata() == meta
+    umask = os.umask(0)
+    os.umask(umask)
+    assert paths[0].stat().st_mode & 0o777 == 0o666 & ~umask
 
 
 def test_recipe_specs_match_the_registry():
