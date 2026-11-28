@@ -1842,7 +1842,7 @@ def capture_fx(module, cases, directory, *, policy, provenance=None, strict=True
     Linear (native_candidates) as atlas.quantize_act + atlas.qlinear with its code buffer held in that
     dtype (the same bytes); the decode-based graph is also captured in memory and must give
     byte-identical outputs. Conv2d, attention and other sites stay decode-based and are listed."""
-    from safetensors.torch import save_file
+    from exporter.quant_export import save_file
 
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=False)

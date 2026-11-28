@@ -439,7 +439,9 @@ def main(argv=None):
             setattr(torch._dynamo.config, name, max(getattr(torch._dynamo.config, name), 256))
 
     from safetensors import safe_open
-    from safetensors.torch import load_file, save_file
+    from safetensors.torch import load_file
+
+    from exporter.quant_export import save_file
 
     fx = Path(args.bundle)
     fx = fx / "fx" if (fx / "fx" / "model.pt2").is_file() else fx

@@ -322,7 +322,7 @@ zero (`dead = diag(H) == 0`). When calibration never excites an input channel, t
 ([SigLIP fc2 zero columns](#siglip-fc2-zero-columns)). With `rtn`, dead columns are cast to nearest on the same pinned exponents
 and take no part in error feedback; live columns are bit-identical to `zero`. The default is bit-identical to the original
 routine. Tests: `tests/test_gptq_dead_columns.py` (13 tests). After a run, count all-zero weight columns per tensor with
-`src/scripts/tile_diag/fc2_export_compare.py`.
+`src/scripts/tile_diag/fc2_export_compare.py` (removed after `50d6c30`; `git show 50d6c30:src/scripts/tile_diag/fc2_export_compare.py`).
 
 ### Producer-aware AWQ
 
@@ -778,7 +778,7 @@ the pack-fold code is byte-identical to the base commit (49 tensors, `policy.jso
 | pack range | `src/exporter/pack_plan.py`, `src/exporter/pack_fold.py`, `src/scripts/tile_flow/pack_plan_census.py` |
 | attention | `src/reference/ref_attention.py` |
 | hardware model | `src/chip/chip_profile.py`, `src/chip/hw_params.py`, `src/chip/hw_cost.py`, `src/chip/hw_scale.py`, `src/chip/hw_two_term.py` |
-| scripts | `src/scripts/tile_flow/` (`verify_bundle`, `inmem_check`, `quality`, `dyn_admission`, `static_clip`, `compare_fx_logits`, `make_bundle_manifest`, `make_tiny_llama`, `pack_plan_census`, `make_loop_manifest`, `policy_fx_capture_phases`, `pi0_phase_capture`, `compose_phases`, `pi0_thread_repro`), `src/scripts/tile_diag/` (Pi0 drift, weights-only error, fc2 and AWQ diagnostics), `src/scripts/hw_report.py`, `src/scripts/npu_model_l2.py`, `src/scripts/k_order_screen.py` |
+| scripts | `src/scripts/tile_flow/` (`verify_bundle`, `inmem_check`, `quality`, `dyn_admission`, `static_clip`, `compare_fx_logits`, `make_bundle_manifest`, `make_tiny_llama`, `pack_plan_census`, `make_loop_manifest`, `policy_fx_capture_phases`, `pi0_phase_capture`, `compose_phases`, `pi0_thread_repro`), `src/scripts/tile_diag/` (Pi0 drift, weights-only error, fc2 and AWQ diagnostics; one-off, removed after `50d6c30`), `src/scripts/hw_report.py`, `src/scripts/npu_model_l2.py`, `src/scripts/k_order_screen.py` |
 | tests | `tests/test_algo_tile.py`, `tests/test_tile_flow_defects.py`, `tests/test_pack_plan.py`, `tests/test_pack_fold.py`, `tests/test_gptq_dead_columns.py`, `tests/test_awq_producer_aware.py`, `tests/test_dit_rope_attention.py`, `tests/test_fx_calls.py`, `tests/test_loop_manifest.py`, `tests/test_verify_bundle_phases.py`, `tests/test_verify_bundle_smolvla.py`, `tests/test_hw_cost.py`, `tests/test_algo_k_order.py`, `tests/test_hw_two_term.py` |
 
 Sources: Atlas RTL (`ucb-bar/atlas-npu`) and `npu_model` (`vmatpop.fp8`, `vpack`, `vunpack`), `atlas-mlir` `lowerPack`,

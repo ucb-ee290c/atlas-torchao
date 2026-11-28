@@ -135,19 +135,21 @@ def test_dit_checkpoint_loads_completely(monkeypatch):
 
     policy, _ = ep.load_policy(DIT, "cpu", torch.float32)
     rec = policy.checkpoint_key_repair
-    assert rec["n_remapped"] == 395
+    # transformers 5.5 nests CLIP one level deeper than the checkpoint (395 keys remapped); 5.22 matches it (0)
+    assert rec["n_remapped"] in (0, 395)
     file = ckpt_keys.resolve_checkpoint_file(DIT)
+    key = "observation_encoder.vision_encoder.model.encoder.layers.0.self_attn.q_proj.weight"
     with safe_open(file, framework="pt") as f:
         keys = list(f.keys())
-        ref = f.get_tensor("observation_encoder.vision_encoder.model.encoder.layers.0.self_attn.q_proj.weight")
-    renamed = set()
-    for k in keys:
+        ref = f.get_tensor(key)
+
+    def rename(k):
         for r in rec["rules"]:
             if k.startswith(r["from_prefix"] + "."):
-                k = r["to_prefix"] + k[len(r["from_prefix"]):]
-                break
-        renamed.add(k)
-    missing, unexpected = ckpt_keys.key_diff(policy.state_dict(), renamed)
+                return r["to_prefix"] + k[len(r["from_prefix"]):]
+        return k
+
+    missing, unexpected = ckpt_keys.key_diff(policy.state_dict(), {rename(k) for k in keys})
     assert not missing and not unexpected
-    got = policy.state_dict()["observation_encoder.vision_encoder.model.vision_model.encoder.layers.0.self_attn.q_proj.weight"]
+    got = policy.state_dict()[rename(key)]
     assert torch.equal(got, ref.to(got.dtype))

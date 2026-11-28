@@ -7,22 +7,13 @@ import torch
 import chip.chip_coverage as cc
 import quant_modes
 from refutil import need_refs
-
-
-def tiny_llama(layers=2):
-    from transformers import LlamaConfig, LlamaForCausalLM
-
-    cfg = LlamaConfig(vocab_size=128, hidden_size=64, intermediate_size=96, num_hidden_layers=layers,
-                      num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=64,
-                      attn_implementation="eager", use_cache=False)
-    torch.manual_seed(0)
-    return LlamaForCausalLM(cfg).to(torch.bfloat16).eval()
+from test_ladder import tiny_llama
 
 
 @pytest.mark.parametrize("mxu", ["framework", "model"])
 def test_tiny_llama_chip(mxu):
     need_refs()
-    model = tiny_llama()
+    model = tiny_llama(2)
     ids = torch.randint(0, 128, (1, 32), generator=torch.Generator().manual_seed(0))
     with torch.no_grad():
         ref = model(ids, labels=ids).loss.item()
@@ -72,7 +63,7 @@ def test_dynamic_scale_chain_rows_are_additive_and_new():
     import algos
 
     def run(spec):
-        model = tiny_llama()
+        model = tiny_llama(2)
         rep = algos.quantize(model, "chip", ["lm_head"], {"chip_mxu": "framework"}, algo=algos.make(spec))
         model(torch.randint(0, 128, (1, 32), generator=torch.Generator().manual_seed(0)))
         return rep["coverage"]

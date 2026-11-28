@@ -8,21 +8,16 @@ version = "0.0.1"
 requires-python = ">=3.11"
 dependencies = [
     "torch==2.11.0",
-    "torch-mlir",  
     "torchvision==0.26.0",
     "torchao==0.18.0",
-    "transformers==5.5.4",
-    "tokenizers==0.22.2",
+    "transformers==5.22.2",
+    "tokenizers==0.23.3",
     "huggingface_hub==1.33.0",
     "accelerate==1.15.0",
     "safetensors==0.8.0",
-    "datasets==5.1.0",
+    "datasets==5.2.0",
     "numpy==2.2.6",
     "ml_dtypes>=0.4.0",
-    # model2MLIR's internal dependencies
-    "xdsl==0.65.0",
-    "structlog==25.5.0",
-    "PyYAML==6.0.3",
 ]
 
 [project.optional-dependencies]
@@ -30,11 +25,16 @@ dependencies = [
 # `ref_cpu` accumulation implementation: ipt_numba needs numba; ipt_c and systolic_c are compiled
 # with gcc at first use.
 reference = ["numba>=0.60"]
+# LeRobot policies (SmolVLA, Multi-Task DiT) for eval_policy.py; lerobot 0.7 needs transformers 5.22.
+policy = ["lerobot[smolvla,dataset,diffusers-dep]==0.7.0"]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
-packages = ["algos", "reference", "mxu", "chip", "exporter", "loaders", "collab"]
-py-modules = ["quant_modes", "layer_rmse", "eval", "eval_policy", "eval_pi0", "chip_coverage"]
+packages = ["algos", "reference", "mxu", "chip", "exporter", "loaders", "collab", "dronet"]
+py-modules = ["quant_modes", "layer_rmse", "eval", "eval_policy", "eval_pi0", "eval_dronet", "chip_coverage"]
+
+[tool.pytest.ini_options]
+markers = ["slow: loads a full checkpoint from HF_HOME"]
 
 # Not enabled yet: the m2m quantization adapter (atlas_m2m_adapter:atlas_fp8_adapter) is not written.
 # [project.entry-points."m2m.quantization_adapters"]

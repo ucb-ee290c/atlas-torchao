@@ -98,7 +98,7 @@ def write_cases(policy, manifest, batches, timesteps, out, seed, frames):
 
     from huggingface_hub import snapshot_download
     from lerobot.utils.constants import OBS_IMAGES, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
-    from safetensors.torch import save_file
+    from exporter.quant_export import save_file
 
     (out / "fx").mkdir(parents=True, exist_ok=True)
     tensors, parity = {}, {"cases": []}

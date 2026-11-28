@@ -119,7 +119,7 @@ def observations(policy, cfg, model_id, n_frames, root=None, device="cpu"):
 
 
 def save_host_cases(path, obs, record, steps=None):
-    from safetensors.torch import save_file
+    from exporter.quant_export import save_file
 
     tensors = {}
     for i, o in enumerate(obs):

@@ -83,7 +83,7 @@ def main(argv=None):
                                          steps=tuple(a.case_steps), embed=embed, prompts=prompts)
     out.mkdir(parents=True, exist_ok=True)
     fx_export.link_export(a.export_dir, out / "export")
-    from safetensors.torch import save_file
+    from exporter.quant_export import save_file
 
     save_file({"prompts": prompts.contiguous()}, str(out / "host_cases.safetensors"))
     meta.update(capture_cases=[0, 1], case_steps=list(a.case_steps) if a.phase != "prefill" else None)

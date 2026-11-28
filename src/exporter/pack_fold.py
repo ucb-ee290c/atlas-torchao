@@ -565,7 +565,7 @@ def fold_export_dir(src, dst, graph_text: str, signature_text: str) -> dict:
     tensors / policy and a manifest with recomputed hashes. `graph_text` / `signature_text` are fx/graph.txt and
     fx/graph_signature.txt of a native-FP8 capture of `src`. Returns the pack_fold_summary."""
     from safetensors import safe_open
-    from safetensors.torch import save_file
+    from exporter.quant_export import save_file
 
     import exporter.load_quantized as load_quantized
     import exporter.quant_export as quant_export

@@ -24,6 +24,7 @@ from __future__ import annotations
 import datetime as _dt
 import hashlib
 import json
+import os
 import platform
 import subprocess
 import sys
@@ -686,6 +687,28 @@ def build_policy(model, mode, report, algo, options, skip, bf16_opt_out, opt_out
 # Provenance helpers
 # ---------------------------------------------------------------------------------------------
 
+def save_file(tensors, path, metadata=None):
+    """safetensors.torch.save_file, made reproducible and readable: safetensors 0.8 writes `__metadata__` in hash-map
+    order (equal exports differ in bytes from run to run), so the header is rewritten with sorted keys at its own
+    length; and it writes mode 0600, hiding exports from others, so the umask's mode is applied."""
+    from safetensors.torch import save_file as _save_file
+
+    _save_file(tensors, str(path), metadata=metadata)
+    with open(path, "r+b") as f:
+        n = int.from_bytes(f.read(8), "little")
+        header = json.loads(f.read(n))
+        if "__metadata__" in header:
+            header["__metadata__"] = dict(sorted(header["__metadata__"].items()))
+            raw = json.dumps(header, separators=(",", ":")).encode()
+            if len(raw) > n:
+                raise RuntimeError(f"safetensors header of {path} grew when sorted ({len(raw)} > {n} bytes)")
+            f.seek(8)
+            f.write(raw.ljust(n, b" "))
+    umask = os.umask(0)
+    os.umask(umask)
+    os.chmod(path, 0o666 & ~umask)
+
+
 def sha256_file(path) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -847,7 +870,6 @@ def export(model: nn.Module, export_dir, *, mode: str, report: dict, algo, algo_
 
     head_embed (NEW; src/exporter/head_embed.py export_record): the --tie / --lm-head / --embedding options and
     what they changed, written to both files. None (the default options) writes neither key."""
-    from safetensors.torch import save_file
 
     import quant_modes
 
