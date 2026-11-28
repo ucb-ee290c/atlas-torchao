@@ -2,6 +2,17 @@
 
 New here? [docs/user-guide.md](docs/user-guide.md) walks from a fresh clone to a quantized export.
 
+One command does the main jobs (`pip install -e .` installs it; `python -m atlas` without installing):
+
+    atlas export TinyLlama/TinyLlama-1.1B-Chat-v1.0 out/tinyllama/export        # quantize + export (atlas_v1_awq_tile_static)
+    atlas eval TinyLlama/TinyLlama-1.1B-Chat-v1.0 --modes bf16 ref_conv --from-export out/tinyllama/export
+    atlas fx out/tinyllama/export out/tinyllama/fx --seqlen 64                    # native-FP8 FX bundle
+    atlas verify out/tinyllama/export out/tinyllama/fx
+
+Each runs an existing script unchanged (`src/eval.py`, `src/eval_policy.py`, `src/eval_dronet.py`,
+`python -m exporter.fx_export`, `verify_bundle.py`); those keep working, and `--dry-run` prints the equivalent
+command ([user guide](docs/user-guide.md#equivalent-commands)).
+
 ## Setup
 
 Step by step, from a fresh clone to a verified export: [docs/user-guide.md](docs/user-guide.md). In short:
@@ -18,12 +29,14 @@ Step by step, from a fresh clone to a verified export: [docs/user-guide.md](docs
 
 ## Layout of `src/`
 
-Entry points sit at the top of `src/` (run them as `python src/eval.py ...`); everything else is a package.
+Entry points sit at the top of `src/` (run them as `python src/eval.py ...`, or through `atlas`); everything else is
+a package.
 `src/` must be on `PYTHONPATH` (the entry points and `tests/conftest.py` do this).
 
 | Path | What lives there |
 |---|---|
-| `eval.py`, `eval_policy.py`, `eval_pi0.py` | CLIs: LLM perplexity, LeRobot policies (SmolVLA, DiT), Pi0 |
+| `atlas.py` | the `atlas` command: `export`, `eval`, `fx`, `verify`, a thin translation into the CLIs below |
+| `eval.py`, `eval_policy.py`, `eval_pi0.py`, `eval_dronet.py` | CLIs: LLM perplexity, LeRobot policies (SmolVLA, DiT), Pi0, DroNet |
 | `quant_modes.py` | the coverage ladder: mode name to profile, and `quantize()` dispatch |
 | `layer_rmse.py` | per-layer isolated and cumulative RMSE against a clean BF16 pass |
 | `reference/` | the reference author's cast and module replacements: `ref_loader` (pinned submodules), `ref_numerics` (E4M3 cast, po2 scales), `ref_profile` (Linear), `ref_attention` (Q.K, P.V, Conv2d) |
