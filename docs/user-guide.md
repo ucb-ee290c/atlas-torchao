@@ -5,8 +5,8 @@ power-of-two exponents), `policy.json` (how each site executes) and `manifest.js
 Format details: [algos/export.md](algos/export.md). Recipes: [algos/atlas_v1.md](algos/atlas_v1.md),
 [algos/tile-aware.md](algos/tile-aware.md).
 
-All commands run from the repository root. Sections 1-4 and 6 were run as written on a CPU-only Linux box
-(2026-11-27, main `50d6c30`); times are from that box under load.
+All commands run from the repository root. Sections 1-6 (all but the Multi-Task DiT export) were run as written in a
+fresh clone and environment on a CPU-only Linux box (2026-11-27); times are ranges seen on that shared box.
 
 ## 1. Setup (once per machine)
 
@@ -14,7 +14,7 @@ All commands run from the repository root. Sections 1-4 and 6 were run as writte
 git clone git@github.com:ucb-ee290c/atlas-torchao.git && cd atlas-torchao
 git submodule update --init third_party/pi0-quant third_party/smolVLA-quant   # not --recursive
 conda create -y -p /scratch/$USER/atlas-env python=3.12 pip                    # on /scratch, not $HOME
-conda activate /scratch/$USER/atlas-env
+conda activate /scratch/$USER/atlas-env          # if this fails: eval "$(conda shell.bash hook)" first
 pip install -e .[reference,policy] pytest       # torch 2.11, transformers 5.22.2, torchao 0.18, numba, lerobot 0.7
 ```
 
@@ -28,11 +28,13 @@ export PYTHONPATH=src
 export HF_HOME=/scratch/$USER/hf_home           # the Hub cache: models and datasets land here
 ```
 
-Check the install (about 40 minutes on CPU; GPU tests skip without a GPU):
+Check the install (40-70 minutes on CPU; GPU tests skip without a GPU):
 
 ```bash
-python -m pytest -q tests      # 0 failed
+python -m pytest -q tests > pytest.log 2>&1; grep -E "[0-9]+ (passed|failed)" pytest.log   # 0 failed
 ```
+
+The summary line is not the last line: the chip tests print their coverage tables at exit.
 
 ## 2. Smoke test (about 1 minute, CPU)
 
@@ -56,7 +58,7 @@ git status --short        # should be empty: the manifest records the commit and
 export OUT=/scratch/$USER/exports/tinyllama/atlas_v1_awq_tile_static      # must not exist yet
 python -u src/eval.py --model $MODEL --modes ref_conv --export-only --algo atlas_v1_awq_tile_static \
     --device cpu --export-dir $OUT/export --out $OUT/export_cli.json
-# prints: export: wrote .../export (1175.7 MiB, 176 quantized sites)       about 28 min on CPU
+# prints: export: wrote .../export (1175.7 MiB, 176 quantized sites)       30-45 min on CPU, ~6 min on a GPU
 ```
 
 - `--algo` picks the recipe. Name it explicitly, never the `atlas_v1` alias (its meaning changed between tags).
@@ -81,7 +83,8 @@ match the manifest. In `$OUT/export/manifest.json`, check:
 - `provenance.atlas_torchao_dirty` is false and `provenance.atlas_torchao_commit` is the commit you ran;
 - `recipe.resolved` is the recipe you meant;
 - `calibration` is the data you expected;
-- `counts`: `quantized` 176 for TinyLlama.
+- `counts`: `quantized` 176 for TinyLlama (154 Linear + 22 attention sites; the loader's `report` counts the 154
+  Linear sites only).
 
 From Python (same shell, so `MODEL` and `OUT` are set):
 
@@ -94,18 +97,21 @@ model, report, manifest = load_quantized(os.environ["MODEL"], os.environ["OUT"] 
 ## 5. Other models
 
 The same flags (`--algo`, `--modes ref_conv --export-only`, `--export-dir`) work on the other CLIs. LeRobot
-policies come with the `policy` extra installed above.
+policies come with the `policy` extra installed above. `eval_policy.py` requires `--out` (the run's JSON record).
+The SmolVLA export warns that `model.vlm_with_expert.vlm.lm_head` has no calibration data: expected, the policy
+never calls the VLM's `lm_head` (lerobot freezes it as unused).
 
 ```bash
-# SmolVLA (--norm-stats dataset is required)
+export EXP=/scratch/$USER/exports/atlas_v1_awq_tile_static
+# SmolVLA (--norm-stats dataset is required); prints 476.9 MiB, 317 quantized sites
 python -u src/eval_policy.py --policy lerobot/smolvla_base --dataset lerobot/svla_so100_pickplace \
     --norm-stats dataset --seed 0 --modes ref_conv --export-only --algo atlas_v1_awq_tile_static \
-    --device cuda --export-dir /scratch/$USER/exports/smolvla/atlas_v1_awq_tile_static/export
+    --device cuda --export-dir $EXP/smolvla/export --out $EXP/smolvla/export_cli.json   # ~6 min on CPU
 # Multi-Task DiT (keeps the image-input Conv2d in BF16)
 python -u src/eval_policy.py --policy TRI-ML/multitask-dit-robosuite-wrist-diffusion-064000 \
     --dataset TRI-ML/PretrainFinetune --seed 0 --modes ref_conv --export-only \
     --algo "atlas_v1_awq_tile_static+keep_bf16:rule=input_conv" --device cuda \
-    --export-dir /scratch/$USER/exports/dit/atlas_v1_awq_tile_static/export
+    --export-dir $EXP/dit/export --out $EXP/dit/export_cli.json
 ```
 
 Pi0 needs openpi's separate environment (torch 2.7.1, transformers 4.53.2); its setup and commands are in
@@ -128,5 +134,6 @@ hardware models (`reference_hw`, `chip`): the README's coverage ladder.
 - `Failed to load ... torchao/_C_*.so` at startup: harmless, those are optional torchao kernels.
 - "unauthenticated requests to the HF Hub": harmless; `export HF_HUB_OFFLINE=1` once everything is cached.
 - The export directory and the FX out directory must not exist; nothing is ever overwritten.
-- `model.safetensors` is written with mode 0600; `chmod a+r` it before sharing an export.
+- "TorchCodec could not load the FFmpeg libraries ... Falling back to 'pyav'": harmless, the video frames decode with
+  pyav instead.
 - SmolVLA refuses to run: add `--norm-stats dataset`.
