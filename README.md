@@ -2,13 +2,13 @@
 
 New here? [docs/user-guide.md](docs/user-guide.md) walks from a fresh clone to a quantized export.
 
-One command does the main jobs (`pip install -e .` installs it; `python -m atlas` without installing):
+One command does the main jobs (`pip install -e .` installs it; `python -m atq` without installing):
 
     MODEL=$(hf download --quiet TinyLlama/TinyLlama-1.1B-Chat-v1.0)              # local snapshot path
-    atlas export $MODEL out/tinyllama/export                                     # quantize + export (atlas_v1_awq_tile_static)
-    atlas eval $MODEL --modes bf16 ref_conv --from-export out/tinyllama/export
-    atlas fx out/tinyllama/export out/tinyllama/fx --seqlen 64                    # native-FP8 FX bundle
-    atlas verify out/tinyllama/export out/tinyllama/fx
+    atq export $MODEL out/tinyllama/export                                     # quantize + export (atlas_v1_awq_tile_static)
+    atq eval $MODEL --modes bf16 ref_conv --from-export out/tinyllama/export
+    atq fx out/tinyllama/export out/tinyllama/fx --seqlen 64                    # native-FP8 FX bundle
+    atq verify out/tinyllama/export out/tinyllama/fx
 
 Each runs an existing script unchanged (`src/eval.py`, `src/eval_policy.py`, `src/eval_dronet.py`,
 `python -m exporter.fx_export`, `verify_bundle.py`); those keep working, and `--dry-run` prints the equivalent
@@ -30,13 +30,13 @@ Step by step, from a fresh clone to a verified export: [docs/user-guide.md](docs
 
 ## Layout of `src/`
 
-Entry points sit at the top of `src/` (run them as `python src/eval.py ...`, or through `atlas`); everything else is
+Entry points sit at the top of `src/` (run them as `python src/eval.py ...`, or through `atq`); everything else is
 a package.
 `src/` must be on `PYTHONPATH` (the entry points and `tests/conftest.py` do this).
 
 | Path | What lives there |
 |---|---|
-| `atlas.py` | the `atlas` command: `export`, `eval`, `fx`, `verify`, a thin translation into the CLIs below |
+| `atq.py` | the `atq` command: `export`, `eval`, `fx`, `verify`, a thin translation into the CLIs below |
 | `eval.py`, `eval_policy.py`, `eval_pi0.py`, `eval_dronet.py` | CLIs: LLM perplexity, LeRobot policies (SmolVLA, DiT), Pi0, DroNet |
 | `quant_modes.py` | the coverage ladder: mode name to profile, and `quantize()` dispatch |
 | `layer_rmse.py` | per-layer isolated and cumulative RMSE against a clean BF16 pass |
@@ -68,7 +68,7 @@ measured on the same windows / frames, isolates that source:
 | step | mode | adds over the previous step | quantized / emulated |
 |---|---|---|---|
 | 1 | `bf16` | baseline | nothing |
-| 2 | `collab_v0` (alias `atlas`) | Linear FP8, the collaborator's way: ceil/448 weight scale, fixed 2^0 activation scale, torch cast | Linear; framework accumulation |
+| 2 | `collab_v0` (alias `atq`) | Linear FP8, the collaborator's way: ceil/448 weight scale, fixed 2^0 activation scale, torch cast | Linear; framework accumulation |
 | 3 | `ref_linear` | reference numerics: dynamic po2 floor(log2(amax/256)) scales, vpack cast, BF16 bias after the rescale | Linear; framework accumulation |
 | 4 | `ref_attn` | attention Q·Kᵀ and P·V, per-head FP8 | + attention |
 | 5 | `ref_conv` (alias `reference`) | Conv2d | + Conv2d (SmolVLA, Multi-Task DiT, Pi0). TinyLlama has none: `ref_conv` ≡ `ref_attn` (the JSON says `equivalent_to`; do not run both) |

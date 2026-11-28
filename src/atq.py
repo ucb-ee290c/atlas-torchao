@@ -1,11 +1,11 @@
-"""atlas: one command for the main jobs of atlas-torchao.
+"""atq: one command for the main jobs of atlas-torchao.
 
-    atlas export MODEL EXPORT_DIR [options]      quantize and write model.safetensors, policy.json, manifest.json
-    atlas eval   MODEL [options]                 evaluate per --modes (re-evaluate an export with --from-export DIR)
-    atlas fx     EXPORT_DIR FX_DIR [options]     FX graph bundle of an export (native FP8 by default)
-    atlas verify EXPORT_DIR FX_DIR [OUT_JSON]    independent checks of an export + FX bundle
+    atq export MODEL EXPORT_DIR [options]      quantize and write model.safetensors, policy.json, manifest.json
+    atq eval   MODEL [options]                 evaluate per --modes (re-evaluate an export with --from-export DIR)
+    atq fx     EXPORT_DIR FX_DIR [options]     FX graph bundle of an export (native FP8 by default)
+    atq verify EXPORT_DIR FX_DIR [OUT_JSON]    independent checks of an export + FX bundle
 
-`python -m atlas ...` is the same command without the console script (PYTHONPATH=src).
+`python -m atq ...` is the same command without the console script (PYTHONPATH=src).
 
 Each subcommand is a thin translation into the existing command, which then runs unchanged in this process, as if it
 had been started from the shell (same parser, same code, same outputs):
@@ -17,7 +17,7 @@ had been started from the shell (same parser, same code, same outputs):
     verify                         python src/scripts/tile_flow/verify_bundle.py EXPORT_DIR FX_DIR OUT_JSON ...
 
 Every option after the positional arguments is passed through verbatim, so all options of the underlying command work
-(`atlas export MODEL EXPORT_DIR --help` lists them). The equivalent command is printed before it runs; --dry-run prints
+(`atq export MODEL EXPORT_DIR --help` lists them). The equivalent command is printed before it runs; --dry-run prints
 it and stops.
 
 Defaults the subcommands add (an explicit option given after them overrides each one):
@@ -133,7 +133,7 @@ def detect_family(model, rest):
 
 
 def translate(argv):
-    """atlas argv (without the program name) -> (target, legacy argv, dry_run).
+    """atq argv (without the program name) -> (target, legacy argv, dry_run).
     target is ("path", script path) or ("module", module name); legacy argv excludes the program name."""
     if not argv or argv[0] in ("-h", "--help"):
         raise UsageError(None)
@@ -151,7 +151,7 @@ def translate(argv):
     if cmd == "fx":
         no_native, args = _take_option(args, "--no-native-fp8", False)
         if _has(args, "--verify-dir"):
-            required = 0                       # replay of an existing bundle: atlas fx --verify-dir FX_DIR
+            required = 0                       # replay of an existing bundle: atq fx --verify-dir FX_DIR
     if args and args[0] in ("-h", "--help"):
         raise UsageError(cmd)                 # help before the positionals: this subcommand's own help
     pos, rest = _positionals(args, names, required)
@@ -221,28 +221,28 @@ def run(target, legacy_argv):
 
 def _usage(cmd=None):
     if cmd is None:
-        lines = ["usage: atlas {export,eval,fx,verify} ...", ""]
+        lines = ["usage: atq {export,eval,fx,verify} ...", ""]
         for name, (names, required, summary) in SUBCOMMANDS.items():
             shown = " ".join(n if i < required else f"[{n}]" for i, n in enumerate(names))
-            lines.append(f"  atlas {name} {shown} [options]".ljust(56) + summary)
+            lines.append(f"  atq {name} {shown} [options]".ljust(56) + summary)
         lines += ["", "Every option after the positional arguments goes to the underlying command unchanged; "
-                  "--dry-run prints that command.", "Details: python -m atlas --help, docs/user-guide.md."]
+                  "--dry-run prints that command.", "Details: python -m atq --help, docs/user-guide.md."]
         return "\n".join(lines)
     names, required, summary = SUBCOMMANDS[cmd]
     shown = " ".join(n if i < required else f"[{n}]" for i, n in enumerate(names))
     extra = {
-        "export": "  --family {llm,policy,dronet}  default: detected (see python -m atlas --help)\n"
+        "export": "  --family {llm,policy,dronet}  default: detected (see python -m atq --help)\n"
                   f"  adds unless given: --modes ref_conv --export-only --algo {DEFAULT_ALGO} --out EXPORT_DIR_cli.json\n"
-                  "  all options of the family's eval script: atlas export MODEL EXPORT_DIR --help",
-        "eval": "  --family {llm,policy,dronet}  default: detected (see python -m atlas --help)\n"
-                "  all options of the family's eval script: atlas eval MODEL --help",
+                  "  all options of the family's eval script: atq export MODEL EXPORT_DIR --help",
+        "eval": "  --family {llm,policy,dronet}  default: detected (see python -m atq --help)\n"
+                "  all options of the family's eval script: atq eval MODEL --help",
         "fx": "  --no-native-fp8               leave out --native-fp8 (the decode-to-aten graph)\n"
-              "  atlas fx --verify-dir FX_DIR  fresh-process replay of an existing bundle\n"
-              "  all options of exporter.fx_export: atlas fx EXPORT_DIR FX_DIR --help",
+              "  atq fx --verify-dir FX_DIR  fresh-process replay of an existing bundle\n"
+              "  all options of exporter.fx_export: atq fx EXPORT_DIR FX_DIR --help",
         "verify": "  OUT_JSON defaults to FX_DIR_verify_bundle.json\n"
-                  "  all options of verify_bundle.py: atlas verify EXPORT_DIR FX_DIR --help",
+                  "  all options of verify_bundle.py: atq verify EXPORT_DIR FX_DIR --help",
     }[cmd]
-    return f"usage: atlas {cmd} {shown} [options]\n\n{summary}\n\n{extra}\n  --dry-run                     print the equivalent command and stop"
+    return f"usage: atq {cmd} {shown} [options]\n\n{summary}\n\n{extra}\n  --dry-run                     print the equivalent command and stop"
 
 
 def main(argv=None):
@@ -264,7 +264,7 @@ def main(argv=None):
     if dry_run:
         print(command)
         return 0
-    print(f"atlas: {command}", file=sys.stderr, flush=True)
+    print(f"atq: {command}", file=sys.stderr, flush=True)
     return run(target, legacy_argv)
 
 

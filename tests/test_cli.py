@@ -1,7 +1,7 @@
-"""src/atlas.py: the `atlas` CLI is a translation into the existing commands, which keep working unchanged.
+"""src/atq.py: the `atq` CLI is a translation into the existing commands, which keep working unchanged.
 
 - translate(): each subcommand's mapping, defaults, family detection and usage errors (pure, no model).
-- The translated argv is accepted by the real legacy parser, run through atlas.run() exactly as the CLI runs it (the
+- The translated argv is accepted by the real legacy parser, run through atq.run() exactly as the CLI runs it (the
   parse is intercepted before any model loads), and gives the same namespace as the documented legacy command.
 - Every existing entry point still parses (--help) and the protected imports still resolve.
 """
@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-import atlas
+import atq
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -22,7 +22,7 @@ TILE = SRC / "scripts" / "tile_flow"
 
 
 def tr(*argv):
-    target, legacy, dry = atlas.translate(list(argv))
+    target, legacy, dry = atq.translate(list(argv))
     return target, legacy
 
 
@@ -54,7 +54,7 @@ def test_export_llm_defaults(llm_dir):
 def test_export_default_recipe_is_explicit_not_the_alias():
     import algos
 
-    assert atlas.DEFAULT_ALGO in algos.RECIPES and atlas.DEFAULT_ALGO not in algos.ALIASES
+    assert atq.DEFAULT_ALGO in algos.RECIPES and atq.DEFAULT_ALGO not in algos.ALIASES
 
 
 def test_export_explicit_options_replace_the_defaults(llm_dir):
@@ -89,14 +89,14 @@ def test_eval_is_a_plain_passthrough(llm_dir):
 
 
 def test_family_detection(llm_dir, policy_dir):
-    assert atlas.detect_family(llm_dir, []) == "llm"
-    assert atlas.detect_family(policy_dir, ["--dataset", "d"]) == "policy"
-    assert atlas.detect_family(policy_dir, ["--dataset=d"]) == "policy"
-    assert atlas.detect_family("/any/weights.npz", []) == "dronet"
-    with pytest.raises(atlas.UsageError, match="LeRobot policy .*--dataset"):
-        atlas.detect_family(policy_dir, [])
-    with pytest.raises(atlas.UsageError, match="--family"):
-        atlas.detect_family("/does/not/exist", [])
+    assert atq.detect_family(llm_dir, []) == "llm"
+    assert atq.detect_family(policy_dir, ["--dataset", "d"]) == "policy"
+    assert atq.detect_family(policy_dir, ["--dataset=d"]) == "policy"
+    assert atq.detect_family("/any/weights.npz", []) == "dronet"
+    with pytest.raises(atq.UsageError, match="LeRobot policy .*--dataset"):
+        atq.detect_family(policy_dir, [])
+    with pytest.raises(atq.UsageError, match="--family"):
+        atq.detect_family("/does/not/exist", [])
 
 
 def test_family_detection_reads_the_hf_cache_offline(tmp_path, monkeypatch):
@@ -108,22 +108,22 @@ def test_family_detection_reads_the_hf_cache_offline(tmp_path, monkeypatch):
     import huggingface_hub.constants as hc
 
     monkeypatch.setattr(hc, "HF_HUB_CACHE", str(tmp_path / "hub"))
-    assert atlas.detect_family("org/m", []) == "llm"
+    assert atq.detect_family("org/m", []) == "llm"
 
 
 def test_explicit_family_wins(policy_dir):
     target, legacy = tr("eval", policy_dir, "--family", "llm")
     assert target[1].endswith("eval.py") and legacy == ["--model", policy_dir]
-    with pytest.raises(atlas.UsageError, match="--family must be one of"):
+    with pytest.raises(atq.UsageError, match="--family must be one of"):
         tr("eval", policy_dir, "--family", "pi0")
 
 
 def test_positionals_come_first(llm_dir):
-    with pytest.raises(atlas.UsageError, match="missing MODEL EXPORT_DIR"):
+    with pytest.raises(atq.UsageError, match="missing MODEL EXPORT_DIR"):
         tr("export", "--device", "cpu", llm_dir, "e")
-    with pytest.raises(atlas.UsageError, match="missing EXPORT_DIR"):
+    with pytest.raises(atq.UsageError, match="missing EXPORT_DIR"):
         tr("export", llm_dir, "--device", "cpu")
-    with pytest.raises(atlas.UsageError, match="unknown subcommand"):
+    with pytest.raises(atq.UsageError, match="unknown subcommand"):
         tr("quantize", llm_dir)
 
 
@@ -133,7 +133,7 @@ def test_fx():
     assert tr("fx", "e", "fx", "--no-native-fp8")[1] == ["--export-dir", "e", "--out-dir", "fx"]
     assert tr("fx", "e", "fx", "--native-fp8")[1] == ["--export-dir", "e", "--out-dir", "fx", "--native-fp8"]
     assert tr("fx", "--verify-dir", "fx", "--device", "cpu")[1] == ["--verify-dir", "fx", "--device", "cpu"]
-    with pytest.raises(atlas.UsageError):
+    with pytest.raises(atq.UsageError):
         tr("fx", "e", "--verify-dir", "fx")
 
 
@@ -145,13 +145,13 @@ def test_verify():
 
 
 def test_dry_run_and_help(llm_dir, capsys):
-    assert atlas.main(["export", llm_dir, "e", "--dry-run"]) == 0
+    assert atq.main(["export", llm_dir, "e", "--dry-run"]) == 0
     out = capsys.readouterr().out.strip()
     assert out.startswith("python ") and "eval.py --model" in out and "--dry-run" not in out
-    assert atlas.main(["export", "--help"]) == 0 and "usage: atlas export" in capsys.readouterr().out
-    assert atlas.main(["--help"]) == 0 and "atlas export MODEL EXPORT_DIR" in capsys.readouterr().out
-    assert atlas.main([]) == 2
-    assert atlas.main(["export", llm_dir]) == 2 and "missing EXPORT_DIR" in capsys.readouterr().err
+    assert atq.main(["export", "--help"]) == 0 and "usage: atq export" in capsys.readouterr().out
+    assert atq.main(["--help"]) == 0 and "atq export MODEL EXPORT_DIR" in capsys.readouterr().out
+    assert atq.main([]) == 2
+    assert atq.main(["export", llm_dir]) == 2 and "missing EXPORT_DIR" in capsys.readouterr().err
 
 
 # --------------------------------------------------------------- the legacy parsers accept the translated argv
@@ -164,7 +164,7 @@ _PARSE_ARGS = argparse.ArgumentParser.parse_args
 
 
 def run_legacy(monkeypatch, target, legacy):
-    """atlas.run(target, legacy) as the CLI runs it, stopped at the legacy parser's parse_args (nothing past argument
+    """atq.run(target, legacy) as the CLI runs it, stopped at the legacy parser's parse_args (nothing past argument
     parsing runs); returns (its namespace as a dict, sys.argv[0] the command saw)."""
     seen = {}
 
@@ -175,14 +175,14 @@ def run_legacy(monkeypatch, target, legacy):
 
     monkeypatch.setattr(argparse.ArgumentParser, "parse_args", capture)
     with pytest.raises(_Parsed):
-        atlas.run(target, legacy)
+        atq.run(target, legacy)
     monkeypatch.setattr(argparse.ArgumentParser, "parse_args", _PARSE_ARGS)
     return vars(seen["ns"]), seen["argv0"]
 
 
 def parsed_by_legacy(monkeypatch, argv):
-    """`atlas <argv>`: translated, then run as run_legacy does."""
-    target, legacy, _ = atlas.translate(list(argv))
+    """`atq <argv>`: translated, then run as run_legacy does."""
+    target, legacy, _ = atq.translate(list(argv))
     return run_legacy(monkeypatch, target, legacy)
 
 
@@ -237,7 +237,7 @@ def test_run_restores_sys_state(monkeypatch):
 LEGACY_HELP = [
     ["src/eval.py"], ["src/eval_policy.py"], ["src/eval_dronet.py"], ["-m", "exporter.fx_export"],
     ["src/scripts/tile_flow/verify_bundle.py"], ["src/scripts/tile_flow/make_loop_manifest.py"],
-    ["src/scripts/tile_flow/policy_fx_capture_phases.py"], ["-m", "atlas"],
+    ["src/scripts/tile_flow/policy_fx_capture_phases.py"], ["-m", "atq"],
 ]
 
 
@@ -247,12 +247,12 @@ def test_entry_point_parses(cmd):
     r = subprocess.run([sys.executable, *cmd, "--help"], cwd=ROOT, env=env, capture_output=True, text=True,
                        timeout=300)
     assert r.returncode == 0, r.stderr[-2000:]
-    assert "usage:" in r.stdout or "atlas export MODEL EXPORT_DIR" in r.stdout
+    assert "usage:" in r.stdout or "atq export MODEL EXPORT_DIR" in r.stdout
 
 
-def test_python_dash_m_atlas_dry_run(tmp_path):
+def test_python_dash_m_atq_dry_run(tmp_path):
     env = {**os.environ, "PYTHONPATH": str(SRC) + os.pathsep + os.environ.get("PYTHONPATH", "")}
-    r = subprocess.run([sys.executable, "-m", "atlas", "export", str(tmp_path / "w.npz"), "e", "--dry-run"],
+    r = subprocess.run([sys.executable, "-m", "atq", "export", str(tmp_path / "w.npz"), "e", "--dry-run"],
                        cwd=ROOT, env=env, capture_output=True, text=True, timeout=120)
     assert r.returncode == 0, r.stderr
     assert r.stdout.split()[1].endswith("eval_dronet.py") and "--weights" in r.stdout
