@@ -28,10 +28,14 @@ reference = ["numba>=0.60"]
 # LeRobot policies (SmolVLA, Multi-Task DiT) for eval_policy.py; lerobot 0.7 needs transformers 5.22.
 policy = ["lerobot[smolvla,dataset,diffusers-dep]==0.7.0"]
 
+[project.scripts]
+# one entry point for the main jobs (export, eval, fx, verify); `python -m atq` is the same (src/atq.py)
+atq = "atq:main"
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 packages = ["algos", "reference", "mxu", "chip", "exporter", "loaders", "collab", "dronet"]
-py-modules = ["quant_modes", "layer_rmse", "eval", "eval_policy", "eval_pi0", "eval_dronet", "chip_coverage"]
+py-modules = ["atq", "quant_modes", "layer_rmse", "eval", "eval_policy", "eval_pi0", "eval_dronet", "chip_coverage"]
 
 [tool.pytest.ini_options]
 markers = ["slow: loads a full checkpoint from HF_HOME"]
