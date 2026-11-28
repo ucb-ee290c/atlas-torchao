@@ -4,8 +4,9 @@ New here? [docs/user-guide.md](docs/user-guide.md) walks from a fresh clone to a
 
 One command does the main jobs (`pip install -e .` installs it; `python -m atlas` without installing):
 
-    atlas export TinyLlama/TinyLlama-1.1B-Chat-v1.0 out/tinyllama/export        # quantize + export (atlas_v1_awq_tile_static)
-    atlas eval TinyLlama/TinyLlama-1.1B-Chat-v1.0 --modes bf16 ref_conv --from-export out/tinyllama/export
+    MODEL=$(hf download --quiet TinyLlama/TinyLlama-1.1B-Chat-v1.0)              # local snapshot path
+    atlas export $MODEL out/tinyllama/export                                     # quantize + export (atlas_v1_awq_tile_static)
+    atlas eval $MODEL --modes bf16 ref_conv --from-export out/tinyllama/export
     atlas fx out/tinyllama/export out/tinyllama/fx --seqlen 64                    # native-FP8 FX bundle
     atlas verify out/tinyllama/export out/tinyllama/fx
 
